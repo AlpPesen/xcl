@@ -1025,11 +1025,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
             }
             count(if gfx { DRAWS } else { DISPATCHES });
+            // an indirect dispatch: its groups are in the argument buffer (`max` of them)
+            let mark = if gfx { 0 } else { super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [0, 0, max]) };
             if guarded.is_some() {
                 pc(this, sig, max, args, args_off, count_buf, count_off);
             } else {
                 fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
             }
+            super::culprit::after_dispatch(list, mark);
             unguard();
         }
         Err(e) => {
@@ -1697,7 +1700,10 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
-    super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
+    let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
+    let r = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
+    super::culprit::after_dispatch(list, mark);
+    r
 }
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept

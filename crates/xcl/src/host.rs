@@ -54,6 +54,16 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 // a device removed while every title thread waits: nothing else would ask
                 crate::hle::d3d12x::real::stop_if_device_removed();
+                // the GPU's work in flight when no frame came for 6 s (`XCL_GPU_CULPRIT=1`)
+                static IDLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let frames = crate::hle::d3d12x::present::counters().1;
+                let o = std::sync::atomic::Ordering::Relaxed;
+                if SEEN.swap(frames, o) != frames || frames < 100 {
+                    IDLE.store(0, o);
+                } else if IDLE.fetch_add(1, o) == 2 {
+                    crate::hle::d3d12x::culprit::on_watchdog_release();
+                }
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();
                 crate::xlog_info!(
