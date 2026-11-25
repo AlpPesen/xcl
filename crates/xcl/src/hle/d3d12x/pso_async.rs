@@ -1364,7 +1364,7 @@ mod pso_queue_tests {
             spared: Default::default(),
             bvh_traversal: Default::default(),
             deprioritized: std::sync::atomic::AtomicBool::new(deprioritized),
-            demand: Mutex::new(Demand { wanted, preload_thread: 0 }),
+            demand: Mutex::new(Demand { wanted, by_submit: false, preload_thread: 0 }),
         })
     }
 

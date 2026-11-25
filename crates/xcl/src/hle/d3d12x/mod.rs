@@ -30,6 +30,7 @@ pub mod null;
 mod place_times;
 pub mod present;
 pub mod pso_async;
+pub mod pso_library;
 pub mod real;
 mod shader_cache_session;
 pub mod sparse;
