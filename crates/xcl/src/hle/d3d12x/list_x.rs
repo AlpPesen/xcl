@@ -3595,6 +3595,26 @@ fn pc_va(va: u64) -> u64 {
 /// it reads there first (`sync_title_buffers`), as the title wrote it by then. (A copy of the
 /// whole buffer at every bind filled unified memory within two minutes of a retail title's
 /// menus, and missed what the title wrote after the bind.)
+/// A vertex buffer view at address 0 is a null view whatever its size: the console reads zeros
+/// from it, and the PC's input assembler would fetch from GPU address 0 (a page fault there is
+/// what a removed device reports, `0x887a0006` with "GPU VA 0x0").
+fn null_if_at_zero(mut v: D3D12_VERTEX_BUFFER_VIEW) -> D3D12_VERTEX_BUFFER_VIEW {
+    if v.BufferLocation == 0 && v.SizeInBytes != 0 {
+        note_null_buffer("vertex buffer");
+        v.SizeInBytes = 0;
+    }
+    v
+}
+
+/// A view at address 0 with a size was bound (`null_if_at_zero`).
+fn note_null_buffer(what: &str) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: a {what} at address 0 with a size is bound: a null view ({n} so far)");
+    }
+}
+
 unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: bool) -> u64 {
     let t = pc_va(va);
     if t != va || va == 0 || bytes == 0 {
@@ -3910,6 +3930,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
             let mut v = views.add(k).read_unaligned();
             let title = v.BufferLocation;
             v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "vertex buffer", true);
+            v = null_if_at_zero(v);
             if super::present::trace_frame() {
                 static N: AtomicU64 = AtomicU64::new(0);
                 let i = N.fetch_add(1, Ordering::Relaxed);
@@ -3957,6 +3978,13 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
     s.bindings.index_title = Some((v.BufferLocation, v.SizeInBytes, v.Format.0));
     drop(g);
     v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "index buffer", true);
+    if v.BufferLocation == 0 {
+        note_null_buffer("index buffer");
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+            s.index_buffer = None;
+        }
+        return set_index_buffer(this, None);
+    }
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
         s.index_buffer = Some(v);
     }
@@ -3980,7 +4008,11 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
     };
     let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
     sync_title_buffers(this, None, 0, 0, 2);
-    let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: gpu_va(this, va, count.saturating_mul(stride) as usize, "DrawIndexedX indices", false), SizeInBytes: count.saturating_mul(stride), Format: format };
+    let at = gpu_va(this, va, count.saturating_mul(stride) as usize, "DrawIndexedX indices", false);
+    if at == 0 {
+        return note_null_buffer("DrawIndexedX index buffer");
+    }
+    let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: at, SizeInBytes: count.saturating_mul(stride), Format: format };
     set_index_buffer(this, Some(&view));
     super::bind::emit_prepared_indexed_draw(&list, count, 1, 0, 0, 0);
     set_index_buffer(this, bound.as_ref());
@@ -4558,6 +4590,19 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A vertex buffer view at address 0 with a size is a null view; any other is as it was.
+    #[test]
+    fn a_vertex_buffer_view_at_address_0_is_null() {
+        let view = |at: u64, size: u32| D3D12_VERTEX_BUFFER_VIEW { BufferLocation: at, SizeInBytes: size, StrideInBytes: 16 };
+        let v = null_if_at_zero(view(0, 4096));
+        assert_eq!((v.BufferLocation, v.SizeInBytes, v.StrideInBytes), (0, 0, 16));
+        for (at, size) in [(0, 0), (0x1000, 4096), (0x1000, 0)] {
+            let v = null_if_at_zero(view(at, size));
+            assert_eq!((v.BufferLocation, v.SizeInBytes), (at, size));
+        }
+    }
+
     use std::sync::Arc;
 
     /// An internal wait shows in the watchdog's summary while its fence is short of the value,
