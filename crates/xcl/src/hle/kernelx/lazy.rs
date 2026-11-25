@@ -41,7 +41,12 @@ unsafe fn commit(page: usize) -> bool {
     if !g.remove(&page) {
         return false;
     }
-    !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null()
+    if VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() {
+        return false;
+    }
+    // (a view of a physical page committed here is writable, not guarded: count it as written)
+    super::guards::committed(page);
+    true
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -88,6 +93,8 @@ pub fn ensure(p: usize, len: usize) {
     if len == 0 {
         return;
     }
+    // views of physical pages there are read-only until written: a kernel call cannot fault
+    super::guards::open(p, len);
     let pages: Vec<usize> = {
         let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {
