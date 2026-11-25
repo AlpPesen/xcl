@@ -4400,6 +4400,13 @@ fn build_cap_bytes() -> usize {
     *V.get_or_init(|| std::env::var("XCL_PSO_MAX_KB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0usize).saturating_mul(1024))
 }
 
+/// `XCL_PSO_MAX_CACHED=1`: `XCL_PSO_MAX_KB` also holds for a program with a saved driver blob (one
+/// of ~1 MB of DXIL takes ~50 MB of commit once made, however quickly).
+fn cap_holds_for_cached() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_PSO_MAX_CACHED").is_ok_and(|v| v.trim() == "1"))
+}
+
 fn over_build_cap(dxil: usize, cap: usize) -> bool {
     cap != 0 && dxil > cap
 }
@@ -4432,8 +4439,8 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
-    if cached.is_none() && over_build_cap(dxil.len(), build_cap_bytes()) {
-        crate::xlog_warn!("D3D12.X: compute PSO of record {record:016x} ({} B DXIL) not built: over XCL_PSO_MAX_KB and without a saved blob", dxil.len());
+    if (cached.is_none() || cap_holds_for_cached()) && over_build_cap(dxil.len(), build_cap_bytes()) {
+        crate::xlog_warn!("D3D12.X: compute PSO of record {record:016x} ({} B DXIL) not built: over XCL_PSO_MAX_KB{}", dxil.len(), if cached.is_none() { " and without a saved blob" } else { " (it has a saved blob)" });
         return (E_OUTOFMEMORY, std::time::Duration::ZERO, false);
     }
     // in the background, a few at a time and within the commit headroom the program asks for
