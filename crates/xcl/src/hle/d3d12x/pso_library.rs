@@ -402,25 +402,61 @@ unsafe fn create_empty_library(dev1: &ID3D12Device1) -> Option<ID3D12PipelineLib
     lib
 }
 
-/// Process-wide D3D12 pipeline library split into two independent `ID3D12PipelineLibrary1` handles:
-/// - `read_lib`: strictly immutable handle opened from the startup `MappedBlob`, serving concurrent
-///   `Load*` calls lock-free per the D3D12 spec (never mutated by `StorePipeline` or `Serialize`).
+/// Maximum idle read-only `ID3D12PipelineLibrary1` handles kept in `read_pool`. Each handle
+/// borrows the same startup `MappedBlob` (zero extra blob RAM) so concurrent `Load*` callers
+/// never share an `ID3D12PipelineLibrary1` instance and never stall behind one another.
+const MAX_POOLED_READ_HANDLES: usize = 16;
+
+struct ReadHandleGuard<'a> {
+    pool: &'a std::sync::Mutex<Vec<ID3D12PipelineLibrary1>>,
+    lib: Option<ID3D12PipelineLibrary1>,
+}
+
+impl ReadHandleGuard<'_> {
+    fn handle(&self) -> &ID3D12PipelineLibrary1 {
+        self.lib.as_ref().unwrap()
+    }
+}
+
+impl Drop for ReadHandleGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(lib) = self.lib.take() {
+            let mut pool = self.pool.lock().unwrap();
+            if pool.len() < MAX_POOLED_READ_HANDLES {
+                pool.push(lib);
+            }
+        }
+    }
+}
+
+/// Process-wide D3D12 pipeline library split into:
+/// - `read_pool`: checked-out pool of independent read-only `ID3D12PipelineLibrary1` handles
+///   opened from the startup `MappedBlob`. Windows `D3D12Core.dll` mutates internal state during
+///   `Load*` and crashes (`D3D12Core.dll+0x7dfa`) when two threads call `Load*` concurrently on
+///   the same `ID3D12PipelineLibrary1` instance; checking out an exclusive handle per caller keeps
+///   every handle strictly single-threaded while preserving lock-free concurrent `Load*` scaling.
 /// - `write_lib`: owned exclusively by the dedicated `xcl-plib-save` worker thread, fed via an
 ///   `mpsc` channel so `store()` returns in ~1 µs with zero lock contention on compile workers and
 ///   `D3D12Core.dll` never sees concurrent `StorePipeline` + `Load*` or `Serialize` races.
 pub struct MmapPipelineLibrary {
-    read_lib: Option<ID3D12PipelineLibrary1>,
-    /// Kept alive for the entire lifetime of `read_lib` because D3D12 requires the initial blob
-    /// memory to remain valid until the `ID3D12PipelineLibrary` is destroyed.
-    _read_backing: Option<Arc<MappedBlob>>,
+    /// Declared BEFORE `read_backing` and `dev1` so Rust drops every pooled handle before
+    /// unmapping `read_backing` or releasing `dev1`.
+    read_pool: std::sync::Mutex<Vec<ID3D12PipelineLibrary1>>,
+    /// Kept alive for the entire lifetime of `read_pool` handles because D3D12 requires the
+    /// initial blob memory to remain valid until every `ID3D12PipelineLibrary` is destroyed.
+    read_backing: Option<Arc<MappedBlob>>,
+    /// Free-threaded D3D12 device used to lazily open additional read-only handles from
+    /// `read_backing` when multiple threads call `Load*` concurrently.
+    dev1: ID3D12Device1,
     /// Async command channel to the dedicated `xcl-plib-save` thread owning `write_lib`.
     /// The mutex protects only the ~50 ns `mpsc::Sender::send` (never any D3D12 call).
     save_tx: Option<std::sync::Mutex<mpsc::Sender<SaveCmd>>>,
     dirty: Arc<AtomicU64>,
 }
 
-// `read_lib` is strictly immutable after creation (`Load*` is free-threaded per D3D12 spec when
-// never mutated by `StorePipeline` or `Serialize`); `save_tx` is synchronized by its Mutex.
+// Every `ID3D12PipelineLibrary1` in `read_pool` is exclusively owned by one thread at a time via
+// `ReadHandleGuard`; `dev1.CreatePipelineLibrary` is free-threaded per D3D12 spec; `read_backing`
+// is read-only immutable memory; `save_tx` is synchronized by its Mutex.
 unsafe impl Sync for MmapPipelineLibrary {}
 unsafe impl Send for MmapPipelineLibrary {}
 
@@ -433,7 +469,7 @@ impl MmapPipelineLibrary {
         }
         let dev1: ID3D12Device1 = device.cast().ok()?;
         let store = LibraryStore::for_adapter(adapter_name);
-        let mut read_lib: Option<ID3D12PipelineLibrary1> = None;
+        let mut initial_read_handles: Vec<ID3D12PipelineLibrary1> = Vec::new();
         let mut backing: Option<Arc<MappedBlob>> = None;
 
         if let Some((gen, blob)) = store.open_latest() {
@@ -443,7 +479,7 @@ impl MmapPipelineLibrary {
                         "D3D12.X: opened memory-mapped pipeline library gen-{gen:08x} ({:.1} MiB file-backed)",
                         blob.len() as f64 / (1024.0 * 1024.0)
                     );
-                    read_lib = Some(lib);
+                    initial_read_handles.push(lib);
                     backing = Some(Arc::new(blob));
                 }
                 Err(e) => {
@@ -478,7 +514,7 @@ impl MmapPipelineLibrary {
             Some(blob) => dev1.CreatePipelineLibrary::<ID3D12PipelineLibrary1>(blob.as_slice()).ok(),
             None => create_empty_library(&dev1),
         };
-        if read_lib.is_none() && write_lib.is_none() {
+        if initial_read_handles.is_empty() && write_lib.is_none() {
             return None;
         }
 
@@ -495,38 +531,51 @@ impl MmapPipelineLibrary {
         });
 
         Some(Self {
-            read_lib,
-            _read_backing: backing,
+            read_pool: std::sync::Mutex::new(initial_read_handles),
+            read_backing: backing,
+            dev1,
             save_tx,
             dirty,
         })
+    }
+
+    /// Check out exclusive ownership of a read-only `ID3D12PipelineLibrary1` handle backed by
+    /// `read_backing`, lazily opening a new handle from the same mmap when concurrent threads
+    /// overlap. Never holds `read_pool`'s mutex across any D3D12 driver call.
+    unsafe fn checkout_read_handle(&self) -> Option<ReadHandleGuard<'_>> {
+        let blob = self.read_backing.as_ref()?;
+        if let Some(lib) = self.read_pool.lock().unwrap().pop() {
+            return Some(ReadHandleGuard { pool: &self.read_pool, lib: Some(lib) });
+        }
+        let lib = self.dev1.CreatePipelineLibrary::<ID3D12PipelineLibrary1>(blob.as_slice()).ok()?;
+        Some(ReadHandleGuard { pool: &self.read_pool, lib: Some(lib) })
     }
 
     pub unsafe fn load_compute(&self, key: &str, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC) -> Option<ID3D12PipelineState> {
         if key.is_empty() || desc.pRootSignature.is_none() || desc.CS.pShaderBytecode.is_null() || desc.CS.BytecodeLength == 0 {
             return None;
         }
-        let lib = self.read_lib.as_ref()?;
+        let guard = self.checkout_read_handle()?;
         let name = HSTRING::from(key);
-        lib.LoadComputePipeline(&name, desc).ok()
+        guard.handle().LoadComputePipeline(&name, desc).ok()
     }
 
     pub unsafe fn load_graphics(&self, key: &str, desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Option<ID3D12PipelineState> {
         if key.is_empty() || desc.pRootSignature.is_none() {
             return None;
         }
-        let lib = self.read_lib.as_ref()?;
+        let guard = self.checkout_read_handle()?;
         let name = HSTRING::from(key);
-        lib.LoadGraphicsPipeline(&name, desc).ok()
+        guard.handle().LoadGraphicsPipeline(&name, desc).ok()
     }
 
     pub unsafe fn load_stream(&self, key: &str, desc: &D3D12_PIPELINE_STATE_STREAM_DESC) -> Option<ID3D12PipelineState> {
         if key.is_empty() || desc.pPipelineStateSubobjectStream.is_null() || desc.SizeInBytes == 0 {
             return None;
         }
-        let lib = self.read_lib.as_ref()?;
+        let guard = self.checkout_read_handle()?;
         let name = HSTRING::from(key);
-        lib.LoadPipeline(&name, desc).ok()
+        guard.handle().LoadPipeline(&name, desc).ok()
     }
 
     /// Enqueue `(key, pso)` for the dedicated `xcl-plib-save` worker thread. Returns immediately
