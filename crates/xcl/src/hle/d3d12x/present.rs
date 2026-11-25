@@ -251,6 +251,15 @@ pub fn is_presented(res: usize) -> bool {
     PRESENTED.lock().unwrap().contains(&res)
 }
 
+/// Look up the resource behind RTV `handle` and retain a COM reference while holding `RTVS`,
+/// preventing a concurrent `note_rtv` overwrite/removal from freeing it before use.
+unsafe fn retain_rtv_resource(handle: usize) -> Option<usize> {
+    let g = RTVS.lock().unwrap();
+    let res = g.as_ref()?.get(&handle).copied()?;
+    add_ref(res);
+    Some(res)
+}
+
 /// the resource an RTV handle names (render-target binds)
 pub fn rtv_resource(handle: usize) -> Option<usize> {
     RTVS.lock().unwrap().as_ref()?.get(&handle).copied()
@@ -328,19 +337,21 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
         lists.iter().rev().find_map(|l| m.get(&(*l as usize)).copied())
     };
     let Some(h) = handle else { return };
-    let res = RTVS.lock().unwrap().as_ref().and_then(|m| m.get(&h).copied());
-    let Some(res) = res else { return };
+    let Some(res) = retain_rtv_resource(h) else { return };
     if backbuffer_like(res).is_none() {
+        release(res);
         return;
     }
-    {
+    let to_release = {
         let mut c = CANDIDATE.lock().unwrap();
         if c.map(|(_, r)| r) != Some(res) {
-            add_ref(res);
-            if let Some((_, old)) = c.replace((queue as usize, res)) {
-                release(old);
-            }
+            c.replace((queue as usize, res)).map(|(_, old)| old)
+        } else {
+            Some(res)
         }
+    };
+    if let Some(old) = to_release {
+        release(old);
     }
     // no console present call seen recently → present on submissions (rate limited)
     if now_ms().saturating_sub(LAST_BOUNDARY_MS.load(Ordering::Relaxed)) > 500 {
@@ -1938,6 +1949,49 @@ mod frame_dump_tests {
                 assert_eq!((ptr as *const u8).add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize + x * 4).cast::<[u8; 4]>().read_unaligned(), [0, 255, 0, 255], "pixel ({x},{y})");
             }
             rb.Unmap(0, None);
+        }
+    }
+
+    #[test]
+    fn retain_rtv_resource_keeps_com_ref_alive_across_rtv_removal() {
+        use std::sync::atomic::AtomicU32;
+        #[repr(C)]
+        struct FakeCom {
+            vt: *const usize,
+            refs: AtomicU32,
+        }
+        unsafe extern "system" fn fake_add_ref(p: usize) -> u32 {
+            (*(p as *const FakeCom)).refs.fetch_add(1, Ordering::AcqRel) + 1
+        }
+        unsafe extern "system" fn fake_release(p: usize) -> u32 {
+            (*(p as *const FakeCom)).refs.fetch_sub(1, Ordering::AcqRel) - 1
+        }
+        let mut vt = [0usize; 3];
+        vt[1] = fake_add_ref as usize;
+        vt[2] = fake_release as usize;
+        let obj = Box::new(FakeCom { vt: vt.as_ptr(), refs: AtomicU32::new(1) });
+        let raw = &*obj as *const FakeCom as usize;
+        let handle = 0x7900_0001usize;
+        unsafe {
+            {
+                let mut g = RTVS.lock().unwrap();
+                add_ref(raw);
+                g.get_or_insert_with(HashMap::new).insert(handle, raw);
+            }
+            assert_eq!(obj.refs.load(Ordering::Acquire), 2);
+            let retained = retain_rtv_resource(handle).expect("retained RTV resource");
+            assert_eq!(retained, raw);
+            assert_eq!(obj.refs.load(Ordering::Acquire), 3);
+            // Simulate concurrent RTV slot clear releasing the table's ref while caller holds its own.
+            {
+                let mut g = RTVS.lock().unwrap();
+                if let Some(old) = g.as_mut().and_then(|m| m.remove(&handle)) {
+                    release(old);
+                }
+            }
+            assert_eq!(obj.refs.load(Ordering::Acquire), 2, "caller ref must keep object alive");
+            release(retained);
+            assert_eq!(obj.refs.load(Ordering::Acquire), 1);
         }
     }
 }
