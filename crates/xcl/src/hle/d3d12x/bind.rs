@@ -397,6 +397,22 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     hold_prelude_until_reset(old, prelude);
 }
 
+/// A submit is about to wait for the pipeline `this` has bound.
+pub(super) fn want_bound(this: *mut c_void) {
+    super::pso_async::want(with(this, |s| s.pso));
+}
+
+/// A put-off dispatch that could not be recorded.
+pub(super) fn dispatch_dropped() {
+    count(DISPATCHES_SKIPPED);
+}
+
+/// `to` goes on in the arena `from` took its pieces from (`from` takes no more).
+pub(super) fn pass_arena(from: *mut c_void, to: *mut c_void) {
+    let arena = with(from, |s| std::mem::take(&mut s.arena));
+    with(to, |s| s.arena = arena);
+}
+
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
     if let Some(mut s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
@@ -1922,6 +1938,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
+    let unbuilt_compute = signature_dispatches(sig) && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
+    if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
+        return super::pso_async::need_by_submit(raw_pso);
+    }
     let pso = pso_for_draw(raw_pso);
     // where the commands are in unified memory (a console buffer's offsets are the title's)
     let commands_at = super::real::console_buffer(args).and_then(|(p, n)| {
@@ -2673,7 +2693,11 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let pso = with(this, |s| s.pso);
+    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
+        return super::pso_async::need_by_submit(pso);
+    }
+    let pso = super::pso_async::resolve_wait(pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
