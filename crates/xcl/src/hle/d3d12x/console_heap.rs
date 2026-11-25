@@ -220,11 +220,18 @@ unsafe fn null_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
 }
 
 static WINDOW_VIEWS_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WINDOW_VIEWS_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the memory windows could not be put in the shared heap (`set_window_views`):
 /// translated shaders then switch over root UAVs (`pso::heap_windows`).
 pub fn window_views_failed() -> bool {
     WINDOW_VIEWS_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the memory windows' raw UAV descriptors are published at `MEM_HEAP_BASE + k` in
+/// the shared shader-visible descriptor heap (`set_window_views` succeeded).
+pub fn window_views_ready() -> bool {
+    WINDOW_VIEWS_READY.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// The memory windows' buffers `(resource, bytes)` as raw UAVs at `MEM_HEAP_BASE + k` of the
@@ -262,6 +269,7 @@ unsafe fn set_window_views_checked(dev: &ID3D12Device, windows: &[(usize, usize)
         device.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&crate::gpu::recomp::runner::raw_window_uav(0)), at);
         true
     };
+    WINDOW_VIEWS_READY.store(ok, std::sync::atomic::Ordering::Release);
     if !ok {
         WINDOW_VIEWS_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
         crate::xlog_warn!("memory windows: could not bind {count} window(s) (64-bit atomics on heap views: {atomics64}) in the shared descriptor heap");
