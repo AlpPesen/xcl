@@ -1731,8 +1731,11 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
+    // no page array: page 0 (unmap) for every address
+    let mut none = 0u64;
+    let mut page = |i: usize| if pages.is_null() { &mut none as *mut u64 as *mut usize } else { pages.add(i) as *mut usize };
     if alias::enabled() {
-        return (0..n).all(|i| !map_aliased(*addresses.add(i), 1, pages.add(i) as *mut usize).is_null()) as BOOL;
+        return (0..n).all(|i| !map_aliased(*addresses.add(i), 1, page(i)).is_null()) as BOOL;
     }
     if crate::gpu::uma::get().is_none() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -1740,12 +1743,7 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
-    // no page array: page 0 (unmap) for every address
-    let ok = (0..n).all(|i| {
-        let mut none = 0usize;
-        let page = if pages.is_null() { &mut none as *mut usize } else { pages.add(i) as *mut usize };
-        !map_pages(away, *addresses.add(i), 1, page).is_null()
-    });
+    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, page(i)).is_null());
     give_back_homes(away);
     ok as BOOL
 }
