@@ -4756,9 +4756,11 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     );
     if hr < 0 && cached.is_some() {
         // a blob the driver does not take (another root signature at the same address…): compiled
-        forget_compute_blob(key);
-        if from_disk {
-            driver_cache::note(false, disk.as_deref());
+        if driver_cache::refused(hr) {
+            forget_compute_blob(key);
+            if from_disk {
+                driver_cache::note(false, disk.as_deref());
+            }
         }
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
         let (retried, took) = driver_compile_identified(
@@ -4839,6 +4841,16 @@ pub(crate) mod driver_cache {
 
     pub fn load(p: &Path) -> Option<Vec<u8>> {
         std::fs::read(p).ok().filter(|b| !b.is_empty())
+    }
+
+    /// Whether a create that failed with `hr` refused the blob it was given. A removed or hung
+    /// device and a driver out of memory fail every create, with a blob or without one, and
+    /// say nothing about the blob: it is kept. (A retail title's run that ended in a device
+    /// removal dropped the blobs of 15 large compute programs in its last two seconds; the next
+    /// run built them again, 10 – 18 s each.)
+    pub fn refused(hr: crate::util::HRESULT) -> bool {
+        use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
+        hr < 0 && ![DXGI_ERROR_DEVICE_REMOVED.0, DXGI_ERROR_DEVICE_HUNG.0, DXGI_ERROR_DEVICE_RESET.0, crate::util::E_OUTOFMEMORY].contains(&hr)
     }
 
     /// A pipeline was made from a kept blob (`ok`), or the driver refused the blob: dropped.
@@ -4943,6 +4955,19 @@ pub(crate) mod driver_cache {
             note(false, Some(&p));
             assert_eq!(load(&p), None);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_lost_device_or_no_memory_does_not_refuse_a_blob() {
+            use crate::util::{E_INVALIDARG, E_OUTOFMEMORY};
+            use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
+            // the driver's answers to a blob of another driver, adapter or root signature
+            for hr in [E_INVALIDARG, 0x887E_0001u32 as i32, 0x887E_0002u32 as i32, 0x8000_4005u32 as i32] {
+                assert!(refused(hr), "{hr:#x}");
+            }
+            for hr in [DXGI_ERROR_DEVICE_REMOVED.0, DXGI_ERROR_DEVICE_HUNG.0, DXGI_ERROR_DEVICE_RESET.0, E_OUTOFMEMORY, 0, 1] {
+                assert!(!refused(hr), "{hr:#x}");
+            }
         }
 
         #[test]
@@ -5337,6 +5362,29 @@ mod graphics_blob_tests {
     }
 
     #[test]
+    fn cached_graphics_blob_is_kept_when_the_device_is_removed() {
+        let removed = windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED.0;
+        let blob = [0xEFu8; 32];
+        let mut copy = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        let mut calls = 0usize;
+        let build = create_graphics_pso_cached(
+            &mut copy,
+            Some(&blob),
+            false,
+            || panic!("a removed device says nothing about the blob: it must not be evicted"),
+            |_, _, f| (f(), std::time::Duration::from_millis(1)),
+            |_| {
+                calls += 1;
+                removed
+            },
+        );
+        assert_eq!(build.hr, removed);
+        assert_eq!(calls, 2, "with the blob, then without it");
+        assert!(!build.reused);
+        assert!(!build.cache_eligible);
+    }
+
+    #[test]
     fn rect_list_gs_fallback_does_not_cache_under_with_gs_key() {
         const E_INVALIDARG: HRESULT = -2147024809;
         let gs = [2u8; 16];
@@ -5415,7 +5463,9 @@ fn create_graphics_pso_cached(
         if hr >= 0 {
             return GraphicsPsoBuild { hr, in_driver, reused: true, cache_eligible: false };
         }
-        on_stale_cache();
+        if driver_cache::refused(hr) {
+            on_stale_cache();
+        }
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
         let (retried, took) = run("graphics retry", false, &mut || retry_without_rect_gs(copy, rect_gs, &mut create));
         let dropped_rect_gs = rect_gs && copy.GS.pShaderBytecode.is_null();
@@ -6306,9 +6356,11 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
     });
     if hc < 0 && ccached.is_some() {
-        forget_compute_blob(ckey);
-        if cfrom_disk {
-            driver_cache::note(false, cdisk.as_deref());
+        if driver_cache::refused(hc) {
+            forget_compute_blob(ckey);
+            if cfrom_disk {
+                driver_cache::note(false, cdisk.as_deref());
+            }
         }
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
         compute = std::ptr::null_mut();
