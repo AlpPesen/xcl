@@ -639,9 +639,12 @@ impl Lw {
             let early_depth_stencil = g.ps.as_ref().is_some_and(|p| p.early_depth);
             let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil } } else { super::graphics::StageInfo::Vertex };
             self.s.try_finish_graphics(g.io, info)
-        } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
+        } else if limit > 0
+            && (((numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32)
+                || (numthreads == [64, 1, 1] && hw == 64 && split_tid.is_none()))
+        {
             self.s.m.optimize();
-            dispatch_chain = self.s.split_compute(numthreads, split_tid, limit).map(std::sync::Arc::new);
+            dispatch_chain = self.s.split_compute(numthreads, split_tid, hw, limit).map(std::sync::Arc::new);
             self.s.finish_optimized(numthreads, Some(hw))
         } else {
             self.s.try_finish(numthreads, Some(hw))
