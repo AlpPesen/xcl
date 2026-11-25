@@ -9431,3 +9431,77 @@ fn gpu_ps_readfirstlane_loop_on_a_primitive_edge_ends() {
     println!("{:?}: lane counts {lanes:?}; most iterations {max_it}; {} of {} pixels wrong, first {:?}", runner::adapter(), bad.len(), size * size, bad.iter().take(8).collect::<Vec<_>>());
     assert!(bad.is_empty(), "{} pixels wrong (iterations, wave OR, own word, lane count), first {:?}", bad.len(), &bad[..bad.len().min(8)]);
 }
+
+/// A wave32 pixel program under `s_wqm` with the march loop of a retail volumetric PS after
+/// another loop: every lane counts steps in a vector register, and the loop goes on as long as
+/// a lane of the mask taken from EXEC has not reached 6 (`v_cmp_le_f32`, `s_andn2 mask, mask,
+/// vcc`, `s_cbranch_scc1`). Exports (passes of the march, the lane's steps, 1, 1).
+fn mask_loop_ps() -> super::Translation {
+    use super::PsInterface;
+    let before = [
+        ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 2)], None),
+        ins("S_ADD_U32", "ENC_SOP2", &[("SDST", 9), ("SSRC0", 9), ("SSRC1", 129)], None),
+        ins("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 9), ("SSRC1", 130)], None),
+    ]
+    .concat();
+    let march = [
+        ins("V_ADD_F32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 242), ("VSRC1", 9)], None),
+        ins("S_ADD_U32", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 8), ("SSRC1", 129)], None),
+        ins("V_CMP_LE_F32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 9)], Some(0x40C0_0000)),
+        ins("S_ANDN2_B32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 106)], None),
+    ]
+    .concat();
+    let back = |body: &[u8]| (-((body.len() as i64 + 4) / 4)) as u16 as u64;
+    let mut code = [
+        ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 126)], None),
+        ins("S_WQM_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None),
+        ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 128)], None),
+    ]
+    .concat();
+    code.extend(&before);
+    code.extend(ins("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", back(&before))], None));
+    code.extend(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)], None));
+    code.extend(ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)], None));
+    code.extend(ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)], None));
+    code.extend(&march);
+    code.extend(ins("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", back(&march))], None));
+    code.extend(
+        [
+            ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 20)], None),
+            ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 8)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 242)], None),
+            ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 10), ("VSRC1", 9), ("VSRC2", 11), ("VSRC3", 11), ("DONE", 1), ("VM", 1)], None),
+            ins("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .concat(),
+    );
+    let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+    translate(&code, &Options { mode: Mode::Pixel(psi), wave64: false, ..Default::default() }).unwrap()
+}
+
+/// Draws `mask_loop_ps` on two triangles sharing a diagonal (helper lanes along it): the march
+/// ends after its 6 passes in every pixel. A helper lane's steps cannot be read from the second
+/// pass on with an RDNA2 driver, its bit stayed in the mask and the loop ran to the loop budget
+/// (`mask_live` in the prelude).
+#[test]
+fn gpu_ps_mask_loop_on_a_primitive_edge_ends() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    let vs = super::dxc::compile("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.5, 1.0); }\n", "main", "vs_6_6", &[]).unwrap();
+    let pt = mask_loop_ps();
+    assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+    assert!(pt.hlsl.contains("scc = (uint)(mask_live("), "{}", pt.hlsl);
+    // the fourth channel: the hardware wave's lane count
+    let hlsl = pt.hlsl.replacen("    if (!xcl_live) discard;", "    xo.t0[3] = (float)WaveGetLaneCount();\n    if (!xcl_live) discard;", 1);
+    let ps = super::dxc::compile(&hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{hlsl}"));
+    let quad = [-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+    let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+    let size = 32usize;
+    let px = runner::draw(&vs, &ps, &layout, &quad, 8, &[], &[], size as u32, [9.0; 4]).unwrap();
+    let lanes: std::collections::BTreeSet<u32> = px.iter().map(|p| p[3] as u32).collect();
+    let bad: Vec<(usize, usize, [f32; 4])> = (0..size * size).filter(|&i| px[i][0] != 6.0 || px[i][1] != 6.0).map(|i| (i % size, i / size, px[i])).collect();
+    println!("{:?}: lane counts {lanes:?}; {} of {} pixels wrong, first {:?}", runner::adapter(), bad.len(), size * size, bad.iter().take(8).collect::<Vec<_>>());
+    assert!(bad.is_empty(), "{} pixels wrong (passes, steps, 1, lane count), first {:?}", bad.len(), &bad[..bad.len().min(8)]);
+}

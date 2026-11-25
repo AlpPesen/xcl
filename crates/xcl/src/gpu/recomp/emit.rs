@@ -1698,7 +1698,15 @@ impl Em {
             _ => return Err("SALU"),
         };
         self.line(&format!("uint {t} = {res};"));
-        if let Some(c) = scc {
+        // "is a lane left" of a lane mask (an AND with EXEC or VCC) in a pixel shader: over the
+        // live lanes (`mask_live`)
+        let lanes_left = matches!(name, "s_and_b32" | "s_andn2_b32")
+            && matches!(self.opt.mode, Mode::Pixel(_))
+            && d.enc.name == "ENC_SOP2"
+            && ["SSRC0", "SSRC1", "SDST"].iter().any(|f| matches!(Self::field(d, f), 106 | 126));
+        if lanes_left {
+            self.line(&format!("scc = (uint)(mask_live({t}) != 0u);"));
+        } else if let Some(c) = scc {
             self.line(&format!("scc = (uint)({c});"));
         }
         self.write32(&dst, &t);
@@ -6288,6 +6296,19 @@ uint first_lane(uint lo, uint hi) { return select(lo != 0u, firstbitlow(lo), sel
 // and the GPU was reset. So the first live lane of EXEC is read if EXEC has one. The value
 // is the same there: the console's compiler reads the first lane of values that are equal in
 // every lane, or of any lane it then removes from EXEC (a waterfall loop).
+// "Is a lane left" of a lane mask in a pixel shader, over the live lanes. AMD's RDNA2 driver
+// (RX 6700 XT) also stops keeping a helper lane's registers at a loop's back edge when the
+// shader has another loop before it: from the second pass on, everything a helper lane holds
+// reads as 0. A loop that goes on as long as lanes are left in a mask (s_andn2 mask, mask, EXEC;
+// s_cbranch_scc1) then kept a helper lane's bit, whose "done" condition comes from registers
+// that no longer change, and ran to the loop budget (a retail volumetric light pass took seconds
+// a draw and the GPU was reset). The helper lanes leave with the live ones.
+uint mask_live(uint m) {
+#ifdef XCL_PIXEL
+    m &= ballot(true).x;
+#endif
+    return m;
+}
 uint first_lane_live(uint lo, uint hi) {
 #ifdef XCL_PIXEL
     uint2 lv = ballot(true);
