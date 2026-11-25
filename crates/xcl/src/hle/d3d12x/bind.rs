@@ -801,12 +801,22 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     Ok((dst, dst_off))
 }
 
+/// local: `XCL_SKIP_MESH=1` leaves out the draws of the two-pass mesh path (a bisection of GPU hangs)
+fn skip_mesh() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_SKIP_MESH").is_ok_and(|v| v.trim() == "1"))
+}
+
 pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
     type PcDm = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
     let pc_dm: PcDm = std::mem::transmute(super::real::orig_fn(this, 79));
     let raw_pso = with(this, |s| s.pso);
     let pso = pso_for_draw(raw_pso);
     if let Some(tp) = super::real::two_pass_of(pso) {
+        if skip_mesh() {
+            count(DRAWS_SKIPPED);
+            return;
+        }
         let groups = x.saturating_mul(y).saturating_mul(z);
         if groups == 0 {
             return;
@@ -878,6 +888,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let count_at = super::real::console_buffer(count_buf).filter(|&(_, n)| count_off as usize + 4 <= n).map(|(p, _)| p + count_off as usize);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if let Some(tp) = super::real::two_pass_of(pso) {
+        if skip_mesh() {
+            count(DRAWS_SKIPPED);
+            return;
+        }
         if let Some(msig) = dispatch_mesh_sig_of(sig) {
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
             let run = (|| -> Result<(), String> {
