@@ -1220,19 +1220,38 @@ impl Pipelines {
         }
     }
 
-    /// The compute pipeline of `c` (made and released).
+    /// The compute pipeline of `c` (made and released). Of a program split into a dispatch chain
+    /// each piece's, and the whole form's an `ExecuteIndirect` runs: as the runtime makes them,
+    /// with the chain's root signature (`real::dispatch_chain`).
     fn make(&self, c: &recomp::pso::Compiled) {
-        self.make_with_cache_path(c, None);
+        match &c.dispatch_chain {
+            Some(chain) => {
+                for piece in &chain.pieces {
+                    self.make_code(piece, &c.samplers, true, None);
+                }
+                self.make_code(&c.dxil, &c.samplers, true, None);
+            }
+            None => self.make_code(&c.dxil, &c.samplers, false, None),
+        }
     }
 
+    #[cfg(test)]
     fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
+        self.make_code(&c.dxil, &c.samplers, false, path_override);
+    }
+
+    fn make_code(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], split: bool, path_override: Option<PathBuf>) {
         use windows::Win32::Graphics::Direct3D12::*;
-        let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
+        let key: Vec<u32> = samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).chain([split as u32]).collect();
         let rs = {
             let mut g = self.signatures.lock().unwrap();
             match g.get(&key) {
                 Some(rs) => rs.clone(),
-                None => match recomp::pso::abi_root_signature_with(&self.dev, true, &c.samplers) {
+                None => match if split {
+                    recomp::pso::dispatch_chain_root_signature(&self.dev, samplers)
+                } else {
+                    recomp::pso::abi_root_signature_with(&self.dev, true, samplers)
+                } {
                     Ok(rs) => {
                         g.insert(key, rs.clone());
                         rs
@@ -1246,19 +1265,19 @@ impl Pipelines {
         };
         let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
             ..Default::default()
         };
         use crate::hle::d3d12x::real::driver_cache;
-        let path = path_override.or_else(|| driver_cache::path(&c.dxil, desc.Flags.0));
+        let path = path_override.or_else(|| driver_cache::path(dxil, desc.Flags.0));
         let cached = path.as_deref().and_then(driver_cache::load);
-        let over_cap = self.max_dxil != 0 && c.dxil.len() > self.max_dxil;
+        let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
         // tens of minutes and gigabytes; the pass finishes without it, and the runtime builds it
         // when a title needs the pipeline. `XCL_PIPELINE_MAX_KB` 0 turns the cap off.
         if cached.is_none() && over_cap {
             self.capped.fetch_add(1, Ordering::Relaxed);
-            self.capped_bytes.fetch_add(c.dxil.len(), Ordering::Relaxed);
+            self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
@@ -1286,7 +1305,7 @@ impl Pipelines {
             *self.running.0.lock().unwrap() -= 1;
             self.running.1.notify_one();
             self.capped.fetch_add(1, Ordering::Relaxed);
-            self.capped_bytes.fetch_add(c.dxil.len(), Ordering::Relaxed);
+            self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }

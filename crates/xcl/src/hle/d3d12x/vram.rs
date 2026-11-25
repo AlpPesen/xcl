@@ -23,6 +23,7 @@
 //! driver does not make reserved: D32S8, MSAA): heaps of the placement's size, shared by
 //! placements inside them, let go 2 s after their last resource (256 MiB ones: 2.8 GB of D32S8).
 
+use super::place_times::{step, Step};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -617,6 +618,7 @@ impl Pages {
             }
             let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
             let region = D3D12_TILE_REGION_SIZE { NumTiles: num_tiles, UseBox: false.into(), ..Default::default() };
+            let _timer = step(Step::Map);
             self.queue.UpdateTileMappings(
                 res,
                 1,
@@ -630,6 +632,7 @@ impl Pages {
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
         }
+        let _timer = step(Step::Signal);
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
     }
@@ -696,7 +699,9 @@ impl Pages {
     unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
+        let timer = step(Step::Sweep);
         self.sweep(now);
+        drop(timer);
 
         let mut missing = 0usize;
         let mut preferred: Option<u32> = None;
@@ -716,6 +721,7 @@ impl Pages {
         let pools = &mut self.pools;
         let pool = &mut self.pool;
         let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
+            let _timer = step(Step::Heap);
             let heap = alloc_pool_heap(dev)?;
             Some(pools.push_heap(heap))
         })?;
@@ -865,7 +871,9 @@ unsafe fn place_on_pages(
     riid: *const windows_sys::core::GUID,
     ppv: *mut *mut c_void,
 ) -> Option<HRESULT> {
+    let timer = step(Step::Va);
     let va = canonical_va(va);
+    drop(timer);
     if desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D {
         return None;
     }
@@ -882,7 +890,9 @@ unsafe fn place_on_pages(
     };
     let dev_key = dev.as_raw() as usize;
     let is_reservable = {
+        let timer = step(Step::Lock);
         let mut g = PAGES.lock().unwrap();
+        drop(timer);
         let pages = g.entry(dev_key).or_insert_with(|| Pages::new(dev)).as_mut()?;
         *pages.reservable_cache.entry((tiled.Format.0, tiled.SampleDesc.Count)).or_insert_with(|| reservable(dev, &tiled))
     };
@@ -892,7 +902,9 @@ unsafe fn place_on_pages(
     }
     // CreateReservedResource and GetResourceTiling do not touch `PAGES`; keep them outside the
     // lock so concurrent streaming threads, `before_execute`, and `page_bytes` do not serialize.
+    let timer = step(Step::Reserved);
     let hr = super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, state as usize, clear as usize, riid, ppv);
+    drop(timer);
     if hr < 0 || (*ppv).is_null() {
         log(&format!("{hr:#x}"));
         return None;
@@ -900,9 +912,13 @@ unsafe fn place_on_pages(
     let raw = *ppv;
     let res = ID3D12Resource::from_raw_borrowed(&raw)?;
     let mut total = 0u32;
+    let timer = step(Step::Tiling);
     dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+    drop(timer);
     let bound = {
+        let timer = step(Step::Lock);
         let mut g = PAGES.lock().unwrap();
+        drop(timer);
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
             if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
                 pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra });

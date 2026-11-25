@@ -13,6 +13,7 @@
 //! Console queue and list types add DMA (0x10, the copy engine); console queue priorities
 //! are mapped onto PC ones.
 
+use super::place_times::{self, Step};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
@@ -1065,9 +1066,13 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     // placement takes no time (`pso_async::title_held`)
     let _in_pc = super::pso_async::pc_call();
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    let texture = u32::from_le_bytes(x[0..4].try_into().unwrap()) != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+    let _total = texture.then(|| place_times::step(Step::Total));
+    let timer = texture.then(|| place_times::step(Step::Desc));
     let d = pc_resource_desc_for_device(this, &x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
     note_alias(va as usize, &x);
+    drop(timer);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
     let state = pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state);
@@ -1093,7 +1098,9 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let mut placed_hr = None;
     if !buffer {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+        let timer = place_times::step(Step::Desc);
         let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
+        drop(timer);
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
                 if hr >= 0 && !(*ppv).is_null() {
@@ -1117,7 +1124,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     };
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
-        match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
+        let timer = place_times::step(Step::Register);
+        let registered = super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32));
+        drop(timer);
+        match registered {
             Ok(()) => {
                 real::note_title_address(*ppv as usize, va as usize);
                 return hr;
