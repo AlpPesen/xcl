@@ -40,6 +40,8 @@ struct State {
     arena: crate::gpu::uma::Arena,
     res_buf: Option<(ID3D12Resource, u64, usize)>,
     res_retired: Vec<(ID3D12Resource, u64, usize)>,
+    /// the recording used the shared record buffer (`shared_record_buffer`)
+    shared_records: bool,
     /// rewritten indirect arguments (`scratch_args`): the block, its bytes in use, and the
     /// bytes of blocks this recording took
     scratch: Option<(ID3D12Resource, u64, usize)>,
@@ -127,6 +129,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.args_gfx.clear();
         s.rs_gfx = 0;
         s.heaps = [0; 2];
+        s.shared_records = false;
         // (the scratch blocks are in `res_retired` already)
         (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
         let mut res_bufs = std::mem::take(&mut s.res_retired);
@@ -423,9 +426,55 @@ fn two_pass_steps(max: u32) -> impl Iterator<Item = (u32, bool)> {
     (0..max).flat_map(|k| [(k, true), (k, false)])
 }
 
+/// The record buffers all recordings of a device share (`XCL_TWO_PASS_SHARED=0`: one of each list,
+/// kept until its allocator is reset). A retail title's world frame has more than a hundred lists
+/// with two-pass draws: at 32 MiB a list the first frame took 4 GB of video memory. A direct
+/// queue runs its lists in order and every pass over the records ends with a UAV barrier
+/// (`emit_uav_barrier`), so the next list's passes see none of it as long as there is one direct
+/// queue (`one_direct_queue`).
+static SHARED_RECORDS: Mutex<Vec<(ID3D12Resource, u64, usize)>> = Mutex::new(Vec::new());
+const SHARED_LEAST: u64 = 32 << 20;
+
+fn shared_records_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TWO_PASS_SHARED").map_or(true, |v| v.trim() != "0"))
+}
+
+/// The title submitted work to at most one direct queue so far.
+unsafe fn one_direct_queue() -> bool {
+    let direct = |q: usize| {
+        let raw = q as *mut c_void;
+        ID3D12CommandQueue::from_raw_borrowed(&raw).is_some_and(|q| q.GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT)
+    };
+    super::present::known_queues().into_iter().filter(|&q| direct(q)).count() <= 1
+}
+
+/// A shared record buffer of at least `need` bytes: buffer, address, bytes.
+unsafe fn shared_record_buffer(dev: &ID3D12Device, need: u64) -> Result<(ID3D12Resource, u64), String> {
+    let key = dev.as_raw() as usize;
+    let mut all = SHARED_RECORDS.lock().unwrap();
+    if let Some((buf, cap, _)) = all.iter().find(|(_, cap, d)| *d == key && *cap >= need) {
+        return Ok((buf.clone(), *cap));
+    }
+    let bytes = need.max(SHARED_LEAST);
+    let buf = default_uav_buffer(dev, bytes, "shared two-pass record buffer")?;
+    all.push((buf.clone(), bytes, key));
+    Ok((buf, bytes))
+}
+
 /// The record buffer of this list for `need_bytes` (at most 128 MiB): buffer, address, bytes.
 unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64, u64), String> {
     let need = need_bytes.max(4 << 20).next_multiple_of(1 << 20).min(128 << 20);
+    if shared_records_on() && one_direct_queue() {
+        let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
+        let (buf, cap) = shared_record_buffer(&dev, need)?;
+        let first = with(this, |s| !std::mem::replace(&mut s.shared_records, true));
+        if let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this).filter(|_| first) {
+            emit_uav_barrier(list, None); // what an earlier list left in the records
+        }
+        let va = buf.GetGPUVirtualAddress();
+        return Ok((buf, va, cap));
+    }
     if let Some((buf, cap, _dev)) = with(this, |s| s.res_buf.as_ref().filter(|(_, cap, _)| *cap >= need).cloned()) {
         let va = buf.GetGPUVirtualAddress();
         return Ok((buf, va, cap));
@@ -2493,6 +2542,28 @@ void main(uint t : SV_GroupIndex) {
         assert!(pool_keeps(1, 128 << 20, 128 << 20));
         assert!(!pool_keeps(2, 256 << 20, 4 << 20));
         assert!(!pool_keeps(16, 0, 1 << 20));
+    }
+
+    /// Recordings share one record buffer, a bigger one is made only when that one is too small.
+    #[test]
+    fn gpu_two_pass_record_buffer_is_shared_by_the_recordings() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev) }.is_err() {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        let dev = dev.unwrap();
+        unsafe {
+            let (a, cap) = shared_record_buffer(&dev, 4 << 20).unwrap();
+            assert_eq!(cap, SHARED_LEAST);
+            let (b, _) = shared_record_buffer(&dev, SHARED_LEAST).unwrap();
+            assert_eq!(a.as_raw(), b.as_raw(), "a second recording's records are the first one's");
+            let (c, big) = shared_record_buffer(&dev, SHARED_LEAST + 1).unwrap();
+            assert!(c.as_raw() != a.as_raw() && big > SHARED_LEAST);
+            let (d, _) = shared_record_buffer(&dev, 4 << 20).unwrap();
+            assert_eq!(d.as_raw(), a.as_raw());
+        }
     }
 
     #[test]
