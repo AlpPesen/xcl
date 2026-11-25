@@ -3994,7 +3994,8 @@ impl Em {
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
                 let t = self.t();
                 let rla = self.rla_uniform_fn();
-                self.line(&format!("uint {t} = {rla}({a}, first_lane({el}, {eh}));"));
+                // (a live lane of EXEC where there is one: `first_lane_live`)
+                self.line(&format!("uint {t} = {rla}({a}, first_lane_live({el}, {eh}));"));
                 self.write32(&dst, &t);
                 return Ok(());
             }
@@ -6226,6 +6227,22 @@ float3 cube_dir(float s, float t, float face) {
 // the cube of a cube array the face coordinate (face + 8 · slice) is in
 float cube_slice(float face) { return (float)(((uint)round(face)) / 8u); }
 uint first_lane(uint lo, uint hi) { return select(lo != 0u, firstbitlow(lo), select(hi != 0u, 32u + firstbitlow(hi), 0u)); }
+// The lane a v_readfirstlane reads. In a pixel shader EXEC holds helper lanes (s_wqm) and its
+// first lane is often one, on a primitive's edge. A helper lane's registers cannot be read once
+// a loop has run a wave op: AMD's RDNA2 driver (RX 6700 XT) gives 0 for everything a helper
+// lane holds after a WaveReadLaneAt inside a loop, quad reads included. A loop whose state the
+// console's compiler carries in a vector (v_mov v, s … v_readfirstlane s, v) then read 0 back
+// each time round and ran to the loop budget: a retail volumetric light pass took seconds a draw
+// and the GPU was reset. So the first live lane of EXEC is read if EXEC has one. The value
+// is the same there: the console's compiler reads the first lane of values that are equal in
+// every lane, or of any lane it then removes from EXEC (a waterfall loop).
+uint first_lane_live(uint lo, uint hi) {
+#ifdef XCL_PIXEL
+    uint2 lv = ballot(true);
+    if (((lo & lv.x) | (hi & lv.y)) != 0u) { lo &= lv.x; hi &= lv.y; }
+#endif
+    return first_lane(lo, hi);
+}
 uint lanemask_lt_lo() { return lane_id >= 32u ? 0xFFFFFFFFu : (lane_id == 0u ? 0u : (0xFFFFFFFFu >> (32u - lane_id))); }
 uint lanemask_lt_hi() { return lane_id <= 32u ? 0u : (0xFFFFFFFFu >> (64u - lane_id)); }
 uint wqm(uint m) { uint q = m | (m >> 1); q = q | (q >> 2); q &= 0x11111111u; return q * 15u; }
