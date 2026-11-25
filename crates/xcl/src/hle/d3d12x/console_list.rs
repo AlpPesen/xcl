@@ -764,12 +764,24 @@ unsafe fn ensure_dispatch_heaps(list: &ID3D12GraphicsCommandList, bound: &mut Ve
         if let Some(d) = &dev { super::console_heap::shared_sampler_heap(d); }
         super::console_heap::global_sampler_heap()
     });
-    let view = crate::gpu::recomp::pso::heap_windows().then(super::console_heap::global_heap).flatten();
+    let view = super::console_heap::global_heap();
     let (view, sampler) = match dev.as_ref().map(|d| d.as_raw() as usize) {
         Some(dev_raw) => (heap_on_device(view, dev_raw), heap_on_device(sampler, dev_raw)),
         None => (view, sampler),
     };
     ensure_dispatch_heaps_with(list, bound, has_sampler, view, sampler);
+}
+
+/// Choose the GPU descriptor handle for `ClearUnorderedAccessView*` on a console command list.
+/// When both slots are hosted in the shared `GLOBAL` heap, an inline RAM `memcpy`
+/// (`CopyDescriptorsSimple`) copies the console descriptor words without initializing `g`'s PC
+/// UAV slot, so the live PC UAV lives at `c.pc_gpu_uav` (#2461).
+fn clear_uav_gpu_handle(g: &super::console_heap::Slot, c: &super::console_heap::Slot) -> u64 {
+    if c.shared_srv != 0 && g.shared_srv != 0 && c.pc_gpu_uav != 0 {
+        c.pc_gpu_uav
+    } else {
+        g.pc_gpu_uav
+    }
 }
 
 unsafe fn ensure_uav_clear_heap(list: &ID3D12GraphicsCommandList, bound: &mut Vec<ID3D12DescriptorHeap>, has_sampler: &mut bool) {
@@ -897,11 +909,12 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let res = q(2) as *mut c_void;
                 let (gpu, cpu) = (super::console_heap::slot(q(0)), super::console_heap::slot(q(1)));
                 match (gpu, cpu, ID3D12Resource::from_raw_borrowed(&res)) {
-                    (Some(g), Some(c), Some(r)) if g.pc_gpu_uav != 0 => {
-                        if g.shared_srv != 0 {
+                    (Some(g), Some(c), Some(r)) if clear_uav_gpu_handle(&g, &c) != 0 => {
+                        let gpu_uav = clear_uav_gpu_handle(&g, &c);
+                        if g.shared_srv != 0 || (c.shared_srv != 0 && gpu_uav == c.pc_gpu_uav) {
                             ensure_uav_clear_heap(&list, &mut bound_heaps, &mut has_sampler_heap);
                         }
-                        let (gh, ch) = (D3D12_GPU_DESCRIPTOR_HANDLE { ptr: g.pc_gpu_uav }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: c.pc_uav as usize });
+                        let (gh, ch) = (D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu_uav }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: c.pc_uav as usize });
                         if get(1) != 0 {
                             let f = values.map(f32::from_bits);
                             list.ClearUnorderedAccessViewFloat(gh, ch, r, &f, &[]);
@@ -973,17 +986,19 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         io[crate::gpu::recomp::IO_GROUP_LIMIT] = limit;
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
+                        // Bind descriptor heaps before the root signature so SetDescriptorHeaps
+                        // never invalidates root signature state (D3D12 #1419 / #2461).
+                        ensure_dispatch_heaps(&list, &mut bound_heaps, &mut has_sampler_heap);
                         // the pipeline's own root signature when it has static samplers
                         let own = super::real::pso_root_signature(real).or(((*p).rs != 0).then_some((*p).rs)).map(|r| r as *mut c_void);
                         match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
                             Some(r) => list.SetComputeRootSignature(r),
                             None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
                         }
-                        ensure_dispatch_heaps(&list, &mut bound_heaps, &mut has_sampler_heap);
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
                         for k in 0..4 {
-                            list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().unwrap_or(uma_va));
+                            list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().filter(|&v| v != 0).unwrap_or(uma_va));
                         }
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
@@ -1263,5 +1278,25 @@ mod tests {
 
             list.Close().unwrap();
         }
+    }
+
+    #[test]
+    fn clear_uav_prefers_cpu_slot_shared_gpu_handle_for_inline_copies() {
+        let slot = |shared_srv, pc_gpu_uav| super::super::console_heap::Slot {
+            at: 0,
+            k: 0,
+            index: 0,
+            pc_srv: 0,
+            pc_uav: 0x100,
+            pc_gpu_uav,
+            shared_srv,
+            sampler: false,
+        };
+        // Both hosted in GLOBAL (inline CopyDescriptorsSimple): use CPU slot's initialized GPU handle.
+        assert_eq!(clear_uav_gpu_handle(&slot(0x2000, 0x3000), &slot(0x1000, 0x4000)), 0x4000);
+        // Unhosted shader-visible heap (no shared_srv): keep g.pc_gpu_uav.
+        assert_eq!(clear_uav_gpu_handle(&slot(0, 0x3000), &slot(0x1000, 0x4000)), 0x3000);
+        // CPU slot not in GLOBAL: keep g.pc_gpu_uav.
+        assert_eq!(clear_uav_gpu_handle(&slot(0x2000, 0x3000), &slot(0, 0)), 0x3000);
     }
 }
