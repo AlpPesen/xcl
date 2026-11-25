@@ -205,6 +205,13 @@ struct RetiredTiles {
     marks: Option<Vec<(ID3D12Fence, u64)>>,
 }
 
+struct PendingUnmap {
+    seq: u64,
+    entries: Vec<(usize, (u32, u32))>,
+    /// Fence marks on every known title queue (`None` = signal failed, keep mapped/held).
+    marks: Option<Vec<(ID3D12Fence, u64)>>,
+}
+
 struct State {
     dev: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -234,6 +241,13 @@ struct State {
     /// decommits and commits again thousands of tiles a second, and each `UpdateTileMappings`
     /// took ~0.15 ms.)
     parked: FxHashMap<usize, (u32, u32)>,
+    /// parked tiles awaiting in-flight title queues before `UpdateTileMappings(NULL)` executes
+    pending_unmaps: VecDeque<PendingUnmap>,
+    /// tile VA → `(pool_tile, unmap_seq)` for tiles still mapped in hardware inside `pending_unmaps`;
+    /// re-committing a VA cancels its pending unmap with no GPU tile-mapping change
+    pending_unmap_va: FxHashMap<usize, ((u32, u32), u64)>,
+    /// monotonic sequence id preventing ABA cancellation across repeated decommit/recommit cycles
+    unmap_seq: u64,
     /// unmapped parked pool tiles awaiting `self.queue` and in-flight title queues before entering `free`
     quarantined: VecDeque<RetiredTiles>,
     /// unpinned unused pool tiles queued from `forget_in` (cannot signal queues under D3D12 release locks)
@@ -561,6 +575,9 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
             parked: FxHashMap::default(),
+            pending_unmaps: VecDeque::new(),
+            pending_unmap_va: FxHashMap::default(),
+            unmap_seq: 0,
             quarantined: VecDeque::new(),
             pending_quarantine: Vec::new(),
             queue_fences: FxHashMap::default(),
@@ -789,7 +806,7 @@ impl State {
         while t < end {
             if !self.mapped.contains_key(&t) && self.window_index(t).is_some() {
                 // still mapped there: no new mapping, what it held is cleared
-                if let Some(tile) = self.parked.remove(&t) {
+                if let Some(tile) = self.parked.remove(&t).or_else(|| self.pending_unmap_va.remove(&t).map(|(tile, _)| tile)) {
                     self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
                     self.runs = None;
                     self.to_zero.push((t, TILE));
@@ -1433,6 +1450,7 @@ impl State {
         if !self.pinned.contains_key(&tile)
             && !self.mapped.values().any(|e| e.pool == tile)
             && !self.parked.values().any(|&p| p == tile)
+            && !self.pending_unmap_va.values().any(|&(p, _)| p == tile)
             && !self.quarantined.iter().any(|b| b.tiles.contains(&tile))
             && !self.pending_quarantine.contains(&tile)
             && !self.free.contains(&tile)
@@ -1454,6 +1472,7 @@ impl State {
                 !self.pinned.contains_key(tile)
                     && !self.mapped.values().any(|e| e.pool == *tile)
                     && !self.parked.values().any(|&p| p == *tile)
+                    && !self.pending_unmap_va.values().any(|&(p, _)| p == *tile)
                     && !self.quarantined.iter().any(|b| b.tiles.contains(tile))
             })
             .collect();
@@ -1496,29 +1515,96 @@ impl State {
         ok
     }
 
+    unsafe fn signal_title_queues(&mut self) -> Option<Vec<(ID3D12Fence, u64)>> {
+        if !self.sync_known_queues() {
+            return None;
+        }
+        let mut marks = Vec::with_capacity(self.queue_fences.len());
+        for (q, fence, val) in self.queue_fences.values_mut() {
+            let next = *val + 1;
+            if q.Signal(&*fence, next).is_ok() {
+                *val = next;
+                marks.push((fence.clone(), next));
+            } else {
+                return None;
+            }
+        }
+        Some(marks)
+    }
+
     unsafe fn quarantine_tiles(&mut self, tiles: Vec<(u32, u32)>) {
         if tiles.is_empty() {
             return;
         }
-        let mut ok = self.sync_known_queues();
-        let mut marks = Vec::with_capacity(1 + self.queue_fences.len());
-        marks.push((self.fence.clone(), self.value));
-        if ok {
-            for (q, fence, val) in self.queue_fences.values_mut() {
-                let next = *val + 1;
-                if q.Signal(&*fence, next).is_ok() {
-                    *val = next;
-                    marks.push((fence.clone(), next));
-                } else {
-                    ok = false;
-                    break;
-                }
+        let marks = self.signal_title_queues().map(|mut title_marks| {
+            title_marks.push((self.fence.clone(), self.value));
+            title_marks
+        });
+        self.quarantined.push_back(RetiredTiles { tiles, marks });
+    }
+
+    /// Unmap `entries` on `self.queue` and quarantine their unpinned pool tiles behind `self.fence`.
+    /// Caller guarantees every active title queue has already passed the work that could touch them.
+    unsafe fn unmap_entries_and_quarantine(&mut self, entries: Vec<(usize, (u32, u32))>) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+        let mut tiles: Vec<(u32, u32)> = Vec::new();
+        for (va, tile) in entries {
+            if let Some(wi) = self.window_index(va) {
+                by_window.entry(wi).or_default().push(va);
+            }
+            if !self.pinned.contains_key(&tile)
+                && !self.mapped.values().any(|e| e.pool == tile)
+                && !self.parked.values().any(|&p| p == tile)
+                && !self.pending_unmap_va.values().any(|&(p, _)| p == tile)
+                && !self.quarantined.iter().any(|b| b.tiles.contains(&tile))
+                && !tiles.contains(&tile)
+            {
+                tiles.push(tile);
             }
         }
-        self.quarantined.push_back(RetiredTiles { tiles, marks: ok.then_some(marks) });
+        for (wi, ts) in by_window {
+            let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
+            self.unmap_tiles(&r, b, &ts);
+        }
+        self.signal();
+        if !tiles.is_empty() {
+            self.quarantined.push_back(RetiredTiles {
+                tiles,
+                marks: Some(vec![(self.fence.clone(), self.value)]),
+            });
+        }
+    }
+
+    /// Execute deferred `UpdateTileMappings(NULL)` batches once all title queues have passed their
+    /// completion marks, skipping any VA that was re-committed in the meantime.
+    unsafe fn drain_pending_unmaps(&mut self) -> bool {
+        let mut unmapped = false;
+        while let Some(front) = self.pending_unmaps.front() {
+            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v));
+            if !ready {
+                break;
+            }
+            let batch = self.pending_unmaps.pop_front().unwrap();
+            let mut ready_entries = Vec::with_capacity(batch.entries.len());
+            for (va, tile) in batch.entries {
+                if self.pending_unmap_va.get(&va).is_some_and(|&(_, s)| s == batch.seq) {
+                    self.pending_unmap_va.remove(&va);
+                    ready_entries.push((va, tile));
+                }
+            }
+            if !ready_entries.is_empty() {
+                self.unmap_entries_and_quarantine(ready_entries);
+                unmapped = true;
+            }
+        }
+        unmapped
     }
 
     unsafe fn drain_quarantined(&mut self) -> bool {
+        self.drain_pending_unmaps();
         let mut freed = false;
         while let Some(front) = self.quarantined.front() {
             let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v));
@@ -1536,39 +1622,27 @@ impl State {
         freed
     }
 
-    /// The parked tiles unmapped from their windows (one call per window) and their unpinned
-    /// pool tiles quarantined behind `self.queue` and every known title queue's completion fence.
-    /// Pools left all free are not retired here: callers do that (`retire_free_pools`) unless
-    /// they take a tile right away.
+    /// Queue parked tiles for unmapping once all active title queues finish in-flight work (never
+    /// issuing `UpdateTileMappings(NULL)` concurrently with executing title queues, and never
+    /// inserting a cross-queue GPU `Wait` on `self.queue`). When no title queues are busy, unmaps
+    /// immediately on `self.queue` and quarantines unpinned pool tiles behind `self.fence`.
     unsafe fn flush_parked(&mut self) -> bool {
+        self.drain_pending_unmaps();
         if self.parked.is_empty() {
             return false;
         }
-        let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
-        let mut tiles: Vec<(u32, u32)> = Vec::new();
-        for (t, tile) in std::mem::take(&mut self.parked) {
-            if let Some(wi) = self.window_index(t) {
-                by_window.entry(wi).or_default().push(t);
+        let entries: Vec<(usize, (u32, u32))> = std::mem::take(&mut self.parked).into_iter().collect();
+        let title_marks = self.signal_title_queues();
+        if title_marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v)) {
+            self.unmap_entries_and_quarantine(entries);
+        } else {
+            self.unmap_seq = self.unmap_seq.wrapping_add(1);
+            let seq = self.unmap_seq;
+            for &(va, tile) in &entries {
+                self.pending_unmap_va.insert(va, (tile, seq));
             }
-            if !self.pinned.contains_key(&tile) {
-                tiles.push(tile);
-            }
+            self.pending_unmaps.push_back(PendingUnmap { seq, entries, marks: title_marks });
         }
-        for (wi, ts) in by_window {
-            let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
-            self.unmap_tiles(&r, b, &ts);
-        }
-        self.signal();
-        for tile in self.pending_quarantine.drain(..) {
-            if !self.pinned.contains_key(&tile)
-                && !self.mapped.values().any(|e| e.pool == tile)
-                && !self.quarantined.iter().any(|b| b.tiles.contains(&tile))
-                && !tiles.contains(&tile)
-            {
-                tiles.push(tile);
-            }
-        }
-        self.quarantine_tiles(tiles);
         true
     }
 }
@@ -1911,6 +1985,9 @@ mod tests {
                 free: Vec::new(),
                 retired: Vec::new(),
                 parked: FxHashMap::default(),
+                pending_unmaps: VecDeque::new(),
+                pending_unmap_va: FxHashMap::default(),
+                unmap_seq: 0,
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 quarantined: VecDeque::new(),
@@ -2122,6 +2199,9 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                pending_unmaps: VecDeque::new(),
+                pending_unmap_va: FxHashMap::default(),
+                unmap_seq: 0,
                 quarantined: VecDeque::new(),
                 pending_quarantine: Vec::new(),
                 queue_fences: FxHashMap::default(),
@@ -2220,6 +2300,9 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                pending_unmaps: VecDeque::new(),
+                pending_unmap_va: FxHashMap::default(),
+                unmap_seq: 0,
                 quarantined: VecDeque::new(),
                 pending_quarantine: Vec::new(),
                 queue_fences: FxHashMap::default(),
@@ -2346,6 +2429,9 @@ mod tests {
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
             parked: FxHashMap::default(),
+            pending_unmaps: VecDeque::new(),
+            pending_unmap_va: FxHashMap::default(),
+            unmap_seq: 0,
             quarantined: VecDeque::new(),
             pending_quarantine: Vec::new(),
             queue_fences: FxHashMap::default(),
@@ -2649,9 +2735,16 @@ mod tests {
             s.pinned.insert(tile, 1);
             s.buffers.insert(BUF, vec![tile]);
 
-            // Decommit and flush while still pinned by BUF: tile is unmapped from window, NOT freed.
+            // Decommit and flush while still pinned by BUF: tile is unmapped from window once
+            // idle title_queue passes its fence, NOT freed.
             s.decommit_range(base, TILE);
             assert!(s.flush_parked());
+            let start = std::time::Instant::now();
+            while !s.pending_unmaps.is_empty() && start.elapsed() < std::time::Duration::from_secs(5) {
+                s.drain_pending_unmaps();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(s.pending_unmaps.is_empty());
             assert!(!s.free.contains(&tile));
             assert!(s.quarantined.is_empty());
 
@@ -2677,6 +2770,78 @@ mod tests {
             }
             assert!(s.free.contains(&tile), "tile should enter free once title queue fence completes");
 
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// `flush_parked` must defer `UpdateTileMappings(NULL)` until active title queues finish
+    /// their prior work (preventing concurrent PTE unmapping while shaders run), and re-committing
+    /// the VA before that fence completes must cancel the deferred unmap cleanly (including ABA).
+    #[test]
+    fn gpu_flush_parked_defers_null_unmap_and_recommit_cancels_stale_unmap() {
+        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(2);
+            let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            assert!(s.note_queue(&title_q));
+
+            s.commit_range(base, TILE);
+            let tile = s.mapped[&base].pool;
+            s.wait_for(s.value);
+            let v_before = s.value;
+
+            let gate1: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate1");
+            let _unblock1 = SignalOnDrop(gate1.clone(), 1);
+            title_q.Wait(&gate1, 1).expect("gate title_q 1");
+
+            // Decommit + flush while title_q is busy: NULL unmap must be deferred, NOT queued on s.queue yet.
+            s.decommit_range(base, TILE);
+            assert!(s.flush_parked());
+            assert_eq!(s.value, v_before, "UpdateTileMappings(NULL) must not be issued while title queue is in flight");
+            assert_eq!(s.pending_unmaps.len(), 1);
+            assert!(s.pending_unmap_va.contains_key(&base));
+
+            // Re-commit same VA before gate1 signals: cancels pending unmap, keeps tile, zeros it, no GPU remap.
+            s.to_zero.clear();
+            s.commit_range(base, TILE);
+            assert_eq!(s.mapped[&base].pool, tile);
+            assert!(!s.pending_unmap_va.contains_key(&base));
+            assert_eq!(s.to_zero, vec![(base, TILE)]);
+            assert_eq!(s.value, v_before);
+
+            // ABA check: decommit & flush again behind a second gate; when gate1 finishes first,
+            // batch #1 must NOT unmap batch #2's tile.
+            let gate2: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate2");
+            let _unblock2 = SignalOnDrop(gate2.clone(), 1);
+            title_q.Wait(&gate2, 1).expect("gate title_q 2");
+            s.decommit_range(base, TILE);
+            assert!(s.flush_parked());
+            assert_eq!(s.pending_unmaps.len(), 2);
+
+            gate1.Signal(1).expect("signal gate1");
+            let start = std::time::Instant::now();
+            while s.pending_unmaps.len() == 2 && start.elapsed() < std::time::Duration::from_secs(5) {
+                s.drain_pending_unmaps();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(s.pending_unmaps.len(), 1, "batch #1 drained cleanly");
+            assert_eq!(s.value, v_before, "stale batch #1 must not unmap VA owned by batch #2");
+            assert!(s.pending_unmap_va.contains_key(&base));
+
+            // Releasing gate2 executes batch #2's deferred NULL unmap and returns tile to free.
+            gate2.Signal(1).expect("signal gate2");
+            let start = std::time::Instant::now();
+            while !s.drain_quarantined() && start.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(s.value > v_before, "batch #2 must emit UpdateTileMappings(NULL) once title_q completes");
+            assert!(s.pending_unmaps.is_empty() && s.pending_unmap_va.is_empty());
+            assert!(s.free.contains(&tile));
+
+            drop(_unblock2);
+            drop(_unblock1);
             s.wait_for(s.value);
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
