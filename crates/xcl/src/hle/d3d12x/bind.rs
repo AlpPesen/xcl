@@ -201,8 +201,37 @@ struct State {
     io_cache_cs: Option<(u64, Option<u32>, u64)>,
     io_cache_tp_cs: Option<(u64, u64)>,
     io_cache_tp_ms: Option<(u64, u64)>,
+    /// Active inline 256-slot indirect-dispatch guard batch: one inline `PRELUDE_GUARD_*`
+    /// `Dispatch(4, 1, 1)` + barrier pair already emitted on this list, with subsequent
+    /// consecutive single indirect dispatches (up to 256, invalidated on any GPU write/barrier)
+    /// appending their 32-byte clamp jobs into its coherent UMA job table with zero extra barriers.
+    inline_guard: Option<InlineGuardBatch>,
+    /// Per-list 16-entry MRU cache of resolved outside-UMA root descriptor VAs (`raw -> resolved`)
+    /// so repeatedly binding the same frame/pass/material CBV skips global `resolve_uma_va` and
+    /// `sparse::gpu_view` lock lookups.
+    root_va_cache: [(u64, u64); 16],
+    root_va_next: usize,
     /// L1 VRAM `io` (`u0`) slabs populated during this recording and copied in `prelude_list_for`
     io_blocks: Vec<IoBlock>,
+}
+
+/// Active inline 256-slot indirect-dispatch guard batch recorded directly on a command list.
+struct InlineGuardBatch {
+    /// Host pointer to `[count, 0, 0, 0]` + 256 × 32-byte `PreludeGuardJob` records in coherent UMA.
+    jobs_cpu: usize,
+    /// Committed scratch buffer holding 256 × 256-byte guarded argument outputs (`GUARDED_ARGS_STATE`).
+    dst: ID3D12Resource,
+    dst_base_off: u64,
+    count: u32,
+}
+
+const INLINE_GUARD_BATCH_MAX: u32 = 256;
+const INLINE_GUARD_JOBS_BYTES: usize = 16 + INLINE_GUARD_BATCH_MAX as usize * 32;
+const INLINE_GUARD_DST_BYTES: u64 = INLINE_GUARD_BATCH_MAX as u64 * 256;
+
+fn inline_guard_batch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_INLINE_GUARD_BATCH").map_or(true, |v| v.trim() != "0"))
 }
 
 /// A recording's blocks of rewritten indirect arguments, and most bytes of them (past it, its
@@ -446,11 +475,21 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 
 /// Note that the active recording segment issued a GPU buffer write or cross-queue fence wait:
 /// subsequent indirect argument clamps must execute inline instead of hoisting into the prelude,
+/// any open inline indirect-guard batch is closed so later dispatches observe the new writes,
 /// and indirect argument ordering is no longer clean.
 pub(super) fn note_gpu_write(list: *mut c_void) {
     with(list, |s| {
         s.prelude_blocked = true;
+        s.inline_guard = None;
         s.arg_order_clean = false;
+    });
+}
+
+/// Close any open inline indirect-guard batch on `list` (called on `ResourceBarrier` / direct
+/// `Dispatch` so subsequent indirect dispatches see post-barrier argument bytes).
+pub(super) fn invalidate_inline_guard(list: *mut c_void) {
+    with(list, |s| {
+        s.inline_guard = None;
     });
 }
 
@@ -500,6 +539,9 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.prelude_scales.clear();
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
+        s.inline_guard = None;
+        s.root_va_cache = [(0, 0); 16];
+        s.root_va_next = 0;
         s.arg_order_clean = false;
         s.uma_windows = None;
         s.dummy_res_va = 0;
@@ -568,6 +610,7 @@ pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
         s.prelude_scales.clear();
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
+        s.inline_guard = None;
         s.dummy_res_va = 0;
         s.io_cache_gfx = None;
         s.io_cache_cs = None;
@@ -618,6 +661,9 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.prelude_scales.clear();
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
+        s.inline_guard = None;
+        s.root_va_cache = [(0, 0); 16];
+        s.root_va_next = 0;
         s.arg_order_clean = false;
         s.uma_windows = None;
         s.dummy_res_va = 0;
@@ -781,8 +827,29 @@ pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_vo
 /// #40 / #42)
 pub(super) unsafe extern "system" fn set_graphics_root_descriptor(this: *mut c_void, i: u32, va: u64) {
     note_address(va);
-    let va = readable_root(va);
+    let va = resolve_root_for_list(this, va);
     put_in(this, true, i, 0, &va.to_le_bytes());
+}
+
+/// Resolve a root descriptor VA for `list`, short-circuiting coherent-UMA addresses and caching
+/// outside-UMA resolutions per recording (`root_va_cache`) to avoid repeated global map lookups
+/// when the title rebinds the same frame/pass/material CBVs across consecutive draws.
+fn resolve_root_for_list(list: *mut c_void, va: u64) -> u64 {
+    if va == 0 || crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize)) {
+        return va;
+    }
+    if let Some(hit) = with(list, |s| {
+        s.root_va_cache.iter().find(|&&(raw, _)| raw == va).map(|&(_, resolved)| resolved)
+    }) {
+        return hit;
+    }
+    let resolved = readable_root(va);
+    with(list, |s| {
+        let idx = s.root_va_next & 15;
+        s.root_va_cache[idx] = (va, resolved);
+        s.root_va_next = s.root_va_next.wrapping_add(1);
+    });
+    resolved
 }
 
 /// The address a root descriptor at `va` gets: first try resolving a GPU-view VA directly to
@@ -2195,6 +2262,100 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
             }
         }
     }
+    // Inline 256-slot offset-table batching (`XCL_INLINE_GUARD_BATCH=0` opt-out): when prelude
+    // hoisting is blocked (after a compute/UAV write), emit ONE `PRELUDE_GUARD_*` `Dispatch(4,1,1)`
+    // + barrier pair on the first indirect dispatch and append up to 255 subsequent consecutive
+    // indirect dispatches into its coherent UMA job table with zero extra barriers or PSO switches.
+    if inline_guard_batch_on() {
+        if let (Some((src_win, src_off)), Some((lim_win, lim_off))) = (
+            uma_win_off(u, src, 12),
+            uma_win_off(u, dispatch_io_host + crate::gpu::recomp::IO_GROUP_LIMIT * 4, 4),
+        ) {
+            let most = most_groups();
+            let appended = with(this, |s| {
+                let b = s.inline_guard.as_mut()?;
+                if b.count >= INLINE_GUARD_BATCH_MAX {
+                    return None;
+                }
+                let idx = b.count;
+                let rec = [src_win, src_off, most, idx * 256, lim_win, lim_off, 0u32, 0u32];
+                let slot_ptr = (b.jobs_cpu + 16 + idx as usize * 32) as *mut u32;
+                std::ptr::copy_nonoverlapping(rec.as_ptr(), slot_ptr, rec.len());
+                (*(b.jobs_cpu as *const std::sync::atomic::AtomicU32)).store(idx + 1, Ordering::Release);
+                b.count = idx + 1;
+                Some((b.dst.clone(), b.dst_base_off + idx as u64 * 256))
+            });
+            if let Some(res) = appended {
+                return Ok(res);
+            }
+            let use_heap = super::console_heap::window_views_ready();
+            let win_ok = use_heap || (src_win < 4 && lim_win < 4);
+            if win_ok {
+                let win_vas = if use_heap {
+                    Some([0u64; 4])
+                } else {
+                    with(this, |s| {
+                        if s.uma_windows.as_ref().is_none_or(Vec::is_empty) {
+                            s.uma_windows = Some(super::real::uma_window_vas());
+                        }
+                        let w = s.uma_windows.as_deref()?;
+                        let first = *w.first().filter(|&&v| v != 0)?;
+                        Some([
+                            first,
+                            w.get(1).copied().filter(|&v| v != 0).unwrap_or(first),
+                            w.get(2).copied().filter(|&v| v != 0).unwrap_or(first),
+                            w.get(3).copied().filter(|&v| v != 0).unwrap_or(first),
+                        ])
+                    })
+                };
+                if let Some(win_vas) = win_vas {
+                    let jobs_p = with(this, |s| s.arena.take(u, INLINE_GUARD_JOBS_BYTES, 256, &mut s.uma));
+                    if let Some(jobs_p) = jobs_p {
+                        if let Some(jobs_va) = super::real::uma_va_of(jobs_p as usize) {
+                            with(this, |s| s.inline_guard = None);
+                            let (dst, dst_base_off, slot, prev_state) = scratch_args_pingpong(this, &dev, INLINE_GUARD_DST_BYTES)?;
+                            let dst_va = dst.GetGPUVirtualAddress() + dst_base_off;
+                            let hdr = [1u32, 0, 0, 0];
+                            let rec0 = [src_win, src_off, most, 0u32, lim_win, lim_off, 0u32, 0u32];
+                            std::ptr::copy_nonoverlapping(hdr.as_ptr(), jobs_p as *mut u32, hdr.len());
+                            std::ptr::copy_nonoverlapping(rec0.as_ptr(), (jobs_p as usize + 16) as *mut u32, rec0.len());
+                            let (rs, pso) = if use_heap {
+                                super::list_x::ensure_view_heap(this);
+                                prelude_guard_heap_pipeline(&dev)?
+                            } else {
+                                prelude_guard_pipeline(&dev)?
+                            };
+                            emit_uav_and_transition(list, &dst, prev_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                            list.SetComputeRootSignature(&rs);
+                            if !use_heap {
+                                for (k, &va) in win_vas.iter().enumerate() {
+                                    list.SetComputeRootUnorderedAccessView((2 + k) as u32, va);
+                                }
+                            }
+                            list.SetPipelineState(&pso);
+                            list.SetComputeRootUnorderedAccessView(0, jobs_va);
+                            list.SetComputeRootUnorderedAccessView(1, dst_va);
+                            list.Dispatch(INLINE_GUARD_BATCH_MAX / 64, 1, 1);
+                            emit_transition_and_uav(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, GUARDED_ARGS_STATE);
+                            with(this, |s| {
+                                s.scratch[slot].state = GUARDED_ARGS_STATE;
+                                s.pc_abi_cs = AbiBound::default();
+                                s.arg_order_clean = true;
+                                s.inline_guard = Some(InlineGuardBatch {
+                                    jobs_cpu: jobs_p as usize,
+                                    dst: dst.clone(),
+                                    dst_base_off,
+                                    count: 1,
+                                });
+                            });
+                            return Ok((dst, dst_base_off));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    with(this, |s| s.inline_guard = None);
     let (dst, dst_off, slot, prev_state) = scratch_args_pingpong(this, &dev, 256)?;
     let lim_off = (crate::gpu::recomp::IO_GROUP_LIMIT * 4) as u32;
     let dst_va = dst.GetGPUVirtualAddress() + dst_off;
@@ -2518,6 +2679,7 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
             }
         }
     }
+    with(this, |s| s.inline_guard = None);
     let (dst, dst_off, slot, prev_state) = scratch_args_pingpong(this, &dev, commands.saturating_mul(2))?;
     let dst_va = dst.GetGPUVirtualAddress() + dst_off;
     if super::console_heap::window_views_ready() {
@@ -3596,7 +3758,7 @@ pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_voi
 /// #39 / #41): the 64-bit GPU address
 pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_void, i: u32, va: u64) {
     note_address(va);
-    let va = readable_root(va);
+    let va = resolve_root_for_list(this, va);
     put(this, i, 0, &va.to_le_bytes());
 }
 
@@ -3608,7 +3770,10 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = with(this, |s| s.pso);
+    let pso = with(this, |s| {
+        s.inline_guard = None;
+        s.pso
+    });
     if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
         return super::pso_async::need_by_submit(pso);
     }

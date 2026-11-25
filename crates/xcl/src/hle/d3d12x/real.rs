@@ -2534,6 +2534,9 @@ fn note_mixed_copy() {
 unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u32, dst: u64, src: u64, ty: u32) {
     let ty = pc_heap_type(ty);
     note_copy_call("CopyDescriptorsSimple", n, dst, src);
+    if ty == D3D12_DESCRIPTOR_HEAP_TYPE_RTV.0 as u32 || ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 {
+        super::list_x::bump_rt_desc_gen();
+    }
     if copy_console_slots(this, n, dst, src, ty) {
         return;
     }
@@ -2550,6 +2553,9 @@ unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u3
 unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dsts: *const u64, dsizes: *const u32, ns: u32, srcs: *const u64, ssizes: *const u32, ty: u32) {
     let ty = pc_heap_type(ty);
     note_copy_call("CopyDescriptors", nd, if dsts.is_null() { 0 } else { *dsts }, if srcs.is_null() { 0 } else { *srcs });
+    if ty == D3D12_DESCRIPTOR_HEAP_TYPE_RTV.0 as u32 || ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 {
+        super::list_x::bump_rt_desc_gen();
+    }
     use super::console_heap::{slot, SAMPLER_SLOT, SLOT};
     let console = !dsts.is_null() && !srcs.is_null() && nd > 0 && slot(*dsts).is_some();
     if !console {
@@ -2703,6 +2709,7 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     }
     let dsv_flags = copy.as_ref().map_or(0, |c| c.Flags.0 as u32);
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
+    super::list_x::bump_rt_desc_gen();
     super::depth_uav::note_dsv(cpu as usize, res as usize, dsv_flags);
 }
 
@@ -8238,6 +8245,7 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _ as *const c_void);
     f(this, res, desc, handle);
+    super::list_x::bump_rt_desc_gen();
     super::present::note_rtv(handle, res);
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -8267,6 +8275,9 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
     if !dsv.is_null() {
         super::depth_uav::before_bind_dsv(this, *dsv);
+    }
+    if super::list_x::skip_redundant_render_targets(this, n, rtvs, single, dsv) {
+        return;
     }
     type F = unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "OMSetRenderTargets")));

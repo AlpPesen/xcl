@@ -483,6 +483,15 @@ unsafe fn alloc_rt_shadow_slot(dev: &ID3D12Device) -> Option<Arc<RtShadowSlot>> 
     Some(Arc::new(RtShadowSlot { dev_key, entry }))
 }
 
+/// Monotonic generation bumped whenever any CPU RTV or DSV descriptor slot is created or
+/// overwritten (`CreateRenderTargetView`, `CreateDepthStencilView`, `CopyDescriptors*(RTV|DSV)`).
+/// Semantic `OMSetRenderTargets` dedup skips a rebind only when this generation is unchanged.
+static RT_DESC_GEN: AtomicU64 = AtomicU64::new(1);
+
+pub(super) fn bump_rt_desc_gen() {
+    RT_DESC_GEN.fetch_add(1, Ordering::Release);
+}
+
 /// Recorded `OMSetRenderTargets` state for `KickoffX` / split restoration and `XCL_TRACE_FRAME`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RenderTargets {
@@ -498,6 +507,10 @@ struct RenderTargets {
     shadow: Option<Arc<RtShadowSlot>>,
     shadow_has_rtvs: bool,
     shadow_has_dsv: bool,
+    /// `RT_DESC_GEN` observed when these targets were bound on this list.
+    desc_gen: u64,
+    /// True when these exact targets are currently active on the PC command list.
+    live_on_pc: bool,
 }
 
 /// What console code set on a list that a PC Reset clears: `KickoffX` closes, submits and
@@ -744,8 +757,43 @@ pub(super) unsafe extern "system" fn om_set_stencil_ref_x(this: *mut c_void, r: 
     pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_OM_SET_STENCIL_REF)(this, r)
 }
 
+/// Whether `OMSetRenderTargets(n, rtvs, single, dsv)` is semantically identical to what is
+/// already active on `this` (same handles/counts/single/DSV and no RTV/DSV CPU descriptor slot
+/// was created or copied since that bind). Opt-out via `XCL_BIND_CACHE=0`.
+pub(super) unsafe fn skip_redundant_render_targets(
+    this: *mut c_void,
+    n: u32,
+    rtvs: *const usize,
+    single: i32,
+    dsv: *const usize,
+) -> bool {
+    if !bind_cache_enabled() || super::present::trace_frame() || this.is_null() {
+        return false;
+    }
+    let num_targets = if rtvs.is_null() { 0 } else { n.min(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) };
+    let read_count = if single != 0 { num_targets.min(1) } else { num_targets } as usize;
+    let slice: &[usize] = if read_count == 0 { &[] } else { std::slice::from_raw_parts(rtvs, read_count) };
+    let d = dsv.as_ref().copied();
+    let cur_gen = RT_DESC_GEN.load(Ordering::Acquire);
+    LISTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&(this as usize)))
+        .and_then(|s| s.bindings.render_targets.as_ref())
+        .is_some_and(|rt| {
+            rt.live_on_pc
+                && rt.desc_gen == cur_gen
+                && rt.num_targets == num_targets
+                && rt.single == single
+                && rt.dsv == d
+                && rt.handles.as_slice() == slice
+        })
+}
+
 /// OMSetRenderTargets as the PC list got it (`real::cl_om_set_render_targets`)
 pub(super) unsafe fn note_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
+    let desc_gen = RT_DESC_GEN.load(Ordering::Acquire);
     let num_targets = if rtvs.is_null() { 0 } else { n.min(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) };
     let read_count = if single != 0 { num_targets.min(1) } else { num_targets } as usize;
     // SAFETY: `rtvs` is non-null whenever `read_count > 0`, and D3D12 requires at least 1
@@ -841,6 +889,8 @@ pub(super) unsafe fn note_render_targets(this: *mut c_void, n: u32, rtvs: *const
             shadow,
             shadow_has_rtvs,
             shadow_has_dsv,
+            desc_gen,
+            live_on_pc: true,
         });
     });
 }
@@ -4968,7 +5018,22 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
         super::title_textures::note_transitions(this as usize, &t);
     }
     if !out.is_empty() {
+        super::bind::invalidate_inline_guard(this);
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
+        if super::cpu_writes::has_water_readback() {
+            const WRITE_STATES: u32 = UNORDERED_ACCESS | 0x4; // UNORDERED_ACCESS | RENDER_TARGET
+            for b in &out {
+                if b[0] == 0
+                    && b[1] == 0
+                    && (b[4] == 0 || b[4] == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
+                    && (b[5] & WRITE_STATES) != 0
+                    && (b[6] & WRITE_STATES) == 0
+                {
+                    let res = (b[2] as u64 | (b[3] as u64) << 32) as usize;
+                    maybe_enqueue_water_readback(this, res, D3D12_RESOURCE_STATES(b[6] as i32));
+                }
+            }
+        }
     }
     if !depth_syncs.is_empty() {
         super::depth_uav::execute_syncs(this, &depth_syncs);
@@ -5157,7 +5222,7 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
         pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
     }
     if water_dst != 0 {
-        maybe_enqueue_water_readback(this, water_dst);
+        maybe_enqueue_water_readback(this, water_dst, D3D12_RESOURCE_STATE_COPY_DEST);
     }
     std::mem::forget((d, s)); // borrowed resource pointers
 }
@@ -5292,9 +5357,10 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 
 /// If `dst` is a tracked placed ocean height/displacement/buoyancy texture (`256×256`
 /// `R32_FLOAT`/`R32G32_FLOAT`, `64×64` `R32G32_FLOAT`, or `128×128` `R16G16_UINT`), copy
-/// subresource 0 into a pooled `READBACK` buffer and queue asynchronous XOR-swizzled writeback
+/// subresource 0 into a pooled `READBACK` buffer using its actual current `cur_state` (skipping
+/// redundant barriers if already in `COPY_SOURCE`) and queue asynchronous XOR-swizzled writeback
 /// into console memory on `xcl-cpu-writes` after this submission's GPU fence completes.
-unsafe fn maybe_enqueue_water_readback(this: *mut c_void, dst: usize) {
+unsafe fn maybe_enqueue_water_readback(this: *mut c_void, dst: usize, cur_state: D3D12_RESOURCE_STATES) {
     let Some(target) = super::cpu_writes::water_readback_target(dst) else { return };
     if list_type(this) == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return;
@@ -5324,12 +5390,17 @@ unsafe fn maybe_enqueue_water_readback(this: *mut c_void, dst: usize) {
             },
         },
     };
-    transition(this, dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    let need_barrier = (cur_state.0 & D3D12_RESOURCE_STATE_COPY_SOURCE.0) == 0;
+    if need_barrier {
+        transition(this, dst, cur_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
     pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(
         this,
         PC_COPY_TEXTURE_REGION,
     )(this, &dst_loc, 0, 0, 0, &src_loc, std::ptr::null());
-    transition(this, dst, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    if need_barrier {
+        transition(this, dst, D3D12_RESOURCE_STATE_COPY_SOURCE, cur_state);
+    }
     std::mem::forget((src_loc, dst_loc)); // borrowed resource pointers
     let mut g = LISTS.lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
@@ -5355,7 +5426,7 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
         if !super::format_alias::try_copy_resource(this, dst, src) {
             pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
         }
-        maybe_enqueue_water_readback(this, dst);
+        maybe_enqueue_water_readback(this, dst, D3D12_RESOURCE_STATE_COPY_DEST);
         return;
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
@@ -8764,6 +8835,31 @@ mod tests {
             on_set_pipeline_state_bound(list, 0x1000, 0x3000);
             clear_segment_state(list as usize);
             assert!(!skip_redundant_pso_bind(list, 0x1000, 0x3000));
+            on_release(list as usize);
+        }
+    }
+
+    #[test]
+    fn redundant_render_targets_dedup_invalidates_on_descriptor_mutation_or_reset() {
+        let list = 0x7E57_B1D1usize as *mut c_void;
+        let rtvs = [0x4000usize, 0x4020];
+        let dsv = 0x5000usize;
+        unsafe {
+            assert!(!skip_redundant_render_targets(list, 2, rtvs.as_ptr(), 0, &dsv));
+            note_render_targets(list, 2, rtvs.as_ptr(), 0, &dsv);
+            // Identical bind with unchanged RTV/DSV descriptor generation is skipped.
+            assert!(skip_redundant_render_targets(list, 2, rtvs.as_ptr(), 0, &dsv));
+            // Different DSV or count -> not skipped.
+            assert!(!skip_redundant_render_targets(list, 2, rtvs.as_ptr(), 0, std::ptr::null()));
+            assert!(!skip_redundant_render_targets(list, 1, rtvs.as_ptr(), 0, &dsv));
+            // Overwriting any RTV/DSV CPU slot bumps RT_DESC_GEN -> must rebind!
+            bump_rt_desc_gen();
+            assert!(!skip_redundant_render_targets(list, 2, rtvs.as_ptr(), 0, &dsv));
+            note_render_targets(list, 2, rtvs.as_ptr(), 0, &dsv);
+            assert!(skip_redundant_render_targets(list, 2, rtvs.as_ptr(), 0, &dsv));
+            // ClearState / PC Reset invalidate live render targets.
+            on_pc_reset(list);
+            assert!(!skip_redundant_render_targets(list, 2, rtvs.as_ptr(), 0, &dsv));
             on_release(list as usize);
         }
     }
