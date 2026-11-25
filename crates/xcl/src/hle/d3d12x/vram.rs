@@ -583,9 +583,11 @@ fn keep_spare_pools() -> usize {
 /// The title's pages of video memory for tiled textures (see the module's comment).
 struct Pages {
     queue: ID3D12CommandQueue,
-    /// signalled after each mapping; title queues wait for it before their next work
+    /// signalled after mappings before GPU queues execute; title queues wait for it before their next work
     fence: ID3D12Fence,
     value: u64,
+    /// true when `map()` / `unmap()` queued tile mappings not yet followed by `queue.Signal`
+    dirty_signal: bool,
     /// per-device timestamp of the last periodic reclaim check
     last_reclaim: std::time::Instant,
     pools: PoolHeaps,
@@ -633,6 +635,7 @@ impl Pages {
             queue,
             fence,
             value: 0,
+            dirty_signal: false,
             last_reclaim: std::time::Instant::now(),
             pools: PoolHeaps::new(),
             pool: TilePool::new(),
@@ -720,9 +723,7 @@ impl Pages {
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
         }
-        let _timer = step(Step::Signal);
-        self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        self.dirty_signal = true;
     }
 
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
@@ -746,8 +747,17 @@ impl Pages {
             Some(&total),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
-        self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        self.dirty_signal = true;
+    }
+
+    /// Emit one `queue.Signal` covering all batched `map()` / `unmap()` calls since the last flush.
+    unsafe fn flush_signal(&mut self) {
+        if self.dirty_signal {
+            let _timer = step(Step::Signal);
+            self.value += 1;
+            let _ = self.queue.Signal(&self.fence, self.value);
+            self.dirty_signal = false;
+        }
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
@@ -1222,6 +1232,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
+            pages.flush_signal();
             let key = queue.as_raw() as usize;
             if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
                 let _ = queue.Wait(&pages.fence, pages.value);
@@ -1233,6 +1244,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
                 do_reclaim = true;
                 newly_reclaimed = pages.sweep_and_reclaim(now);
                 if !newly_reclaimed.is_empty() {
+                    pages.flush_signal();
                     unmap_mark = Some((pages.fence.clone(), pages.value));
                 }
             }
