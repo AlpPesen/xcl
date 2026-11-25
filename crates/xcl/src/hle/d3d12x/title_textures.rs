@@ -38,8 +38,15 @@ extern "system" {
     fn GetWriteWatch(flags: u32, base: *const c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
 }
 
-/// (device, address its bytes are read from, layout, states) of an upload
-type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
+/// Upload parameters for a pending or CPU-dirtied texture.
+struct Upload {
+    device: usize,
+    src: usize,
+    tex: Arc<xg::Texture>,
+    states: Vec<D3D12_RESOURCE_STATES>,
+    dirty_pages: Option<Vec<usize>>,
+    page_size: usize,
+}
 
 struct Entry {
     device: usize,
@@ -167,9 +174,9 @@ impl Table {
     }
 
     /// Collect active textures that are pending or overlap any sorted dirty page in `dirty`,
-    /// clearing `pending` on returned entries and returning `(res_list, pending_cleared)`.
-    fn dirty_and_pending(&mut self, dirty: &[usize], page: usize) -> (Vec<usize>, usize) {
-        let mut hits: Vec<usize> = Vec::with_capacity(self.pending_res.len() + 16);
+    /// clearing `pending` on returned entries and returning `((res, was_pending) list, pending_cleared)`.
+    fn dirty_and_pending(&mut self, dirty: &[usize], page: usize) -> (Vec<(usize, bool)>, usize) {
+        let mut hits: Vec<(usize, bool)> = Vec::with_capacity(self.pending_res.len() + 16);
         let mut cleared = 0usize;
         for res in std::mem::take(&mut self.pending_res) {
             if let Some(e) = self.by_res.get_mut(&res) {
@@ -177,7 +184,7 @@ impl Table {
                     e.pending = false;
                     cleared += 1;
                 }
-                hits.push(res);
+                hits.push((res, true));
             }
         }
         if !dirty.is_empty() && page > 0 {
@@ -194,19 +201,20 @@ impl Table {
                 let q_lo = lo.saturating_sub(SMALL_SRC_MAX);
                 for (&(_, res), &end) in self.by_src_small.range((q_lo, 0)..(hi, 0)) {
                     if end > lo {
-                        hits.push(res);
+                        hits.push((res, false));
                     }
                 }
             }
             for (&res, &(src, end)) in &self.by_src_large {
                 let idx = dirty.partition_point(|&p| p.saturating_add(page) <= src);
                 if dirty.get(idx).is_some_and(|&p| p < end) {
-                    hits.push(res);
+                    hits.push((res, false));
                 }
             }
         }
-        hits.sort_unstable();
-        hits.dedup();
+        // Keep `was_pending == true` when a resource was both pending and dirty-hit.
+        hits.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        hits.dedup_by_key(|x| x.0);
         (hits, cleared)
     }
 
@@ -547,7 +555,7 @@ fn recheck_gpu_view_sources() {
     if SEEN.swap(gen, Ordering::AcqRel) == gen {
         return;
     }
-    let mut changed = false;
+    let mut remapped = Vec::new();
     // (the shadowed textures too: one comes back when the texture over it goes)
     let mut g = TEXTURES.lock().unwrap();
     let t = &mut *g;
@@ -555,7 +563,7 @@ fn recheck_gpu_view_sources() {
     for (&res, e) in t.by_res.iter_mut() {
         let old_src = e.src;
         if recheck_source(e) {
-            changed = true;
+            remapped.push(res);
             reindex.push((res, old_src, e.src, e.tex.size() as usize, e.gpu_written, e.pending));
         }
     }
@@ -563,11 +571,17 @@ fn recheck_gpu_view_sources() {
         t.unindex_active(res, old_src);
         t.index_active(res, new_src, size, gpu_written, pending);
     }
-    for e in t.shadowed.values_mut() {
-        changed |= recheck_source(e);
+    for (&res, e) in t.shadowed.iter_mut() {
+        if recheck_source(e) {
+            remapped.push(res);
+        }
     }
     drop(g);
-    if changed {
+    if !remapped.is_empty() {
+        let mut last = LAST_CONTENT.lock().unwrap();
+        for res in remapped {
+            last.remove(&res);
+        }
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
 }
@@ -947,18 +961,39 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
+    let page_size = (page as usize).max(0x1000);
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
-        let (hits, cleared) = t.dirty_and_pending(&dirty, page as usize);
+        let (hits, cleared) = t.dirty_and_pending(&dirty, page_size);
         if cleared > 0 {
             PENDING.fetch_sub(cleared, Ordering::Relaxed);
         }
         hits.into_iter()
-            .filter_map(|res| {
+            .filter_map(|(res, was_pending)| {
                 let e = t.by_res.get(&res)?;
+                let dirty_pages = if was_pending {
+                    None
+                } else {
+                    let end = e.src.saturating_add(e.tex.size() as usize);
+                    let lo = dirty.partition_point(|&p| p.saturating_add(page_size) <= e.src);
+                    let hi = lo + dirty[lo..].partition_point(|&p| p < end);
+                    (lo < hi).then(|| dirty[lo..hi].to_vec())
+                };
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| {
+                    (
+                        r.clone(),
+                        Upload {
+                            device: e.device,
+                            src: e.src,
+                            tex: Arc::clone(&e.tex),
+                            states: e.states.clone(),
+                            dirty_pages,
+                            page_size,
+                        },
+                    )
+                })
             })
             .collect()
     });
@@ -966,8 +1001,15 @@ unsafe fn refresh_once(queue: *mut c_void) {
     upload_all(todo);
 }
 
-/// texture → `content_hash` of its memory at its last upload
-static LAST_CONTENT: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+struct PageHashes {
+    src: usize,
+    size: usize,
+    page_size: usize,
+    hashes: Vec<u64>,
+}
+
+/// texture → per-page `content_hash` of its memory at its last upload
+static LAST_CONTENT: Mutex<BTreeMap<usize, PageHashes>> = Mutex::new(BTreeMap::new());
 static UNCHANGED: AtomicU64 = AtomicU64::new(0);
 
 /// `XCL_TEXTURE_SKIP_UNCHANGED=0` uploads a texture whenever its pages were written, as before.
@@ -976,10 +1018,110 @@ fn unchanged_skip() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
 }
 
-/// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
-/// content from here on (the caller uploads it when this is false).
-fn same_as_last_upload(res: usize, h: u64) -> bool {
-    LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+/// Aligned base of the first page covering `[src, src + size)` and the number of `page_size` pages.
+fn page_count(src: usize, size: usize, page_size: usize) -> (usize, usize) {
+    if size == 0 || page_size == 0 {
+        return (src, 0);
+    }
+    let first_page = src - (src % page_size);
+    let end = src.saturating_add(size);
+    let count = end.saturating_sub(first_page).div_ceil(page_size);
+    (first_page, count)
+}
+
+/// Page indices of `[src, src + size)` whose bytes changed since `res`'s last upload, or `None`
+/// if all checked pages match. When `dirty_pages` is `Some` and `(src, size, page_size)` matches
+/// the recorded `PageHashes`, only those dirty pages are read and hashed (outside `LAST_CONTENT`).
+fn changed_pages_with<'a, F>(
+    res: usize,
+    src: usize,
+    size: usize,
+    dirty_pages: Option<&[usize]>,
+    page_size: usize,
+    mut read_range: F,
+) -> Option<Vec<usize>>
+where
+    F: FnMut(usize, usize) -> std::borrow::Cow<'a, [u8]>,
+{
+    let (first_page, count) = page_count(src, size, page_size);
+    let end = src.saturating_add(size);
+
+    if let Some(pages) = dirty_pages {
+        let matched = {
+            let g = LAST_CONTENT.lock().unwrap();
+            g.get(&res).is_some_and(|e| e.src == src && e.size == size && e.page_size == page_size && e.hashes.len() == count)
+        };
+        if matched {
+            if count == 0 {
+                return None;
+            }
+            let mut indices: Vec<usize> = pages
+                .iter()
+                .filter_map(|&p| {
+                    let pg = p - (p % page_size);
+                    if pg < first_page {
+                        return None;
+                    }
+                    let k = (pg - first_page) / page_size;
+                    (k < count).then_some(k)
+                })
+                .collect();
+            indices.sort_unstable();
+            indices.dedup();
+
+            let mut computed = Vec::with_capacity(indices.len());
+            for k in indices {
+                let pg = first_page + k * page_size;
+                let lo = pg.max(src);
+                let hi = pg.saturating_add(page_size).min(end);
+                let bytes = read_range(lo, hi - lo);
+                computed.push((k, content_hash(&bytes)));
+            }
+
+            let mut g = LAST_CONTENT.lock().unwrap();
+            if let Some(entry) = g.get_mut(&res).filter(|e| e.src == src && e.size == size && e.page_size == page_size && e.hashes.len() == count) {
+                let mut changed = Vec::new();
+                for (k, h) in computed {
+                    if entry.hashes[k] != h {
+                        entry.hashes[k] = h;
+                        changed.push(k);
+                    }
+                }
+                return if changed.is_empty() { None } else { Some(changed) };
+            }
+        }
+    }
+
+    let mut hashes = Vec::with_capacity(count);
+    if count > 0 {
+        let bytes = read_range(src, size);
+        for k in 0..count {
+            let pg = first_page + k * page_size;
+            let lo = pg.max(src);
+            let hi = pg.saturating_add(page_size).min(end);
+            hashes.push(content_hash(&bytes[lo - src..hi - src]));
+        }
+    }
+
+    let mut g = LAST_CONTENT.lock().unwrap();
+    if let Some(entry) = g.get_mut(&res).filter(|e| e.src == src && e.size == size && e.page_size == page_size && e.hashes.len() == count) {
+        let mut changed = Vec::new();
+        for (k, h) in hashes.into_iter().enumerate() {
+            if entry.hashes[k] != h {
+                entry.hashes[k] = h;
+                changed.push(k);
+            }
+        }
+        if changed.is_empty() { None } else { Some(changed) }
+    } else {
+        g.insert(res, PageHashes { src, size, page_size, hashes });
+        Some((0..count).collect())
+    }
+}
+
+/// Per-page change check backed by `title_bytes` for `upload_all`.
+unsafe fn changed_pages_since_last_upload(res: usize, src: usize, size: usize, dirty_pages: Option<&[usize]>, page_size: usize) -> Option<Vec<usize>> {
+    changed_pages_with(res, src, size, dirty_pages, page_size, |at, len| title_bytes(at, len))
 }
 
 /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
@@ -1080,12 +1222,12 @@ unsafe fn seed_stream_recheck(todo: &[(ID3D12Resource, Upload)], watched: &[(usi
         return;
     }
     let mut seeded = Vec::new();
-    for (r, (_, src, tex, _)) in todo {
-        let size = tex.size() as usize;
-        if size == 0 || range_is_fully_watched(*src, size, watched) {
+    for (r, u) in todo {
+        let size = u.tex.size() as usize;
+        if size == 0 || range_is_fully_watched(u.src, size, watched) {
             continue;
         }
-        let fp = sample_fingerprint(*src, size);
+        let fp = sample_fingerprint(u.src, size);
         seeded.push((r.as_raw() as usize, StreamRecheck { base_frame: frame, stage: 0, last_fp: fp }));
     }
     if !seeded.is_empty() {
@@ -1234,21 +1376,33 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         let mut bytes = 0usize;
         let mut device = 0usize;
         let skip_unchanged = unchanged_skip();
-        while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !batch_fits(picked.len(), bytes, device, *dev, tex.size() as usize) {
+        while let Some((_, u)) = todo.peek() {
+            if !batch_fits(picked.len(), bytes, device, u.device, u.tex.size() as usize) {
                 break;
             }
-            let (r, (dev, va, tex, states)) = todo.next().unwrap();
-            device = dev;
-            bytes += tex.size() as usize;
-            picked.push((r, va, tex, states));
+            let (r, u) = todo.next().unwrap();
+            let size = u.tex.size() as usize;
+            let mut already_checked = false;
+            if skip_unchanged && u.dirty_pages.is_some() {
+                if changed_pages_since_last_upload(r.as_raw() as usize, u.src, size, u.dirty_pages.as_deref(), u.page_size).is_none() {
+                    let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || (n.is_power_of_two() && n >= 1024) {
+                        crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
+                    }
+                    continue;
+                }
+                already_checked = true;
+            }
+            device = u.device;
+            bytes += size;
+            picked.push((r, u.src, u.tex, u.states, u.page_size, already_checked));
         }
         if picked.is_empty() {
             continue;
         }
         let prepared = hash_and_detile_all(&picked, bytes, skip_unchanged);
         let mut batch = Vec::with_capacity(picked.len());
-        for ((r, va, _, states), subs) in picked.into_iter().zip(prepared) {
+        for ((r, va, _, states, _, _), subs) in picked.into_iter().zip(prepared) {
             let Some(subs) = subs else {
                 continue;
             };
@@ -1650,18 +1804,19 @@ fn detile_pool() -> &'static DetilePool {
 /// Read each texture once, optionally skip unchanged content (`LAST_CONTENT`), and detile from the
 /// same buffer — using the persistent detile worker pool when the batch reaches `PARALLEL_BYTES`.
 unsafe fn hash_and_detile_all(
-    picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>)],
+    picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>, usize, bool)],
     bytes: usize,
     skip_unchanged: bool,
 ) -> Vec<Option<Vec<Subresource>>> {
-    let items: Vec<(usize, usize, &xg::Texture)> = picked.iter().map(|(r, va, tex, _)| (r.as_raw() as usize, *va, &**tex)).collect();
+    let items: Vec<(usize, usize, &xg::Texture, usize, bool)> =
+        picked.iter().map(|(r, va, tex, _, page_size, checked)| (r.as_raw() as usize, *va, &**tex, *page_size, *checked)).collect();
     let threads = if bytes < PARALLEL_BYTES { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8) };
     let threads = threads.min(items.len());
-    let work = |res: usize, va: usize, tex: &xg::Texture| -> Option<Vec<Subresource>> {
-        let mem = title_bytes(va, tex.size() as usize);
-        if skip_unchanged {
-            let h = content_hash(&mem);
-            if same_as_last_upload(res, h) {
+    let work = |res: usize, va: usize, tex: &xg::Texture, page_size: usize, already_checked: bool| -> Option<Vec<Subresource>> {
+        let size = tex.size() as usize;
+        let mem = title_bytes(va, size);
+        if skip_unchanged && !already_checked {
+            if changed_pages_with(res, va, size, None, page_size, |at, len| std::borrow::Cow::Borrowed(&mem[at - va..at - va + len])).is_none() {
                 let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                 if n == 1 || (n.is_power_of_two() && n >= 1024) {
                     crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
@@ -1672,14 +1827,14 @@ unsafe fn hash_and_detile_all(
         Some(subresources_from_bytes(&mem, tex))
     };
     if threads <= 1 {
-        return items.iter().map(|&(res, va, tex)| work(res, va, tex)).collect();
+        return items.iter().map(|&(res, va, tex, ps, checked)| work(res, va, tex, ps, checked)).collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out: Vec<Mutex<Option<Vec<Subresource>>>> = (0..items.len()).map(|_| Mutex::new(None)).collect();
     detile_pool().run(threads, &|| loop {
         let k = next.fetch_add(1, Ordering::Relaxed);
-        let Some(&(res, va, tex)) = items.get(k) else { break };
-        if let Some(subs) = work(res, va, tex) {
+        let Some(&(res, va, tex, ps, checked)) = items.get(k) else { break };
+        if let Some(subs) = work(res, va, tex, ps, checked) {
             *out[k].lock().unwrap() = Some(subs);
         }
     });
@@ -1765,13 +1920,21 @@ mod tests {
     /// texture that was forgotten (released, or its address registered again) is uploaded again.
     #[test]
     fn a_texture_with_unchanged_memory_is_left_out_until_it_is_forgotten() {
+        use std::borrow::Cow;
+        const PAGE: usize = 0x1000;
         let (a, b) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize);
+        forget(a);
+        forget(b);
         let mut mem = vec![0u8; 3 << 20];
         mem[5] = 1;
+        let src = mem.as_ptr() as usize;
+        let size = mem.len();
+        let (_, count) = page_count(src, size, PAGE);
+        let all_pages: Vec<usize> = (0..count).collect();
         let h = content_hash(&mem);
-        assert!(!same_as_last_upload(a, h), "the first upload is not left out");
-        assert!(same_as_last_upload(a, h), "the same bytes again: left out");
-        assert!(!same_as_last_upload(b, h), "another texture over the same bytes has its own first upload");
+        assert_eq!(changed_pages_with(a, src, size, None, PAGE, |at, len| Cow::Borrowed(&mem[at - src..at - src + len])), Some(all_pages.clone()), "the first upload is not left out");
+        assert_eq!(changed_pages_with(a, src, size, None, PAGE, |at, len| Cow::Borrowed(&mem[at - src..at - src + len])), None, "the same bytes again: left out");
+        assert_eq!(changed_pages_with(b, src, size, None, PAGE, |at, len| Cow::Borrowed(&mem[at - src..at - src + len])), Some(all_pages.clone()), "another texture over the same bytes has its own first upload");
         // one byte anywhere, also in the tail that is not a whole 32-byte step
         for at in [0usize, 31, 32, (3 << 20) - 1] {
             let mut m = mem.clone();
@@ -1779,15 +1942,197 @@ mod tests {
             assert_ne!(content_hash(&m), h, "byte {at} changed");
         }
         mem[(3 << 20) - 1] = 9;
-        let h2 = content_hash(&mem);
-        assert!(!same_as_last_upload(a, h2), "changed memory is uploaded");
-        assert!(same_as_last_upload(a, h2));
+        assert_eq!(changed_pages_with(a, src, size, None, PAGE, |at, len| Cow::Borrowed(&mem[at - src..at - src + len])), Some(vec![count - 1]), "changed memory is uploaded");
+        assert_eq!(changed_pages_with(a, src, size, None, PAGE, |at, len| Cow::Borrowed(&mem[at - src..at - src + len])), None);
         // the length is part of the content: a prefix of zeros is not the whole
         assert_ne!(content_hash(&[0u8; 64]), content_hash(&[0u8; 96]));
         forget(a);
-        assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
+        assert_eq!(changed_pages_with(a, src, size, None, PAGE, |at, len| Cow::Borrowed(&mem[at - src..at - src + len])), Some(all_pages), "forgotten: its next upload is a first one");
         forget(a);
         forget(b);
+    }
+
+    #[test]
+    fn dirty_page_unchanged_skips_and_reads_only_that_page() {
+        use std::borrow::Cow;
+        const PAGE: usize = 0x1000;
+        let res = 0x7E57_2395_0001usize;
+        forget(res);
+        let mem = vec![0x5Au8; 8 * PAGE];
+        let src = 0x10_0000usize;
+        let mut bytes_read = 0usize;
+        let got = changed_pages_with(res, src, mem.len(), None, PAGE, |at, len| {
+            bytes_read += len;
+            Cow::Borrowed(&mem[at - src..at - src + len])
+        });
+        assert_eq!(got, Some((0..8).collect()));
+        assert_eq!(bytes_read, mem.len());
+
+        bytes_read = 0;
+        let mut calls = Vec::new();
+        let dirty = [src + 3 * PAGE];
+        let got = changed_pages_with(res, src, mem.len(), Some(&dirty), PAGE, |at, len| {
+            bytes_read += len;
+            calls.push((at, len));
+            Cow::Borrowed(&mem[at - src..at - src + len])
+        });
+        assert_eq!(got, None, "unchanged dirty page must skip upload");
+        assert_eq!(bytes_read, PAGE, "only the single 4096-byte dirty page must be read");
+        assert_eq!(calls, vec![(src + 3 * PAGE, PAGE)]);
+        forget(res);
+    }
+
+    #[test]
+    fn dirty_page_one_modified_byte_updates_only_that_page_hash() {
+        use std::borrow::Cow;
+        const PAGE: usize = 0x1000;
+        let res = 0x7E57_2395_0002usize;
+        forget(res);
+        let mut mem = vec![0x11u8; 6 * PAGE];
+        let src = 0x20_0000usize;
+        assert_eq!(
+            changed_pages_with(res, src, mem.len(), None, PAGE, |at, len| Cow::Borrowed(&mem[at - src..at - src + len])),
+            Some((0..6).collect())
+        );
+
+        mem[2 * PAGE + 123] ^= 0x01;
+        mem[4 * PAGE + 77] ^= 0x01;
+        let mut bytes_read = 0usize;
+        let dirty2 = [src + 2 * PAGE];
+        let got = changed_pages_with(res, src, mem.len(), Some(&dirty2), PAGE, |at, len| {
+            bytes_read += len;
+            Cow::Borrowed(&mem[at - src..at - src + len])
+        });
+        assert_eq!(got, Some(vec![2]));
+        assert_eq!(bytes_read, PAGE);
+
+        assert_eq!(
+            changed_pages_with(res, src, mem.len(), Some(&dirty2), PAGE, |at, len| Cow::Borrowed(&mem[at - src..at - src + len])),
+            None
+        );
+        let dirty4 = [src + 4 * PAGE];
+        assert_eq!(
+            changed_pages_with(res, src, mem.len(), Some(&dirty4), PAGE, |at, len| Cow::Borrowed(&mem[at - src..at - src + len])),
+            Some(vec![4])
+        );
+        forget(res);
+    }
+
+    #[test]
+    fn unaligned_src_and_tail_bytes_hash_exact_clamped_spans() {
+        use std::borrow::Cow;
+        const PAGE: usize = 0x1000;
+        let res = 0x7E57_2395_0003usize;
+        forget(res);
+        let src = 0x30_0500usize;
+        let size = 0x2307usize;
+        assert_eq!(page_count(src, size, PAGE), (0x30_0000, 3));
+        assert_eq!(page_count(src, 0, PAGE), (src, 0));
+
+        let mut mem = vec![0x33u8; size];
+        assert_eq!(
+            changed_pages_with(res, src, size, None, PAGE, |at, len| Cow::Borrowed(&mem[at - src..at - src + len])),
+            Some(vec![0, 1, 2])
+        );
+
+        let mut calls = Vec::new();
+        assert_eq!(
+            changed_pages_with(res, src, size, Some(&[0x30_0000]), PAGE, |at, len| {
+                calls.push((at, len));
+                Cow::Borrowed(&mem[at - src..at - src + len])
+            }),
+            None
+        );
+        assert_eq!(calls, vec![(src, 0xB00)]);
+
+        mem[size - 1] ^= 0xFF;
+        calls.clear();
+        assert_eq!(
+            changed_pages_with(res, src, size, Some(&[0x30_2000]), PAGE, |at, len| {
+                calls.push((at, len));
+                Cow::Borrowed(&mem[at - src..at - src + len])
+            }),
+            Some(vec![2])
+        );
+        assert_eq!(calls, vec![(0x30_2000, 0x807)]);
+
+        mem[0] ^= 0xFF;
+        calls.clear();
+        assert_eq!(
+            changed_pages_with(res, src, size, Some(&[0x30_0000]), PAGE, |at, len| {
+                calls.push((at, len));
+                Cow::Borrowed(&mem[at - src..at - src + len])
+            }),
+            Some(vec![0])
+        );
+        assert_eq!(calls, vec![(src, 0xB00)]);
+        assert_eq!(
+            changed_pages_with(res, src, size, None, PAGE, |at, len| Cow::Borrowed(&mem[at - src..at - src + len])),
+            None
+        );
+        forget(res);
+    }
+
+    #[test]
+    fn remapped_src_and_forget_force_full_upload_even_with_identical_bytes() {
+        use std::borrow::Cow;
+        const PAGE: usize = 0x1000;
+        let res = 0x7E57_2395_0004usize;
+        forget(res);
+        let mem = vec![0u8; 4 * PAGE];
+        let src1 = 0x40_0000usize;
+        let src2 = 0x50_0000usize;
+
+        assert_eq!(
+            changed_pages_with(res, src1, mem.len(), None, PAGE, |at, len| Cow::Borrowed(&mem[at - src1..at - src1 + len])),
+            Some(vec![0, 1, 2, 3])
+        );
+        assert_eq!(
+            changed_pages_with(res, src1, mem.len(), Some(&[src1]), PAGE, |at, len| Cow::Borrowed(&mem[at - src1..at - src1 + len])),
+            None
+        );
+
+        assert_eq!(
+            changed_pages_with(res, src2, mem.len(), Some(&[src2]), PAGE, |at, len| Cow::Borrowed(&mem[at - src2..at - src2 + len])),
+            Some(vec![0, 1, 2, 3])
+        );
+        assert_eq!(
+            changed_pages_with(res, src2, mem.len(), Some(&[src2 + PAGE]), PAGE, |at, len| Cow::Borrowed(&mem[at - src2..at - src2 + len])),
+            None
+        );
+
+        forget(res);
+        assert_eq!(
+            changed_pages_with(res, src2, mem.len(), Some(&[src2]), PAGE, |at, len| Cow::Borrowed(&mem[at - src2..at - src2 + len])),
+            Some(vec![0, 1, 2, 3])
+        );
+        forget(res);
+    }
+
+    #[test]
+    fn duplicate_dirty_pages_produce_unique_changed_indices() {
+        use std::borrow::Cow;
+        const PAGE: usize = 0x1000;
+        let res = 0x7E57_2395_0005usize;
+        forget(res);
+        let mut mem = vec![0u8; 4 * PAGE];
+        let src = 0x60_0000usize;
+        assert_eq!(
+            changed_pages_with(res, src, mem.len(), None, PAGE, |at, len| Cow::Borrowed(&mem[at - src..at - src + len])),
+            Some(vec![0, 1, 2, 3])
+        );
+
+        mem[PAGE + 10] = 0xAA;
+        mem[3 * PAGE + 20] = 0xBB;
+        let dirty = [src + 3 * PAGE, src + PAGE, src + PAGE + 0x100, src + 3 * PAGE + 0x200, src + PAGE];
+        let mut bytes_read = 0usize;
+        let got = changed_pages_with(res, src, mem.len(), Some(&dirty), PAGE, |at, len| {
+            bytes_read += len;
+            Cow::Borrowed(&mem[at - src..at - src + len])
+        });
+        assert_eq!(got, Some(vec![1, 3]));
+        assert_eq!(bytes_read, 2 * PAGE);
+        forget(res);
     }
 
     /// Real uploads, dirty-page detection and a source changing after registration:
@@ -2975,19 +3320,19 @@ mod tests {
 
         // Only pending entry fires with no dirty pages.
         let (hits, cleared) = t.dirty_and_pending(&[], 0x1000);
-        assert_eq!(hits, vec![0x200]);
+        assert_eq!(hits, vec![(0x200, true)]);
         assert_eq!(cleared, 1);
 
         // Dirty pages hitting small, large, and gpu_written return only small + large.
         let dirty = [0x2000_1000, 0x2021_0000, 0x2030_0000];
         let (hits, cleared) = t.dirty_and_pending(&dirty, 0x1000);
-        assert_eq!(hits, vec![0x100, 0x300]);
+        assert_eq!(hits, vec![(0x100, false), (0x300, false)]);
         assert_eq!(cleared, 0);
 
         // Marking small as gpu_written removes it from dirty scans.
         assert!(t.mark_gpu_written(0x100));
         let (hits, _) = t.dirty_and_pending(&dirty, 0x1000);
-        assert_eq!(hits, vec![0x300]);
+        assert_eq!(hits, vec![(0x300, false)]);
     }
 
     #[test]
