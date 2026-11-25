@@ -1811,8 +1811,11 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             m.remove(&(this as usize));
         }
         super::sparse::forget_buffer(this as usize);
-        super::vram::forget(this as usize);
-        super::title_textures::forget(this as usize);
+        let recycle = super::vram::forget_for_recycle(this as usize, held);
+        let final_state = super::title_textures::forget(this as usize);
+        if let (Some(info), Some(state)) = (recycle, final_state) {
+            super::vram::park_recyclable(this as usize, info, state.0 as u32);
+        }
         super::depth_uav::forget(this as usize);
         super::format_alias::forget(this as usize);
         let gone = UMA_BUFFERS.write().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
@@ -3616,7 +3619,7 @@ unsafe fn desc_of(res: *mut c_void) -> Option<D3D12_RESOURCE_DESC> {
     ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc())
 }
 
-unsafe fn note_reserved(hr: HRESULT, ppv: *mut *mut c_void) -> HRESULT {
+pub(super) unsafe fn note_reserved(hr: HRESULT, ppv: *mut *mut c_void) -> HRESULT {
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         if let Some(d) = desc_of(*ppv) {
             RESERVED.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, d);
