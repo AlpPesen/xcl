@@ -26,7 +26,8 @@
 //! UAV at 2k + 1.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, RwLock};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -57,7 +58,7 @@ struct Heap {
     sampler: bool,
     /// views in the shared heap: the index there of each page's first SRV (`UNMAPPED`: the
     /// page has no place yet); empty: the heap's views are not in the shared heap
-    pages: Vec<u32>,
+    pages: Vec<AtomicU32>,
     /// shader visible as the title made it
     visible: bool,
     memory: Memory,
@@ -73,7 +74,7 @@ impl Heap {
     }
 }
 
-static HEAPS: Mutex<Vec<Heap>> = Mutex::new(Vec::new());
+static HEAPS: RwLock<Vec<Heap>> = RwLock::new(Vec::new());
 
 /// Released descriptor range in `GLOBAL` or `GLOBAL_SAMPLER` awaiting active GPU queues before
 /// being returned to `free` (prevents overwriting shader-visible descriptors still read in flight).
@@ -162,8 +163,9 @@ struct Global {
 
 // D3D12 descriptor heaps and devices are free-threaded
 unsafe impl Send for Global {}
+unsafe impl Sync for Global {}
 
-static GLOBAL: Mutex<Option<Global>> = Mutex::new(None);
+static GLOBAL: RwLock<Option<Global>> = RwLock::new(None);
 static GLOBAL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// descriptors of the shared heap at most (the GPU may take more: OPTIONS19)
@@ -234,7 +236,10 @@ unsafe fn global_cap(dev: &ID3D12Device) -> u32 {
 /// made) – view heaps then keep their own.
 pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut g = GLOBAL.lock().unwrap();
+    if GLOBAL.read().unwrap().is_some() {
+        return true;
+    }
+    let mut g = GLOBAL.write().unwrap();
     if g.is_none() {
         if GLOBAL_FAILED.load(Relaxed) {
             return false;
@@ -327,7 +332,7 @@ unsafe fn set_window_views_checked(dev: &ID3D12Device, windows: &[(usize, usize)
     let complete = count <= crate::gpu::uma::MAX_WINDOWS || windows.iter().all(|&(raw, bytes)| raw != 0 || bytes == 0);
     let ok = atomics64 && count <= crate::gpu::uma::MAX_HEAP_WINDOWS && complete && windows.first().is_some_and(|w| w.0 != 0) && shared_heap(dev) && {
         let (device, cpu, inc) = {
-            let g = GLOBAL.lock().unwrap();
+            let g = GLOBAL.read().unwrap();
             let s = g.as_ref().unwrap();
             (s.dev.clone(), s.cpu, s.inc)
         };
@@ -354,7 +359,7 @@ unsafe fn set_window_views_checked(dev: &ID3D12Device, windows: &[(usize, usize)
 /// `count` descriptors of the shared heap: the index of the first. None: no shared heap, or
 /// no room left in it.
 fn reserve_global(count: u32) -> Option<u32> {
-    let mut g = GLOBAL.lock().unwrap();
+    let mut g = GLOBAL.write().unwrap();
     let s = g.as_mut()?;
     unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) };
     let (cap, mut next) = (s.cap, s.next);
@@ -372,12 +377,20 @@ fn reserve_global(count: u32) -> Option<u32> {
 /// The place in the shared heap of the page slot `k` of `h` is in – (index of the page's
 /// first SRV there, the page's first slot) – given now if the page has none yet. None: the
 /// heap is not in the shared heap, or that is full.
-fn page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
+fn page_of(h: &Heap, k: u32) -> Option<(u32, u32)> {
     let p = (k / PAGE_SLOTS) as usize;
-    let mut first = *h.pages.get(p)?;
+    let slot_atom = h.pages.get(p)?;
+    let mut first = slot_atom.load(Ordering::Acquire);
     if first == UNMAPPED {
-        first = reserve_global(page_descriptors(h.n, p as u32))?;
-        h.pages[p] = first;
+        let count = page_descriptors(h.n, p as u32);
+        let alloc = reserve_global(count)?;
+        match slot_atom.compare_exchange(UNMAPPED, alloc, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => first = alloc,
+            Err(existing) => {
+                release_global(alloc, count);
+                first = existing;
+            }
+        }
     }
     Some((first, p as u32 * PAGE_SLOTS))
 }
@@ -388,10 +401,10 @@ pub fn release_global(first: u32, count: u32) {
     if count == 0 {
         return;
     }
-    let dev = GLOBAL.lock().unwrap().as_ref().map(|s| s.dev.clone());
+    let dev = GLOBAL.read().unwrap().as_ref().map(|s| s.dev.clone());
     let Some(dev) = dev else { return };
     let marks = unsafe { signal_live_queues_for(&dev) };
-    if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
+    if let Some(s) = GLOBAL.write().unwrap().as_mut() {
         if marks.as_ref().is_some_and(Vec::is_empty) {
             merge_release(&mut s.free, first, count);
         } else {
@@ -418,12 +431,12 @@ fn merge_release(free: &mut Vec<(u32, u32)>, first: u32, count: u32) {
 
 /// The shader-visible PC heap lists bind for view descriptors (None: none shared).
 pub fn global_heap() -> Option<ID3D12DescriptorHeap> {
-    GLOBAL.lock().unwrap().as_ref().map(|s| s.heap.clone())
+    GLOBAL.read().unwrap().as_ref().map(|s| s.heap.clone())
 }
 
 /// Whether `obj` (a title's view heap) has its descriptors in the shared heap.
 pub fn in_global(obj: usize) -> bool {
-    HEAPS.lock().unwrap().iter().any(|h| h.obj == obj && !h.sampler && !h.pages.is_empty())
+    HEAPS.read().unwrap().iter().any(|h| h.obj == obj && !h.sampler && !h.pages.is_empty())
 }
 
 /// Memory for a heap of `bytes` from the title's allocation hook – where the title expects the
@@ -482,25 +495,25 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
             );
         }
     }
-    let pages = if shared && !sampler && GLOBAL.lock().unwrap().is_some() {
-        vec![UNMAPPED; n.div_ceil(PAGE_SLOTS).max(1) as usize]
-    } else if shared && sampler && GLOBAL_SAMPLER.lock().unwrap().is_some() {
-        vec![UNMAPPED; n.div_ceil(SAMPLER_PAGE_SLOTS).max(1) as usize]
+    let pages = if shared && !sampler && GLOBAL.read().unwrap().is_some() {
+        (0..n.div_ceil(PAGE_SLOTS).max(1)).map(|_| AtomicU32::new(UNMAPPED)).collect()
+    } else if shared && sampler && GLOBAL_SAMPLER.read().unwrap().is_some() {
+        (0..n.div_ceil(SAMPLER_PAGE_SLOTS).max(1)).map(|_| AtomicU32::new(UNMAPPED)).collect()
     } else {
         Vec::new()
     };
-    HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, memory });
+    HEAPS.write().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, memory });
     true
 }
 
 /// The heap object was released for good: its slots go back to unified memory.
 pub fn unregister(obj: usize) {
     let gone = {
-        let mut heaps = HEAPS.lock().unwrap();
+        let mut heaps = HEAPS.write().unwrap();
         heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
     };
     if let Some(h) = gone {
-        for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
+        for (p, f) in h.pages.iter().enumerate().map(|(p, a)| (p, a.load(Ordering::Relaxed))).filter(|&(_, f)| f != UNMAPPED) {
             if h.sampler {
                 release_global_sampler(f, sampler_page_descriptors(h.n, p as u32));
             } else {
@@ -523,12 +536,12 @@ pub fn unregister(obj: usize) {
 
 /// Whether heap `obj` holds samplers, and the 32-bit console address of its slots.
 pub fn base(obj: usize) -> Option<(bool, u32)> {
-    HEAPS.lock().unwrap().iter().find(|h| h.obj == obj).map(|h| (h.sampler, h.shadow as u32))
+    HEAPS.read().unwrap().iter().find(|h| h.obj == obj).map(|h| (h.sampler, h.shadow as u32))
 }
 
 /// Start of the console slots of heap `obj` (CPU handle = GPU handle on the console).
 pub fn start(obj: usize) -> Option<u64> {
-    HEAPS.lock().unwrap().iter().find(|h| h.obj == obj).map(|h| h.shadow as u64)
+    HEAPS.read().unwrap().iter().find(|h| h.obj == obj).map(|h| h.shadow as u64)
 }
 
 /// A console slot: where its descriptor goes and its PC descriptors.
@@ -552,12 +565,12 @@ pub struct Slot {
 /// The slot behind a console CPU handle (None: not one of XCL's console heaps). A view slot
 /// of a heap in the shared heap gets its page's place there now if the page has none yet.
 pub fn slot(cpu: u64) -> Option<Slot> {
-    let mut heaps = HEAPS.lock().unwrap();
-    let h = heaps.iter_mut().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
+    let heaps = HEAPS.read().unwrap();
+    let h = heaps.iter().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
     let k = ((cpu - h.shadow as u64) / h.slot_bytes() as u64) as u32;
     if h.sampler {
         let shared = sampler_page_of(h, k).and_then(|(first, k0)| {
-            let g = GLOBAL_SAMPLER.lock().unwrap();
+            let g = GLOBAL_SAMPLER.read().unwrap();
             let g = g.as_ref()?;
             let i = first + (k - k0);
             Some((i, g.cpu + i as u64 * g.inc as u64))
@@ -570,7 +583,7 @@ pub fn slot(cpu: u64) -> Option<Slot> {
     }
     let uav = ((2 * k + 1) * h.inc) as u64;
     let shared = page_of(h, k).and_then(|(first, k0)| {
-        let g = GLOBAL.lock().unwrap();
+        let g = GLOBAL.read().unwrap();
         let g = g.as_ref()?;
         let i = first + 2 * (k - k0);
         Some((i, g.gpu + (i as u64 + 1) * g.inc as u64, g.cpu + i as u64 * g.inc as u64))
@@ -588,8 +601,9 @@ pub unsafe fn publish(s: &Slot, uav: bool) {
         return;
     }
     if s.sampler {
-        if let Some(g) = GLOBAL_SAMPLER.lock().unwrap().as_ref() {
-            g.dev.CopyDescriptorsSimple(
+        let dev = GLOBAL_SAMPLER.read().unwrap().as_ref().map(|g| g.dev.clone());
+        if let Some(dev) = dev {
+            dev.CopyDescriptorsSimple(
                 1,
                 D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
                 D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
@@ -598,9 +612,10 @@ pub unsafe fn publish(s: &Slot, uav: bool) {
         }
         return;
     }
-    if let Some(g) = GLOBAL.lock().unwrap().as_ref() {
-        let (dst, src) = if uav { (s.shared_srv + g.inc as u64, s.pc_uav) } else { (s.shared_srv, s.pc_srv) };
-        g.dev.CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    let target = GLOBAL.read().unwrap().as_ref().map(|g| (g.dev.clone(), g.inc));
+    if let Some((dev, inc)) = target {
+        let (dst, src) = if uav { (s.shared_srv + inc as u64, s.pc_uav) } else { (s.shared_srv, s.pc_srv) };
+        dev.CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
 }
 
@@ -609,6 +624,12 @@ pub unsafe fn publish(s: &Slot, uav: bool) {
 pub unsafe fn publish_range(first: &Slot, n: u32) {
     let page_slots = if first.sampler { SAMPLER_PAGE_SLOTS } else { PAGE_SLOTS };
     let step = if first.sampler { SAMPLER_SLOT } else { SLOT };
+    let dev = if first.sampler {
+        GLOBAL_SAMPLER.read().unwrap().as_ref().map(|g| g.dev.clone())
+    } else {
+        GLOBAL.read().unwrap().as_ref().map(|g| g.dev.clone())
+    };
+    let Some(dev) = dev else { return };
     let mut done = 0;
     while done < n {
         let s = if done == 0 { Some(*first) } else { slot((first.at + (done * step) as usize) as u64) };
@@ -616,16 +637,19 @@ pub unsafe fn publish_range(first: &Slot, n: u32) {
         let run = (page_slots - s.k % page_slots).min(n - done);
         if s.shared_srv != 0 {
             if s.sampler {
-                if let Some(g) = GLOBAL_SAMPLER.lock().unwrap().as_ref() {
-                    g.dev.CopyDescriptorsSimple(
-                        run,
-                        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
-                        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
-                        D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                    );
-                }
-            } else if let Some(g) = GLOBAL.lock().unwrap().as_ref() {
-                g.dev.CopyDescriptorsSimple(2 * run, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                dev.CopyDescriptorsSimple(
+                    run,
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
+                    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                );
+            } else {
+                dev.CopyDescriptorsSimple(
+                    2 * run,
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
             }
         }
         done += run;
@@ -673,18 +697,97 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     }
     write(dst, &w[..n]);
     if !src.sampler {
-        note_resource(dst, resource_at(src.at).unwrap_or(0));
+        if super::present::trace_frame() {
+            note_resource(dst, resource_at(src.at).unwrap_or(0));
+        }
         if w[3] >> 28 >= 8 {
             super::ambient::copy_descriptor(src.index, dst.index);
         }
     }
 }
 
+/// Copy `n` contiguous console slots from `src` to `dst` under a single shared `HEAPS` read lock,
+/// renumbering T#/S# PC heap indices per page run instead of re-acquiring global locks per slot.
+pub fn copy_words_range(dst: u64, src: u64, n: u32) -> bool {
+    if n == 0 {
+        return true;
+    }
+    let heaps = HEAPS.read().unwrap();
+    let Some(hd) = heaps.iter().find(|h| dst >= h.shadow as u64 && dst < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64) else {
+        return false;
+    };
+    let Some(hs) = heaps.iter().find(|h| src >= h.shadow as u64 && src < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64) else {
+        return false;
+    };
+    if hd.sampler != hs.sampler {
+        return false;
+    }
+    let sampler = hd.sampler;
+    let step = hd.slot_bytes();
+    let kd0 = ((dst - hd.shadow as u64) / step as u64) as u32;
+    let ks0 = ((src - hs.shadow as u64) / step as u64) as u32;
+    let count = n.min(hd.n - kd0).min(hs.n - ks0);
+    let page_slots = if sampler { SAMPLER_PAGE_SLOTS } else { PAGE_SLOTS };
+    let words_n = if sampler { 4 } else { 8 };
+    let trace = !sampler && super::present::trace_frame();
+    let d_hosted = !hd.pages.is_empty();
+    let s_hosted = !hs.pages.is_empty();
+
+    let mut done = 0u32;
+    while done < count {
+        let kd = kd0 + done;
+        let ks = ks0 + done;
+        let run = (page_slots - kd % page_slots)
+            .min(page_slots - ks % page_slots)
+            .min(count - done);
+        let d_page = if sampler { sampler_page_of(hd, kd) } else { page_of(hd, kd) };
+        let s_page = if sampler { sampler_page_of(hs, ks) } else { page_of(hs, ks) };
+        for i in 0..run {
+            let kdi = kd + i;
+            let ksi = ks + i;
+            let dst_at = hd.shadow + (kdi * step) as usize;
+            let src_at = hs.shadow + (ksi * step) as usize;
+            let dst_idx = match d_page {
+                Some((first, k0)) => if sampler { first + (kdi - k0) } else { first + 2 * (kdi - k0) },
+                None => if sampler { sampler_unmapped_index(d_hosted, kdi) } else { view_unmapped_index(d_hosted, kdi) },
+            };
+            let mut w = [0u32; 8];
+            unsafe { std::ptr::copy_nonoverlapping(src_at as *const u32, w.as_mut_ptr(), words_n) };
+            let is_tex = !sampler && (w[3] >> 28 >= 8);
+            if sampler {
+                w[3] = (w[3] & !0xFFF) | (dst_idx & 0xFFF);
+            } else if is_tex {
+                w[0] = dst_idx;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(w.as_ptr(), dst_at as *mut u32, words_n) };
+            if trace {
+                let res = resource_at(src_at).unwrap_or(0);
+                let mut g = RES.lock().unwrap();
+                let m = g.get_or_insert_with(Default::default);
+                if res == 0 {
+                    m.remove(&dst_at);
+                } else {
+                    m.insert(dst_at, res);
+                }
+            }
+            if is_tex {
+                let src_idx = match s_page {
+                    Some((first, k0)) => first + 2 * (ksi - k0),
+                    None => view_unmapped_index(s_hosted, ksi),
+                };
+                super::ambient::copy_descriptor(src_idx, dst_idx);
+            }
+        }
+        done += run;
+    }
+    true
+}
+
 /// `XCL_TRACE_FRAME`: what the slots of each shader-visible view heap hold – images whose
 /// PC index is the slot's own (made or copied through the device) or another (copied by the
 /// title itself, as memory), buffers, empty.
 pub fn census() {
-    let heaps = HEAPS.lock().unwrap();
+    let heaps = HEAPS.read().unwrap();
     // samplers: S# word 3 [11:0] is the PC index in the sampler heap the slot belongs to
     for h in heaps.iter().filter(|h| h.sampler) {
         let (mut empty, mut own, mut other) = (0u32, 0u32, 0u32);
@@ -693,7 +796,7 @@ pub fn census() {
             let w = unsafe { std::slice::from_raw_parts((h.shadow + (k * SAMPLER_SLOT) as usize) as *const u32, 4) };
             if w.iter().all(|&x| x == 0) {
                 empty += 1;
-            } else if w[3] & 0xFFF == sampler_own_index(&h.pages, k) {
+            } else if w[3] & 0xFFF == sampler_own_index_atomic(&h.pages, k) {
                 own += 1;
             } else {
                 other += 1;
@@ -712,8 +815,8 @@ pub fn census() {
     for h in heaps.iter().filter(|h| !h.sampler) {
         let (mut empty, mut own, mut other, mut buffers) = (0u32, 0u32, 0u32, 0u32);
         let mut examples: Vec<(u32, u32)> = Vec::new();
-        let own_index = |k: u32| match h.pages.get((k / PAGE_SLOTS) as usize) {
-            Some(&f) if f != UNMAPPED => f + 2 * (k % PAGE_SLOTS),
+        let own_index = |k: u32| match h.pages.get((k / PAGE_SLOTS) as usize).map(|a| a.load(Ordering::Relaxed)) {
+            Some(f) if f != UNMAPPED => f + 2 * (k % PAGE_SLOTS),
             _ => 2 * k,
         };
         for k in 0..h.n {
@@ -772,9 +875,17 @@ fn sampler_unmapped_index(hosted: bool, k: u32) -> u32 {
 }
 
 /// Expected PC sampler index for slot `k` of a sampler heap with shared-page table `pages`.
+#[cfg(test)]
 fn sampler_own_index(pages: &[u32], k: u32) -> u32 {
     match pages.get((k / SAMPLER_PAGE_SLOTS) as usize) {
         Some(&f) if f != UNMAPPED => f + (k % SAMPLER_PAGE_SLOTS),
+        _ => sampler_unmapped_index(!pages.is_empty(), k),
+    }
+}
+
+fn sampler_own_index_atomic(pages: &[AtomicU32], k: u32) -> u32 {
+    match pages.get((k / SAMPLER_PAGE_SLOTS) as usize).map(|a| a.load(Ordering::Relaxed)) {
+        Some(f) if f != UNMAPPED => f + (k % SAMPLER_PAGE_SLOTS),
         _ => sampler_unmapped_index(!pages.is_empty(), k),
     }
 }
@@ -791,8 +902,9 @@ struct GlobalSampler {
 }
 
 unsafe impl Send for GlobalSampler {}
+unsafe impl Sync for GlobalSampler {}
 
-static GLOBAL_SAMPLER: Mutex<Option<GlobalSampler>> = Mutex::new(None);
+static GLOBAL_SAMPLER: RwLock<Option<GlobalSampler>> = RwLock::new(None);
 static GLOBAL_SAMPLER_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn sampler_page_descriptors(n: u32, p: u32) -> u32 {
@@ -805,7 +917,10 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
     if std::env::var("XCL_SHARED_SAMPLER_HEAP").is_ok_and(|v| v.trim() == "0") {
         return false;
     }
-    let mut g = GLOBAL_SAMPLER.lock().unwrap();
+    if GLOBAL_SAMPLER.read().unwrap().is_some() {
+        return true;
+    }
+    let mut g = GLOBAL_SAMPLER.write().unwrap();
     if g.is_none() {
         if GLOBAL_SAMPLER_FAILED.load(Relaxed) {
             return false;
@@ -858,7 +973,7 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
 }
 
 fn reserve_global_sampler(count: u32) -> Option<u32> {
-    let mut g = GLOBAL_SAMPLER.lock().unwrap();
+    let mut g = GLOBAL_SAMPLER.write().unwrap();
     let s = g.as_mut()?;
     unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) };
     let (cap, mut next) = (s.cap, s.next);
@@ -873,12 +988,20 @@ fn reserve_global_sampler(count: u32) -> Option<u32> {
     r
 }
 
-fn sampler_page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
+fn sampler_page_of(h: &Heap, k: u32) -> Option<(u32, u32)> {
     let p = (k / SAMPLER_PAGE_SLOTS) as usize;
-    let mut first = *h.pages.get(p)?;
+    let slot_atom = h.pages.get(p)?;
+    let mut first = slot_atom.load(Ordering::Acquire);
     if first == UNMAPPED {
-        first = reserve_global_sampler(sampler_page_descriptors(h.n, p as u32))?;
-        h.pages[p] = first;
+        let count = sampler_page_descriptors(h.n, p as u32);
+        let alloc = reserve_global_sampler(count)?;
+        match slot_atom.compare_exchange(UNMAPPED, alloc, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => first = alloc,
+            Err(existing) => {
+                release_global_sampler(alloc, count);
+                first = existing;
+            }
+        }
     }
     Some((first, p as u32 * SAMPLER_PAGE_SLOTS))
 }
@@ -887,10 +1010,10 @@ fn release_global_sampler(first: u32, count: u32) {
     if count == 0 {
         return;
     }
-    let dev = GLOBAL_SAMPLER.lock().unwrap().as_ref().map(|s| s.dev.clone());
+    let dev = GLOBAL_SAMPLER.read().unwrap().as_ref().map(|s| s.dev.clone());
     let Some(dev) = dev else { return };
     let marks = unsafe { signal_live_queues_for(&dev) };
-    if let Some(s) = GLOBAL_SAMPLER.lock().unwrap().as_mut() {
+    if let Some(s) = GLOBAL_SAMPLER.write().unwrap().as_mut() {
         if marks.as_ref().is_some_and(Vec::is_empty) {
             merge_release(&mut s.free, first, count);
         } else {
@@ -902,12 +1025,12 @@ fn release_global_sampler(first: u32, count: u32) {
 
 /// The shared shader-visible PC sampler heap lists bind (None: no shared sampler heap).
 pub fn global_sampler_heap() -> Option<ID3D12DescriptorHeap> {
-    GLOBAL_SAMPLER.lock().unwrap().as_ref().map(|s| s.heap.clone())
+    GLOBAL_SAMPLER.read().unwrap().as_ref().map(|s| s.heap.clone())
 }
 
 /// Whether `obj` (a title's sampler heap) has its descriptors in the shared sampler heap.
 pub fn in_global_sampler(obj: usize) -> bool {
-    HEAPS.lock().unwrap().iter().any(|h| h.obj == obj && h.sampler && !h.pages.is_empty())
+    HEAPS.read().unwrap().iter().any(|h| h.obj == obj && h.sampler && !h.pages.is_empty())
 }
 
 #[cfg(test)]
@@ -989,7 +1112,7 @@ mod tests {
         unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
         unsafe extern "system" fn create_uav(_this: *mut c_void, _resource: *mut c_void, _counter: *mut c_void, _desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, _at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             // The adopted device hook can re-enter descriptor bookkeeping.
-            UNLOCKED.fetch_and(GLOBAL.try_lock().is_ok(), Ordering::Relaxed);
+            UNLOCKED.fetch_and(GLOBAL.try_write().is_ok(), Ordering::Relaxed);
             CALLS.fetch_add(1, Ordering::Relaxed);
         }
         let mut vt = [0usize; 20];
@@ -1001,7 +1124,7 @@ mod tests {
         let mut resource = Object { vt: vt.as_ptr() };
         unsafe {
             let dev = ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void);
-            *GLOBAL.lock().unwrap() = Some(Global {
+            *GLOBAL.write().unwrap() = Some(Global {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
@@ -1025,7 +1148,7 @@ mod tests {
             assert!(!set_window_views_checked(&dev, &[window], false));
             assert_eq!(CALLS.load(Ordering::Relaxed), 0);
             assert!(UNLOCKED.load(Ordering::Relaxed), "device callback ran while GLOBAL was locked");
-            *GLOBAL.lock().unwrap() = None;
+            *GLOBAL.write().unwrap() = None;
         }
     }
 
@@ -1197,7 +1320,7 @@ mod tests {
         let mut device = Object { vt: vt.as_ptr() };
         let mut heap = Object { vt: vt.as_ptr() };
         unsafe {
-            *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
+            *GLOBAL_SAMPLER.write().unwrap() = Some(GlobalSampler {
                 dev: ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(),
@@ -1211,11 +1334,11 @@ mod tests {
             release_global_sampler(5, 4);
             release_global_sampler(1, 4);
             release_global_sampler(1, 0);
-            assert_eq!(GLOBAL_SAMPLER.lock().unwrap().as_ref().unwrap().free, vec![(1, 8)]);
+            assert_eq!(GLOBAL_SAMPLER.read().unwrap().as_ref().unwrap().free, vec![(1, 8)]);
             assert_eq!(reserve_global_sampler(8), Some(1));
             // Coalesced range ending at cursor straddles cleanly into the never-used tail.
             {
-                let mut g = GLOBAL_SAMPLER.lock().unwrap();
+                let mut g = GLOBAL_SAMPLER.write().unwrap();
                 let s = g.as_mut().unwrap();
                 s.next = 13;
                 s.free.clear();
@@ -1223,12 +1346,12 @@ mod tests {
             release_global_sampler(9, 2);
             release_global_sampler(11, 2);
             assert_eq!(reserve_global_sampler(8), Some(9));
-            let g = GLOBAL_SAMPLER.lock().unwrap();
+            let g = GLOBAL_SAMPLER.read().unwrap();
             let s = g.as_ref().unwrap();
             assert_eq!(s.next, 17);
             assert!(s.free.is_empty());
             drop(g);
-            *GLOBAL_SAMPLER.lock().unwrap() = None;
+            *GLOBAL_SAMPLER.write().unwrap() = None;
         }
     }
 
@@ -1256,12 +1379,12 @@ mod tests {
         let mut sampler_heap = Object { vt: vt.as_ptr() };
         unsafe {
             let dev = ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void);
-            *GLOBAL.lock().unwrap() = Some(Global {
+            *GLOBAL.write().unwrap() = Some(Global {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut view_heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024, next: 64, free: Vec::new(), retired: VecDeque::new(),
             });
-            *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
+            *GLOBAL_SAMPLER.write().unwrap() = Some(GlobalSampler {
                 dev,
                 heap: ID3D12DescriptorHeap::from_raw(&mut sampler_heap as *mut _ as *mut c_void),
                 cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(),
@@ -1283,18 +1406,18 @@ mod tests {
                 assert_eq!(slot(start(0xC111).unwrap()).unwrap().index, 5);
                 unregister(0xC110);
                 unregister(0xC111);
-                assert_eq!(GLOBAL_SAMPLER.lock().unwrap().as_ref().unwrap().free, vec![(1, 8)]);
+                assert_eq!(GLOBAL_SAMPLER.read().unwrap().as_ref().unwrap().free, vec![(1, 8)]);
             } else {
-                let mut heaps = HEAPS.lock().unwrap();
-                heaps.push(Heap { obj: 0xC100, shadow: 0, n: 16, pc_cpu: 0, pc_gpu: 0, inc: 16, sampler: true, pages: vec![UNMAPPED; 2], visible: true, memory: Memory::Uma });
-                heaps.push(Heap { obj: 0xC101, shadow: 0, n: 16, pc_cpu: 0, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED], visible: true, memory: Memory::Uma });
+                let mut heaps = HEAPS.write().unwrap();
+                heaps.push(Heap { obj: 0xC100, shadow: 0, n: 16, pc_cpu: 0, pc_gpu: 0, inc: 16, sampler: true, pages: vec![AtomicU32::new(UNMAPPED), AtomicU32::new(UNMAPPED)], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { obj: 0xC101, shadow: 0, n: 16, pc_cpu: 0, pc_gpu: 0, inc: 32, sampler: false, pages: vec![AtomicU32::new(UNMAPPED)], visible: true, memory: Memory::Uma });
                 drop(heaps);
                 assert!(!in_global(0xC100) && in_global_sampler(0xC100));
                 assert!(in_global(0xC101) && !in_global_sampler(0xC101));
-                HEAPS.lock().unwrap().clear();
+                HEAPS.write().unwrap().clear();
             }
-            *GLOBAL_SAMPLER.lock().unwrap() = None;
-            *GLOBAL.lock().unwrap() = None;
+            *GLOBAL_SAMPLER.write().unwrap() = None;
+            *GLOBAL.write().unwrap() = None;
         }
     }
 
@@ -1353,5 +1476,30 @@ mod tests {
         drain_retired_ranges(&mut retired, &mut free, |f| f.load(Ordering::SeqCst));
         assert_eq!(free, vec![(64, 32)]);
         assert_eq!(retired.len(), 1);
+    }
+
+    #[test]
+    fn copy_words_range_copies_views_and_samplers_with_renumbering() {
+        let Some(u) = crate::gpu::uma::get() else { return };
+        let rel = |p: u64| (p as usize - u.base()) as u32;
+        assert!(register(0xD100, 6, 0x1000, 0x5000, 32, false, false, true));
+        assert!(register(0xD101, 4, 0x9000, 0, 16, true, false, true));
+        let (v, sm) = (start(0xD100).unwrap(), start(0xD101).unwrap());
+        // Slot 0 = 2D T#, Slot 1 = Buffer V#, Slot 2 = 2D T#
+        write(&slot(v).unwrap(), &[0, 0x1111_0000, 0, 9 << 28, 0, 0, 0, 0]);
+        write(&slot(v + SLOT as u64).unwrap(), &[0x5678, 0, 128, 0x3101_6FAC, 0, 0, 0, 0]);
+        write(&slot(v + 2 * SLOT as u64).unwrap(), &[4, 0x2222_0000, 0, 9 << 28, 0, 0, 0, 0]);
+        assert!(copy_words_range(v + 3 * SLOT as u64, v, 3));
+        assert_eq!(words_at(rel(v + 3 * SLOT as u64)).unwrap()[..4], [6, 0x1111_0000, 0, 9 << 28]);
+        assert_eq!(words_at(rel(v + 4 * SLOT as u64)).unwrap()[..4], [0x5678, 0, 128, 0x3101_6FAC]);
+        assert_eq!(words_at(rel(v + 5 * SLOT as u64)).unwrap()[..4], [10, 0x2222_0000, 0, 9 << 28]);
+        // Samplers: copy slots 0..2 -> 2..4, renumbering word 3 [11:0]
+        write(&slot(sm).unwrap(), &[1, 2, 3, 0xABC0_0000]);
+        write(&slot(sm + SAMPLER_SLOT as u64).unwrap(), &[4, 5, 6, 0xDEF0_0001]);
+        assert!(copy_words_range(sm + 2 * SAMPLER_SLOT as u64, sm, 2));
+        assert_eq!(words_at(rel(sm + 2 * SAMPLER_SLOT as u64)).unwrap()[..4], [1, 2, 3, 0xABC0_0002]);
+        assert_eq!(words_at(rel(sm + 3 * SAMPLER_SLOT as u64)).unwrap()[..4], [4, 5, 6, 0xDEF0_0003]);
+        unregister(0xD100);
+        unregister(0xD101);
     }
 }

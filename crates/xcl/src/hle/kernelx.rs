@@ -2147,33 +2147,57 @@ pub fn host_os_version() -> (u32, u32, u32) {
 
 /// The finest timer Windows offers (0.5 ms) for the title: with the default 15.6 ms tick every
 /// sleep rounds up (a retail game's audio mixer ran at a third of real time). Windows 11 keeps
-/// it while the window is hidden only when told to.
+/// it while the window is hidden only when told to. Also opt out of Windows 11 Efficiency Mode
+/// (`PROCESS_POWER_THROTTLING_EXECUTION_SPEED`) and lift process priority to `ABOVE_NORMAL` so
+/// foreground title rendering/streaming threads are not demoted behind background OS work
+/// (`XCL_PRIORITY=0` disables priority boost).
 pub fn fine_timer() {
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        GetCurrentProcess, ProcessPowerThrottling, SetPriorityClass, SetProcessInformation, ABOVE_NORMAL_PRIORITY_CLASS,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
     };
-    let state = PROCESS_POWER_THROTTLING_STATE {
+    let size = std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32;
+    let combined = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
         StateMask: 0,
     };
-    let size = std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32;
-    let kept = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state as *const _ as *const c_void, size) } != 0;
+    let mut kept = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &combined as *const _ as *const c_void, size) } != 0;
+    if !kept {
+        let timer_only = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+            StateMask: 0,
+        };
+        kept = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &timer_only as *const _ as *const c_void, size) } != 0;
+        let eco_only = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: 0,
+        };
+        unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &eco_only as *const _ as *const c_void, size) };
+    }
+    let boosted = if std::env::var("XCL_PRIORITY").map_or(true, |v| v.trim() != "0") {
+        unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) != 0 }
+    } else {
+        false
+    };
     // in 100 ns units; "finest" is the smallest period the system supports
     let (mut coarsest, mut finest, mut was) = (0u32, 0u32, 0u32);
     if unsafe { NtQueryTimerResolution(&mut coarsest, &mut finest, &mut was) } < 0 || finest == 0 {
-        crate::xlog_warn!("timer: NtQueryTimerResolution failed – Windows' default resolution");
+        crate::xlog_warn!("timer: NtQueryTimerResolution failed – Windows' default resolution (above-normal priority: {boosted})");
         return;
     }
     let mut now = 0u32;
     let status = unsafe { NtSetTimerResolution(finest, 1, &mut now) };
     crate::xlog_info!(
-        "timer: {} (was {:.2} ms, now {:.2} ms; kept while the window is hidden: {})",
+        "timer: {} (was {:.2} ms, now {:.2} ms; EcoQoS/timer-throttle off: {}; above-normal priority: {})",
         if status >= 0 { "finest resolution for the title" } else { "raising the resolution failed" },
         was as f64 / 10_000.0,
         now as f64 / 10_000.0,
-        if kept { "yes" } else { "no" }
+        if kept { "yes" } else { "no" },
+        if boosted { "yes" } else { "no" }
     );
 }
 

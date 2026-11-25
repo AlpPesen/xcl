@@ -208,7 +208,21 @@ struct State {
 /// A recording's blocks of rewritten indirect arguments, and most bytes of them (past it, its
 /// two-pass ExecuteIndirects are skipped)
 const SCRATCH_BLOCK: u64 = 1 << 20;
-const SCRATCH_CAP: u64 = 16 << 20;
+/// Default per-recording cap on rewritten indirect-argument scratch (MiB). Overridable via
+/// `XCL_INDIRECT_SCRATCH_MB` (clamped 4..=128 MiB) so dense open-world indirect draw lists do
+/// not exhaust scratch mid-recording and drop trailing draws.
+const SCRATCH_CAP: u64 = 32 << 20;
+
+fn scratch_cap() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("XCL_INDIRECT_SCRATCH_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb.clamp(4, 128) << 20)
+            .unwrap_or(SCRATCH_CAP)
+    })
+}
 /// Most bytes of buffers kept for reuse (`FREE_RES`)
 const FREE_RES_CAP: u64 = 256 << 20;
 /// Size of one pooled VRAM `io` (`u0`) slab (64 KiB = 256 distinct 256-byte `io` slots).
@@ -1769,9 +1783,10 @@ unsafe fn alloc_prelude_scratch(this: *mut c_void, dev: &ID3D12Device, bytes: u6
         return Ok(r);
     }
     let size = bytes.max(SCRATCH_BLOCK);
-    let remaining = SCRATCH_CAP.saturating_sub(with(this, |s| s.scratch_taken));
+    let cap = scratch_cap();
+    let remaining = cap.saturating_sub(with(this, |s| s.scratch_taken));
     if size > remaining {
-        return Err(format!("its rewritten arguments are past {} MiB this recording", SCRATCH_CAP >> 20));
+        return Err(format!("its rewritten arguments are past {} MiB this recording", cap >> 20));
     }
     let dev_key = dev.as_raw() as usize;
     let picked = {
@@ -2388,9 +2403,10 @@ unsafe fn scratch_args_in(this: *mut c_void, dev: &ID3D12Device, bytes: u64, slo
         return Ok(r);
     }
     let size = bytes.max(SCRATCH_BLOCK);
-    let remaining = SCRATCH_CAP.saturating_sub(with(this, |s| s.scratch_taken));
+    let cap = scratch_cap();
+    let remaining = cap.saturating_sub(with(this, |s| s.scratch_taken));
     if size > remaining {
-        return Err(format!("its rewritten arguments are past {} MiB this recording", SCRATCH_CAP >> 20));
+        return Err(format!("its rewritten arguments are past {} MiB this recording", cap >> 20));
     }
     let dev_key = dev.as_raw() as usize;
     let picked = {
@@ -2442,7 +2458,7 @@ unsafe fn scratch_args_pingpong(this: *mut c_void, dev: &ID3D12Device, bytes: u6
             s.scratch[0].buf.as_ref().is_some_and(|(_, cap, _)| s.scratch[0].used + aligned <= *cap),
             s.scratch[1].buf.as_ref().is_some_and(|(_, cap, _)| s.scratch[1].used + aligned <= *cap),
         ];
-        let can_alloc = SCRATCH_CAP.saturating_sub(s.scratch_taken) >= size;
+        let can_alloc = scratch_cap().saturating_sub(s.scratch_taken) >= size;
         let chosen = pick_pingpong_slot(preferred, fits, can_alloc);
         s.scratch_next = chosen ^ 1;
         chosen

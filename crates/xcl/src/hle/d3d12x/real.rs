@@ -2488,21 +2488,19 @@ pub(super) unsafe extern "system" fn dev_create_sampler_x(this: *mut c_void, des
 /// Copy `n` console slots from `src` to `dst` (both in console heaps of one kind): the PC
 /// descriptors (2 per view slot) and the slots. False: not two console ranges.
 unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: u32) -> bool {
-    use super::console_heap::{copy_words, slot, SAMPLER_SLOT, SLOT};
+    use super::console_heap::{copy_words_range, slot};
     let (Some(d0), Some(s0)) = (slot(dst), slot(src)) else { return false };
     if d0.sampler != s0.sampler {
         return false;
+    }
+    if n == 0 || d0.at == s0.at {
+        return true;
     }
     let ty = pc_heap_type(ty);
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, if d0.sampler { n } else { 2 * n }, d0.pc_srv, s0.pc_srv, ty);
     super::console_heap::publish_range(&d0, n);
-    let step = if d0.sampler { SAMPLER_SLOT } else { SLOT } as u64;
-    for k in 0..n as u64 {
-        if let (Some(d), Some(s)) = (slot(dst + k * step), slot(src + k * step)) {
-            copy_words(&s, &d);
-        }
-    }
+    copy_words_range(dst, src, n);
     true
 }
 
@@ -2554,20 +2552,37 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
         let f: F = std::mem::transmute(orig_fn(this, 23));
         return f(this, nd, dsts, dsizes, ns, srcs, ssizes, ty);
     }
-    // every descriptor as (dst, src) handle, ranges walked in step
+    // Walk (dst, src) ranges in lockstep with zero heap allocations, batching each maximal
+    // contiguous overlap into a single `copy_console_slots` call.
     let step = if ty == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32 { SAMPLER_SLOT } else { SLOT } as u64;
-    let expand = |starts: *const u64, sizes: *const u32, n: u32| -> Vec<u64> {
-        (0..n as usize).flat_map(|r| {
-            let (h, len) = (*starts.add(r), if sizes.is_null() { 1 } else { *sizes.add(r) });
-            (0..len as u64).map(move |k| h + k * step)
-        })
-        .collect()
-    };
-    let (d, s) = (expand(dsts, dsizes, nd), expand(srcs, ssizes, ns));
-    for (a, b) in d.iter().zip(s.iter()) {
-        if !copy_console_slots(this, 1, *a, *b, ty) {
+    let (mut di, mut si) = (0usize, 0usize);
+    let (mut d_rem, mut s_rem) = (0u32, 0u32);
+    let (mut d_cur, mut s_cur) = (0u64, 0u64);
+    loop {
+        while d_rem == 0 {
+            if di >= nd as usize {
+                return;
+            }
+            d_cur = *dsts.add(di);
+            d_rem = if dsizes.is_null() { 1 } else { *dsizes.add(di) };
+            di += 1;
+        }
+        while s_rem == 0 {
+            if si >= ns as usize {
+                return;
+            }
+            s_cur = *srcs.add(si);
+            s_rem = if ssizes.is_null() { 1 } else { *ssizes.add(si) };
+            si += 1;
+        }
+        let run = d_rem.min(s_rem);
+        if !copy_console_slots(this, run, d_cur, s_cur, ty) {
             note_mixed_copy();
         }
+        d_cur = d_cur.wrapping_add(run as u64 * step);
+        s_cur = s_cur.wrapping_add(run as u64 * step);
+        d_rem -= run;
+        s_rem -= run;
     }
 }
 
@@ -8275,12 +8290,15 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 }
 
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
+    let bound = super::pso_async::resolve(pso as usize);
+    if super::list_x::skip_redundant_pso_bind(this, pso as usize, bound) {
+        return;
+    }
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
-    let bound = super::pso_async::resolve(pso as usize);
     f(this, bound as *mut c_void);
     super::dred::mark_pipeline(this, pso as usize, bound);
-    super::list_x::on_set_pipeline_state(this, pso as usize);
+    super::list_x::on_set_pipeline_state_bound(this, pso as usize, bound);
 }
 
 /// The title's markers are counted for `XCL_DRED=1`'s pipeline labels (`dred`).

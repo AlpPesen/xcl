@@ -187,6 +187,9 @@ pub(super) unsafe fn restore_after_internal_pass(list: *mut c_void, clobbered_gf
     if bound_pso != 0 {
         let resolved = super::pso_async::resolve_for_bind(bound_pso);
         pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+            s.last_pc_pso = resolved;
+        }
         if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE {
             if let Some((true, static_bias)) = device_x::base_depth_bias_info(bound_pso) {
                 let target = depth_bias.unwrap_or(static_bias);
@@ -903,6 +906,9 @@ struct ListState {
     last_queue: Option<usize>,
     /// Title's currently bound PSO (before dynamic depth-bias override)
     bound_pso: usize,
+    /// Last resolved PC PSO actually emitted via `SetPipelineState` on this PC list
+    /// (cleared on Reset / ClearState / KickoffX / split so bind dedup is always exact).
+    last_pc_pso: usize,
     /// Active `RSSetDepthBiasX` override (None = zero / disabled)
     depth_bias: Option<DepthBias>,
     /// Last depth bias sent to `ID3D12GraphicsCommandList9::RSSetDepthBias` on this PC list
@@ -1170,6 +1176,7 @@ pub(super) fn clear_segment_state(list: usize) {
     real::dispatch_chain::list_reset(list);
     super::title_textures::list_reset(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
+        s.last_pc_pso = 0;
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
         s.written_values.clear();
@@ -1200,14 +1207,40 @@ pub(super) fn on_allocator_release(alloc: usize) {
     }
 }
 
-/// Track `SetPipelineState` on a command list (for `RSSetDepthBiasX` and `KickoffX`),
-/// syncing `ID3D12GraphicsCommandList9::RSSetDepthBias` when the bound PSO uses native dynamic
-/// depth bias.
+fn bind_cache_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_BIND_CACHE").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Whether `SetPipelineState(pso)` resolved to `bound` is already active on `list` (same title
+/// PSO and resolved PC PSO, with no pending/active depth-bias patch), allowing the redundant
+/// D3D12 call and DRED marker to be skipped.
+pub(super) fn skip_redundant_pso_bind(list: *mut c_void, pso: usize, bound: usize) -> bool {
+    if !bind_cache_enabled() || list.is_null() || pso == 0 || bound == 0 {
+        return false;
+    }
+    LISTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&(list as usize)))
+        .is_some_and(|s| s.bound_pso == pso && s.last_pc_pso == bound && !s.pso_dirty && !s.using_fallback_pso)
+}
+
+/// Track `SetPipelineState` on a command list (for `RSSetDepthBiasX`, `KickoffX`, and redundant
+/// bind dedup), syncing `ID3D12GraphicsCommandList9::RSSetDepthBias` when the bound PSO uses
+/// native dynamic depth bias.
+#[cfg(test)]
 pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
+    on_set_pipeline_state_bound(list, pso, pso);
+}
+
+pub(super) unsafe fn on_set_pipeline_state_bound(list: *mut c_void, pso: usize, bound: usize) {
     let key = list as usize;
     let sync_target = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
+        s.last_pc_pso = bound;
         // Keep the title-visible base PSO key when `bind_abi` re-binds its resolved background PSO.
         if s.bound_pso == 0 || pso == s.bound_pso || super::pso_async::resolve(s.bound_pso) != pso {
             s.bound_pso = pso;
@@ -1261,6 +1294,7 @@ pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
         let mut g = LISTS.lock().unwrap();
         if let Some(s) = g.get_or_insert_with(HashMap::new).get_mut(&key) {
             s.bound_pso = pso;
+            s.last_pc_pso = 0;
             s.depth_bias = None;
             s.native_bias = DepthBias::ZERO;
             s.pso_dirty = false;
@@ -3644,6 +3678,7 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
     }
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.bindings.render_targets = None;
+        s.last_pc_pso = 0;
         if PREDICATION_USED.load(Ordering::Acquire) {
             s.predication = None;
             s.pred_in_state = false;
@@ -3917,6 +3952,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     // Reset() cleared the PC list's native RSSetDepthBias state to (0, 0, 0) and bound init_pso.
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+        s.last_pc_pso = init_pso;
         s.native_bias = DepthBias::ZERO;
         s.using_fallback_pso = false;
         s.pso_dirty = false;
@@ -4014,6 +4050,9 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
         if let Some(base) = need_restore_base {
             let resolved = super::pso_async::resolve_for_bind(base);
             pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+                s.last_pc_pso = resolved;
+            }
         }
         if !need_native_call {
             return;
@@ -4058,6 +4097,9 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
     if let Some(base) = restore {
         let resolved = super::pso_async::resolve_for_bind(base);
         pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+            s.last_pc_pso = resolved;
+        }
     }
 }
 
@@ -4099,6 +4141,7 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
     let resolved = super::pso_async::resolve_for_bind(target);
     pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+        s.last_pc_pso = resolved;
         s.using_fallback_pso = is_fallback;
     }
 }
@@ -4777,6 +4820,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
         s.allocator = alloc;
         s.bound_pso = pso;
+        s.last_pc_pso = resolved;
         s.depth_bias = None;
         s.native_bias = DepthBias::ZERO;
         s.pso_dirty = false;
@@ -8692,6 +8736,35 @@ mod tests {
                 .and_then(|m| m.get(&dev_key))
                 .map_or(0, |p| p.free.len());
             assert_eq!(free_count, RT_SHADOW_CHUNK_SLOTS as usize, "all shadow slots must recycle on release");
+        }
+    }
+
+    #[test]
+    fn redundant_pso_bind_cache_skips_identical_and_invalidates_on_upgrade_or_reset() {
+        let list = 0x7E57_B1D0usize as *mut c_void;
+        unsafe {
+            on_create(list, 0xA110_0001, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            // First bind is never skipped.
+            assert!(!skip_redundant_pso_bind(list, 0x1000, 0x2000));
+            on_set_pipeline_state_bound(list, 0x1000, 0x2000);
+            // Exact same (pso, resolved) is skipped.
+            assert!(skip_redundant_pso_bind(list, 0x1000, 0x2000));
+            // Async compile completion: same title PSO resolves to a new real PC PSO -> must bind!
+            assert!(!skip_redundant_pso_bind(list, 0x1000, 0x3000));
+            on_set_pipeline_state_bound(list, 0x1000, 0x3000);
+            assert!(skip_redundant_pso_bind(list, 0x1000, 0x3000));
+            // Different title PSO -> must bind!
+            assert!(!skip_redundant_pso_bind(list, 0x1001, 0x3001));
+            // ClearState / PC Reset / segment clear invalidate the cached PC PSO.
+            on_clear_state(list, 0x1000);
+            assert!(!skip_redundant_pso_bind(list, 0x1000, 0x3000));
+            on_set_pipeline_state_bound(list, 0x1000, 0x3000);
+            on_pc_reset(list);
+            assert!(!skip_redundant_pso_bind(list, 0x1000, 0x3000));
+            on_set_pipeline_state_bound(list, 0x1000, 0x3000);
+            clear_segment_state(list as usize);
+            assert!(!skip_redundant_pso_bind(list, 0x1000, 0x3000));
+            on_release(list as usize);
         }
     }
 }
