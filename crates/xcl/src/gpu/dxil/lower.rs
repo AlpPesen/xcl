@@ -194,6 +194,11 @@ pub struct Lw {
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,
+    /// constant data after the program in the code region (`recomp::Options::rodata`:
+    /// (address from the program's start, dwords)) and its table, created on first use
+    /// (`rodata_loads`)
+    pub rodata: Vec<(u32, Vec<u32>)>,
+    pub rodata_table: Option<Value>,
     /// cached decoded format descriptors hoisted to `d3`'s defining block
     pub fmt_desc_cache: HashMap<(Value, Option<u32>), super::lower_mem::FmtDesc>,
     /// cached single-component format decode parameters hoisted to `d3`'s defining block
@@ -1328,6 +1333,8 @@ impl Lw {
             return err(d, "indirect branch");
         }
         if name == "s_getpc_b64" {
+            // the code region is addressed from 0 – with constant data after the program and
+            // several memory windows, above them all (`rodata_loads`), as the HLSL kernel
             let lo = match self.compact_blk_pc {
                 Some((blk_pc, rep_blk_pc)) => {
                     let rel = (d.pc + d.len as u64).wrapping_sub(rep_blk_pc) as u32;
@@ -1335,7 +1342,8 @@ impl Lw {
                 }
                 None => self.c((d.pc + d.len as u64) as u32),
             };
-            let hi = self.c(0);
+            let code_hi = if self.rodata.is_empty() || !self.windowed() { 0 } else { crate::gpu::recomp::CODE_ADDRESS_HI };
+            let hi = self.c(code_hi);
             self.write64(&dst, lo, hi);
             return Ok(());
         }
