@@ -88,23 +88,25 @@ pub(super) fn unmark(page: usize) -> bool {
     LAZY.write().unwrap_or_else(|e| e.into_inner()).remove(&page)
 }
 
-/// The lazy pages of `[p, p + len)` committed – memory a kernel call or XCL writes.
-pub fn ensure(p: usize, len: usize) {
+/// The lazy pages of `[p, p + len)` committed – memory a kernel call or XCL writes. Views of
+/// physical pages there are read-only until written and a kernel call cannot fault: they are
+/// opened, and stay open while the returned value lives (hold it across the write).
+pub fn ensure(p: usize, len: usize) -> super::guards::Opened {
+    let opened = super::guards::open(p, len);
     if len == 0 {
-        return;
+        return opened;
     }
-    // views of physical pages there are read-only until written: a kernel call cannot fault
-    super::guards::open(p, len);
     let pages: Vec<usize> = {
         let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {
-            return;
+            return opened;
         }
         g.range(p & !(PAGE - 1)..p.saturating_add(len)).copied().collect()
     };
     for page in pages {
         unsafe { commit(page) };
     }
+    opened
 }
 
 #[cfg(test)]
@@ -124,7 +126,7 @@ mod tests {
             std::ptr::write_volatile((r + 8) as *mut u32, 7);
             assert_eq!(std::ptr::read_volatile((r + 8) as *const u32), 7);
             assert!(!unmark(r), "used: no longer lazy");
-            ensure(r + PAGE + 4, 4);
+            let _open = ensure(r + PAGE + 4, 4);
             assert!(!LAZY.read().unwrap().contains(&(r + PAGE)));
             assert!(crate::gpu::shader::readable(r + PAGE, 4));
             VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
