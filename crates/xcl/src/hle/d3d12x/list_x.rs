@@ -4863,11 +4863,15 @@ mod tests {
                 scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 1));
             }
             on_create(raw, alloc.as_raw() as usize, 0, ty);
-            {
+            // Read under the lock, assert after it: a failed assert while holding the lock poisons
+            // COPY_SCRATCH, the list's Release hook (`real::cl_release`) then panics on it while the
+            // test unwinds, and that aborts the whole test binary.
+            let (active, released) = {
                 let cache = COPY_SCRATCH.lock().unwrap();
-                assert!(!cache.active.contains_key(&key), "the new list starts without one");
-                assert!(!cache.released.is_empty(), "the GPU may still use it: it stays until the fence");
-            }
+                (cache.active.contains_key(&key), !cache.released.is_empty())
+            };
+            assert!(!active, "the new list starts without one");
+            assert!(released, "the GPU may still use it: it stays until the fence");
             fence.Signal(1).unwrap();
             on_release(key);
             super::super::alloc_pool::forget(alloc.as_raw() as usize);
