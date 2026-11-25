@@ -1396,8 +1396,8 @@ unsafe fn take_readback_job(dev: &ID3D12Device, need: usize) -> Option<ReadbackJ
             return Some(free.swap_remove(i));
         }
     }
-    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).ok()?;
-    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &alloc, None).ok()?;
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
     let _ = list.Close();
     let mut d = buffer_desc(want as u64);
     d.Flags = D3D12_RESOURCE_FLAG_NONE;
