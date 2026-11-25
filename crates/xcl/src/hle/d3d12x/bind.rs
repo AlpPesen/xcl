@@ -651,6 +651,12 @@ void main() {
 /// a 4K target in groups of 2x2 pixels is 2.1 million.
 const MOST_GROUPS: u32 = 1 << 22;
 
+/// local: `XCL_INDIRECT_MOST_GROUPS` instead of `MOST_GROUPS`
+fn most_groups() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_INDIRECT_MOST_GROUPS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(MOST_GROUPS))
+}
+
 unsafe fn guard_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
     static CACHE: Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>> = Mutex::new(None);
     args_pipeline(dev, GUARD_ARGS_HLSL, &CACHE)
@@ -672,7 +678,7 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     super::real::uma_window_buffer(src, 12).ok_or("the indirect arguments are not in one memory window")?;
     let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
     let (dst, dst_off) = scratch_args(this, &dev, 256)?;
-    let consts: Vec<u8> = [0u32, MOST_GROUPS, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+    let consts: Vec<u8> = [0u32, most_groups(), 0].iter().flat_map(|w| w.to_le_bytes()).collect();
     let p = with(this, |s| s.arena.take(u, consts.len(), 256, &mut s.uma)).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr(), p, consts.len());
     let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
