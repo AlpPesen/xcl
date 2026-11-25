@@ -523,10 +523,13 @@ pub(super) unsafe extern "system" fn set_graphics_root_descriptor(this: *mut c_v
     put_in(this, true, i, 0, &va.to_le_bytes());
 }
 
-/// The address a root descriptor at `va` gets (`sparse::gpu_view`): a root descriptor has no
-/// size, so as much of the tile is taken as lies in the view. A read through it is in step with
-/// the title's memory, a write is not (a root UAV in a GPU view stays what it was before).
+/// The address a root descriptor at `va` gets: first try resolving a GPU-view VA directly to
+/// contiguous UMA backing (`real::resolve_uma_va`, zero-copy for both reads and root UAV writes),
+/// then fall back to the read-only `sparse::gpu_view` mirror for scattered mappings.
 fn readable_root(va: u64) -> u64 {
+    if let Some(u) = super::real::resolve_uma_va(va, 0x1000) {
+        return u;
+    }
     for len in [0x1_0000usize, 0x1000] {
         if let Some(b) = super::sparse::gpu_view::base_for(va as usize, len) {
             return b as u64;
