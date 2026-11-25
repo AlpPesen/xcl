@@ -105,6 +105,14 @@ pub const PAGE_SLOTS: u32 = 256;
 /// a page with no place in the shared heap yet
 const UNMAPPED: u32 = u32::MAX;
 
+/// Fallback index for a view slot when no `GLOBAL` page is mapped:
+/// hosted heaps (`hosted == true`, whose lists bind `GLOBAL`) map overflowed slots to reserved
+/// null-view slot `0` (SRV at 0, UAV at 1) so exhaustion never aliases `MEM_HEAP_BASE` window
+/// UAVs or unrelated descriptors; unhosted heaps keep local `2 * k`.
+fn view_unmapped_index(hosted: bool, k: u32) -> u32 {
+    if hosted { 0 } else { 2 * k }
+}
+
 /// PC descriptors of page `p` of a heap of `n` slots: 2 per slot, and the last page only as
 /// long as the heap (a heap of a few slots takes a few descriptors, not a whole page's).
 fn page_descriptors(n: u32, p: u32) -> u32 {
@@ -462,7 +470,10 @@ pub fn slot(cpu: u64) -> Option<Slot> {
         let i = first + 2 * (k - k0);
         Some((i, g.gpu + (i as u64 + 1) * g.inc as u64, g.cpu + i as u64 * g.inc as u64))
     });
-    let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or((2 * k, if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0));
+    let hosted = !h.pages.is_empty();
+    let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or_else(|| {
+        (view_unmapped_index(hosted, k), if hosted || h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0)
+    });
     Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
 }
 
@@ -1180,5 +1191,16 @@ mod tests {
         // Unhosted sampler heap (empty pages) keeps local slot index k.
         assert_eq!(sampler_own_index(&[], 0), 0);
         assert_eq!(sampler_own_index(&[], 42), 42);
+    }
+
+    #[test]
+    fn exhausted_hosted_view_slots_map_to_null_slot_zero() {
+        // Hosted view heaps must never fall back to `2 * k`, which aliases `MEM_HEAP_BASE` window UAVs.
+        assert_eq!(view_unmapped_index(true, 0), 0);
+        assert_eq!(view_unmapped_index(true, crate::gpu::recomp::MEM_HEAP_BASE / 2), 0);
+        assert_eq!(view_unmapped_index(true, 42), 0);
+        // Unhosted heaps (no shared heap) keep their own local 2 * k layout.
+        assert_eq!(view_unmapped_index(false, 0), 0);
+        assert_eq!(view_unmapped_index(false, 42), 84);
     }
 }
