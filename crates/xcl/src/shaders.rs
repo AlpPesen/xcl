@@ -1523,7 +1523,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows: windows, ..Default::default() };
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, ..Default::default() };
                         let Ok(t) = recomp::translate(code, &opt) else { continue };
                         if !t.complete() {
                             continue;
@@ -2162,7 +2162,7 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                             skipped.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        let wave64 = recomp::detect_wave64(code);
+                        let wave64 = recomp::fssm_wave64(f, code);
                         let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split, mem_windows: windows, sampler_base: 0 };
                         if trace {
                             eprintln!("direct: {name} FSSM#{fi} ({} B, {})", code.len(), coverage::stage_name(&mode));

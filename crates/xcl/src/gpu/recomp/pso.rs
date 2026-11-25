@@ -942,7 +942,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let wave64 = super::detect_wave64(code);
+    let wave64 = super::fssm_wave64(f, code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
     if super::lower_dxil::enabled() {
@@ -988,7 +988,7 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
     let mode = interface(blob, &sh, f).ok_or("unknown shader interface")?;
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::detect_wave64(code), split: false, mem_windows: windows, sampler_base };
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::fssm_wave64(f, code), split: false, mem_windows: windows, sampler_base };
     let k = match (&mode, stage) {
         (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs)?,
         (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps)?,
@@ -1033,7 +1033,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1126,7 +1126,7 @@ fn console_mesh_with(
     let record = ms.clone();
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let wave64 = super::detect_wave64(code);
+    let wave64 = super::fssm_wave64(f, code);
     let split = wave64 && split_wave64;
     let compile_one = || compile(code, ms, wave64);
     // Cache the mesh compute pass in RAM (`ShaderCache` + in-flight coalescing) and on disk

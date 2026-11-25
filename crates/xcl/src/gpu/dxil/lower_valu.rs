@@ -387,7 +387,7 @@ impl Lw {
         let m = Self::mods(d);
         let u = self.sources(d, &ins, src_f16)?;
         if let Some(rest) = name.strip_prefix("v_cmpx_").or_else(|| name.strip_prefix("v_cmp_")) {
-            return self.vopc(d, rest, name.starts_with("v_cmpx_"), &outs, &u, &m);
+            return self.vopc(d, rest, name.starts_with("v_cmpx_"), &ins, &outs, &u, &m);
         }
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let z = self.c(0);
@@ -1178,7 +1178,7 @@ impl Lw {
         }))
     }
 
-    pub fn vopc(&mut self, d: &Decoded, rest: &str, cmpx: bool, outs: &[&Operand], u: &[Src], m: &Mods) -> LResult<()> {
+    pub fn vopc(&mut self, d: &Decoded, rest: &str, cmpx: bool, ins: &[&Operand], outs: &[&Operand], u: &[Src], m: &Mods) -> LResult<()> {
         let (opn, ty) = rest.rsplit_once('_').ok_or_else(|| format!("{}: VOPC", rdna2::format(d)))?;
         if u.len() < 2 {
             return err(d, "VOPC");
@@ -1226,7 +1226,67 @@ impl Lw {
             }
             t => t,
         };
-        let cond = match ty {
+        // Pixel shaders (#134): quad-read the compare's VGPR operands rather than its
+        // predicate result (AMD RDNA2/3/4 amdxc64 crashes on quadOp of values derived
+        // from WaveReadLaneAt, such as v_readfirstlane waterfall loops).
+        if self.gfx.as_ref().is_some_and(|g| g.ps.is_some())
+            && d.variant == Variant::Plain
+            && self.guard_override.is_none()
+            && opn != "f"
+        {
+            let dst = self.vopc_dst(d, cmpx, outs);
+            if matches!(dst, Dst::Null) && matches!(ty, "f32" | "i32" | "u32") {
+                return Ok(());
+            }
+            let is_vgpr = |o: &Operand| match o.field {
+                Some("LITERAL") | None => false,
+                Some(f) => {
+                    (o.ty.starts_with("OPR_VGPR") && d.enc.field_width(f) <= 8)
+                        || (!matches!(o.ty, "OPR_SIMM16" | "OPR_SIMM32") && Self::field(d, f) >= 256)
+                }
+            };
+            let (a_vgpr, b_vgpr) = if matches!(opn, "t" | "tru") {
+                (false, false)
+            } else {
+                (ins.first().is_some_and(|o| is_vgpr(o)), ins.get(1).is_some_and(|o| is_vgpr(o)))
+            };
+            let (el, eh) = self.exec_mask();
+            let qbase = self.andc(self.lane, !3);
+            let mut q = self.c(0);
+            for p in 0..4u32 {
+                let kp = self.c(p);
+                let qa = if a_vgpr { self.s.quad_read_lane_at(ua, kp) } else { ua };
+                let qb = if b_vgpr {
+                    if ub == ua && a_vgpr {
+                        qa
+                    } else {
+                        self.s.quad_read_lane_at(ub, kp)
+                    }
+                } else {
+                    ub
+                };
+                let cp = self.vopc_cond(d, opn, ty, qa, qb, m)?;
+                let lp = self.or(qbase, kp);
+                let ap = self.lanebit_at(el, eh, lp);
+                let bp = self.land(ap, cp);
+                let up = self.u(bp);
+                let sh = self.shlc(up, p);
+                q = self.or(q, sh);
+            }
+            let (lo, hi) = self.ballot_ps_quad(q);
+            if self.wave64 {
+                self.write64(&dst, lo, hi);
+            } else {
+                self.write32(&dst, lo);
+            }
+            return Ok(());
+        }
+        let cond = self.vopc_cond(d, opn, ty, ua, ub, m)?;
+        self.vopc_write(d, cmpx, outs, cond)
+    }
+
+    fn vopc_cond(&mut self, d: &Decoded, opn: &str, ty: &str, ua: Value, ub: Value, m: &Mods) -> LResult<Value> {
+        Ok(match ty {
             "f32" => {
                 let a = self.fsrc(m, 0, ua);
                 if opn == "class" {
@@ -1254,8 +1314,7 @@ impl Lw {
                 }
             }
             _ => return err(d, "VOPC type"),
-        };
-        self.vopc_write(d, cmpx, outs, cond)
+        })
     }
 
     /// The recompiler's `float_compare`: NaN tested explicitly.
@@ -1315,7 +1374,7 @@ impl Lw {
         }
     }
 
-    pub fn vopc_write(&mut self, d: &Decoded, cmpx: bool, outs: &[&Operand], cond: Value) -> LResult<()> {
+    fn vopc_dst(&self, d: &Decoded, cmpx: bool, outs: &[&Operand]) -> Dst {
         let mut dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
         if d.variant == Variant::Sdwa {
             if let Some(e) = ext_encoding(d) {
@@ -1328,6 +1387,11 @@ impl Lw {
         if cmpx {
             dst = Dst::S(126);
         }
+        dst
+    }
+
+    pub fn vopc_write(&mut self, d: &Decoded, cmpx: bool, outs: &[&Operand], cond: Value) -> LResult<()> {
+        let dst = self.vopc_dst(d, cmpx, outs);
         self.write_mask(&dst, cond);
         Ok(())
     }
