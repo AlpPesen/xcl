@@ -35,6 +35,9 @@ struct Pending {
     spared: std::sync::atomic::AtomicBool,
     /// shader issues `image_bvh*_intersect_ray`: held back without blocking until BVH builds succeed
     bvh_traversal: std::sync::atomic::AtomicBool,
+    /// heavyweight RT/compute shader (`>= 512 KiB` DXIL / BVH traversal): lower worker queue
+    /// priority than normal/MS PSOs so world-entry draws finish ahead of slow RT compiles
+    deprioritized: std::sync::atomic::AtomicBool,
     demand: Mutex<Demand>,
 }
 
@@ -113,6 +116,8 @@ impl Pending {
         };
         if became_wanted {
             crate::gpu::recomp::dxc::notify_wanted();
+            notify_queue_wanted();
+            super::real::notify_big_compile_wanted();
         }
     }
 
@@ -291,38 +296,92 @@ fn drop_unstarted_job(p: &Pending) {
 
 type Work = Box<dyn FnOnce() + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
-    Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Work>();
-        let rx = Arc::new(Mutex::new(rx));
+struct PsoWork {
+    work: Work,
+    pending: Option<Arc<Pending>>,
+}
+
+/// Priority work queue for `xcl-pso-*` workers: pipelines waited on by a title thread (`wanted`)
+/// jump ahead of queued background builds.
+struct PsoQueue {
+    items: Mutex<std::collections::VecDeque<PsoWork>>,
+    cv: Condvar,
+}
+
+impl PsoQueue {
+    fn new() -> Self {
+        Self { items: Mutex::new(std::collections::VecDeque::new()), cv: Condvar::new() }
+    }
+
+    fn push(&self, work: Work, pending: Option<Arc<Pending>>) {
+        self.items.lock().unwrap().push_back(PsoWork { work, pending });
+        self.cv.notify_one();
+    }
+
+    fn notify_wanted(&self) {
+        let _g = self.items.lock().unwrap();
+        drop(_g);
+        self.cv.notify_all();
+    }
+
+    fn pop(&self) -> Work {
+        let mut g = self.items.lock().unwrap();
+        loop {
+            if let Some(pos) = g.iter().position(|item| item.pending.as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted)) {
+                return g.remove(pos).unwrap().work;
+            }
+            if let Some(pos) = g.iter().position(|item| !item.pending.as_ref().is_some_and(|p| p.deprioritized.load(Ordering::Acquire))) {
+                return g.remove(pos).unwrap().work;
+            }
+            if let Some(item) = g.pop_front() {
+                return item.work;
+            }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+}
+
+static WORK_QUEUE: OnceLock<Arc<PsoQueue>> = OnceLock::new();
+
+fn notify_queue_wanted() {
+    if let Some(q) = WORK_QUEUE.get() {
+        q.notify_wanted();
+    }
+}
+
+fn queue() -> &'static Arc<PsoQueue> {
+    WORK_QUEUE.get_or_init(|| {
+        let q = Arc::new(PsoQueue::new());
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
         for k in 0..n {
-            let rx = rx.clone();
+            let q = q.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(work) = next else { return };
+                let work = q.pop();
                 work();
             });
         }
-        Mutex::new(tx)
+        q
     })
 }
 
 fn enqueue(p: Arc<Pending>) {
-    let _ = queue().lock().unwrap().send(Box::new(move || {
-        // (released by the title meanwhile)
-        if p.orphan.load(Ordering::Acquire) {
-            drop_unstarted_job(&p);
-            return;
-        }
-        // (None: a bind took it and builds it itself)
-        let job = p.job.lock().unwrap().take();
-        if let Some(job) = job {
-            build(&p, job, false);
-        }
-    }));
+    let p_q = p.clone();
+    queue().push(
+        Box::new(move || {
+            // (released by the title meanwhile)
+            if p.orphan.load(Ordering::Acquire) {
+                drop_unstarted_job(&p);
+                return;
+            }
+            // (None: a bind took it and builds it itself)
+            let job = p.job.lock().unwrap().take();
+            if let Some(job) = job {
+                build(&p, job, false);
+            }
+        }),
+        Some(p_q),
+    );
 }
 
 /// The caller also drains its batch. Multiple workers can therefore build
@@ -339,12 +398,15 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     // the helpers build for this worker's pipeline: the title waiting for it waits for them too
     let parent = BUILDING.with(|b| b.borrow().clone());
     for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
-        let (drain, parent) = (drain.clone(), parent.clone());
-        let _ = queue().lock().unwrap().send(Box::new(move || {
-            let before = BUILDING.with(|b| b.replace(parent));
-            drain();
-            BUILDING.with(|b| *b.borrow_mut() = before);
-        }));
+        let (drain, parent_run, parent_q) = (drain.clone(), parent.clone(), parent.clone());
+        queue().push(
+            Box::new(move || {
+                let before = BUILDING.with(|b| b.replace(parent_run));
+                drain();
+                BUILDING.with(|b| *b.borrow_mut() = before);
+            }),
+            parent_q,
+        );
     }
     drain();
     let mut results = vec![0; count];
@@ -395,6 +457,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         late: Default::default(),
         spared: Default::default(),
         bvh_traversal: Default::default(),
+        deprioritized: Default::default(),
         demand: Default::default(),
     });
     PENDING.write().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -1042,7 +1105,7 @@ pub fn resolve_wait(pso: usize) -> usize {
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
-    if p.spared.load(Ordering::Acquire) || (p.bvh_traversal.load(Ordering::Acquire) && !super::real::bvh_traversal_allowed()) {
+    if p.spared.load(Ordering::Acquire) || p.bvh_traversal.load(Ordering::Acquire) {
         return resolve_spared(&p, pso);
     }
     // (the title's thread is held from here until the pipeline is built or the budget is over)
@@ -1127,10 +1190,28 @@ pub fn image_only(standin: usize) {
     }
 }
 
-/// The compute pipeline behind stand-in `standin` issues `image_bvh*_intersect_ray`: binds do not
-/// block waiting for it while the BVH builder gate is still closed.
+/// Whether heavyweight compute shaders (`>= 512 KiB` DXIL / `>= 24 KiB` console code) compile
+/// asynchronously off title threads (default on, `XCL_ASYNC_HEAVY_COMPUTE=0` to disable).
+pub fn async_heavy_compute() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("XCL_ASYNC_HEAVY_COMPUTE").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// The compute pipeline behind stand-in `standin` is a heavyweight shader (`>= 512 KiB` DXIL):
+/// never compile it synchronously on title threads — queue it at lower worker priority behind
+/// normal/MS PSOs and return the stand-in until background `BIG_COMPILES` finishes it.
+pub fn heavy_compute(standin: usize) {
+    if let Some(p) = entry(standin) {
+        p.deprioritized.store(true, Ordering::Release);
+        p.spared.store(true, Ordering::Release);
+    }
+}
+
+/// The compute pipeline behind stand-in `standin` issues `image_bvh*_intersect_ray`: binds never
+/// compile it synchronously on title threads; queue it deprioritized behind normal/MS PSOs.
 pub fn bvh_traversal(standin: usize) {
     if let Some(p) = entry(standin) {
+        p.deprioritized.store(true, Ordering::Release);
         p.bvh_traversal.store(true, Ordering::Release);
     }
 }
@@ -1200,4 +1281,55 @@ pub fn is_pending(pso: usize) -> bool {
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.read().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+#[cfg(test)]
+mod pso_queue_tests {
+    use super::*;
+
+    fn dummy_pending(wanted: bool, deprioritized: bool) -> Arc<Pending> {
+        Arc::new(Pending {
+            job: Mutex::new(None),
+            sent: std::sync::atomic::AtomicBool::new(true),
+            real: AtomicUsize::new(0),
+            driver: AtomicUsize::new(0),
+            done: Mutex::new(false),
+            cv: Condvar::new(),
+            compute: false,
+            key: 0,
+            used: Default::default(),
+            orphan: Default::default(),
+            late: Default::default(),
+            spared: Default::default(),
+            bvh_traversal: Default::default(),
+            deprioritized: std::sync::atomic::AtomicBool::new(deprioritized),
+            demand: Mutex::new(Demand { wanted, preload_thread: 0 }),
+        })
+    }
+
+    #[test]
+    fn pso_queue_dequeues_wanted_then_normal_ahead_of_deprioritized() {
+        let q = PsoQueue::new();
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let push = |name: &'static str, p: Arc<Pending>| {
+            let o = order.clone();
+            q.push(Box::new(move || o.lock().unwrap().push(name)), Some(p));
+        };
+        let heavy1 = dummy_pending(false, true);
+        let bg1 = dummy_pending(false, false);
+        let promoted = dummy_pending(false, false);
+        let wanted_now = dummy_pending(true, false);
+        let heavy2 = dummy_pending(false, true);
+        push("heavy1", heavy1);
+        push("bg1", bg1);
+        push("promoted", promoted.clone());
+        push("wanted", wanted_now);
+        push("heavy2", heavy2);
+        promoted.demand.lock().unwrap().wanted = true;
+        q.notify_wanted();
+        for _ in 0..5 {
+            (q.pop())();
+        }
+        assert_eq!(*order.lock().unwrap(), ["promoted", "wanted", "bg1", "heavy1", "heavy2"]);
+    }
 }

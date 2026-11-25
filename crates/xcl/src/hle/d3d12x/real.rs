@@ -4251,12 +4251,15 @@ fn huge_pso_bytes() -> usize {
 }
 
 /// Huge driver compiles at once on the workers (default 1, `XCL_HUGE_PSO_CONCURRENCY`).
+/// Applies to `>= 512 KiB` heavyweights (`BIG_COMPILES`); `256 KiB..512 KiB` medium-large compiles
+/// (such as two-pass world MS PSOs) use `MEDIUM_COMPILES` so a multi-minute RT compute compile
+/// cannot serialize them.
 fn huge_pso_concurrency() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_CONCURRENCY").ok().as_deref(), 1, 1, 64))
 }
 
-/// Hard cap on concurrent huge (`>= 256 KB`) driver compiles even when wanted by a title bind
+/// Hard cap on concurrent huge (`>= 512 KiB`) driver compiles even when wanted by a title bind
 /// (`XCL_HUGE_PSO_WANTED_CONCURRENCY`, default 2, always `>= huge_pso_concurrency()`). Prevents a
 /// burst of lazy compute binds from launching 10+ huge driver compiles simultaneously and spiking
 /// process commit into OOM, while still letting a wanted build overtake 1 background build.
@@ -4268,28 +4271,81 @@ fn huge_pso_wanted_concurrency() -> usize {
     })
 }
 
+/// Total physical RAM in bytes (`None` if the OS query fails).
+fn total_physical_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    unsafe { (GlobalMemoryStatusEx(&mut m) != 0 && m.ullTotalPhys > 0).then_some(m.ullTotalPhys) }
+}
+
+/// Default `(background, wanted)` concurrency for `256 KiB..512 KiB` medium-large driver compiles
+/// (`MEDIUM_COMPILES`): 3/4 on `>= 32 GiB` hosts (or unknown), 2/3 on smaller-RAM hosts.
+fn medium_pso_defaults(total_phys_bytes: Option<u64>) -> (usize, usize) {
+    match total_phys_bytes {
+        Some(bytes) if bytes < (32u64 << 30) => (2, 3),
+        _ => (3, 4),
+    }
+}
+
+/// Medium-large (`256 KiB..512 KiB`) background driver compiles at once (`XCL_MEDIUM_PSO_CONCURRENCY`).
+fn medium_pso_concurrency() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let (def, _) = medium_pso_defaults(total_physical_ram());
+        env_count(std::env::var("XCL_MEDIUM_PSO_CONCURRENCY").ok().as_deref(), def, 1, 64)
+    })
+}
+
+/// Medium-large (`256 KiB..512 KiB`) wanted driver compiles at once (`XCL_MEDIUM_PSO_WANTED_CONCURRENCY`).
+fn medium_pso_wanted_concurrency() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let base = medium_pso_concurrency();
+        let (_, def) = medium_pso_defaults(total_physical_ram());
+        env_count(std::env::var("XCL_MEDIUM_PSO_WANTED_CONCURRENCY").ok().as_deref(), def.max(base), base, 64)
+    })
+}
+
 /// A count from the environment: `default` when unset or not a number, clamped to the
 /// inclusive range `min..=max`.
 fn env_count(v: Option<&str>, default: usize, min: usize, max: usize) -> usize {
     v.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(default).clamp(min, max)
 }
 
-/// A counting semaphore: background driver compiles of big programs at once (`most` 0: the
-/// `huge_pso_concurrency` of the environment; `wanted_most` 0: `huge_pso_wanted_concurrency`).
+#[derive(Clone, Copy)]
+enum SlotLimit {
+    Medium,
+    Big,
+    Fixed(usize, usize),
+}
+
+/// A counting semaphore: background driver compiles of big programs at once.
 struct Slots {
     n: Mutex<usize>,
     cv: std::sync::Condvar,
-    most: usize,
-    wanted_most: usize,
+    limit: SlotLimit,
 }
 
 impl Slots {
+    const fn fixed(most: usize, wanted_most: usize) -> Self {
+        Self { n: Mutex::new(0), cv: std::sync::Condvar::new(), limit: SlotLimit::Fixed(most, wanted_most) }
+    }
+
     fn most(&self) -> usize {
-        if self.most == 0 { huge_pso_concurrency() } else { self.most }
+        match self.limit {
+            SlotLimit::Medium => medium_pso_concurrency(),
+            SlotLimit::Big => huge_pso_concurrency(),
+            SlotLimit::Fixed(most, _) => most,
+        }
     }
 
     fn wanted_most(&self) -> usize {
-        if self.wanted_most == 0 { huge_pso_wanted_concurrency() } else { self.wanted_most }
+        match self.limit {
+            SlotLimit::Medium => medium_pso_wanted_concurrency(),
+            SlotLimit::Big => huge_pso_wanted_concurrency(),
+            SlotLimit::Fixed(_, wanted_most) => wanted_most,
+        }
     }
 }
 
@@ -4302,12 +4358,29 @@ impl Drop for SlotGuard {
     }
 }
 
-static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0, wanted_most: 0 };
+const LARGE_DRIVER_COMPILE: usize = 512 << 10;
+static MEDIUM_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), limit: SlotLimit::Medium };
+static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), limit: SlotLimit::Big };
 const GIANT_DRIVER_COMPILE: usize = 4 << 20;
-static GIANT_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
+static GIANT_COMPILES: Slots = Slots::fixed(1, 1);
 
 fn compile_slots(bytes: usize) -> &'static Slots {
-    if bytes >= GIANT_DRIVER_COMPILE { &GIANT_COMPILES } else { &BIG_COMPILES }
+    if bytes >= GIANT_DRIVER_COMPILE {
+        &GIANT_COMPILES
+    } else if bytes >= LARGE_DRIVER_COMPILE {
+        &BIG_COMPILES
+    } else {
+        &MEDIUM_COMPILES
+    }
+}
+
+/// Wake workers waiting in `big_compile_turn` when a queued pipeline becomes wanted by a title thread.
+pub(super) fn notify_big_compile_wanted() {
+    for slots in [&MEDIUM_COMPILES, &BIG_COMPILES, &GIANT_COMPILES] {
+        let _g = slots.n.lock().unwrap();
+        drop(_g);
+        slots.cv.notify_all();
+    }
 }
 
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
@@ -4377,7 +4450,14 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
     loop {
         let is_wanted = wanted();
         let cap = if is_wanted { slots.wanted_most() } else { slots.most() };
-        if *n < cap && (is_wanted || commit_free()) {
+        let ok = if is_wanted {
+            // Always allow the first 2 wanted slots (never deadlock under tight commit); extra
+            // wanted slots on wider tiers (e.g. MEDIUM_COMPILES cap 4) require commit headroom.
+            *n < cap && (*n < 2 || commit_free())
+        } else {
+            *n < cap && commit_free()
+        };
+        if ok {
             *n += 1;
             return SlotGuard(slots);
         }
@@ -4410,7 +4490,7 @@ mod big_compile_tests {
 
     #[test]
     fn wanted_builds_bypass_commit_and_unwanted_slot_but_respect_hard_cap() {
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2 };
+        static S: Slots = Slots::fixed(1, 2);
         let held = big_compile_turn(&S, || true, || false);
         assert_eq!(*S.n.lock().unwrap(), 1);
         // Unwanted slot is full, but a wanted build immediately takes the 2nd (wanted) slot and
@@ -4448,7 +4528,7 @@ mod big_compile_tests {
         // Mirrors GIANT_COMPILES (`most == 1, wanted_most == 1`) under low commit (< 3 GiB):
         // an unwanted compile waiting on commit headroom must never hold the slot and deadlock a
         // wanted compile.
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
+        static S: Slots = Slots::fixed(1, 1);
         static FREE: AtomicBool = AtomicBool::new(false);
         let bg = std::thread::spawn(|| {
             let _g = big_compile_turn(&S, || FREE.load(Ordering::Acquire), || false);
@@ -4469,7 +4549,7 @@ mod big_compile_tests {
     #[test]
     fn wanted_burst_is_hard_capped_to_wanted_most() {
         use std::sync::atomic::AtomicUsize;
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2 };
+        static S: Slots = Slots::fixed(1, 2);
         static IN: AtomicUsize = AtomicUsize::new(0);
         static PEAK: AtomicUsize = AtomicUsize::new(0);
         let t: Vec<_> = (0..12)
@@ -4508,8 +4588,40 @@ mod big_compile_tests {
 
     #[test]
     fn giant_driver_compiles_have_their_own_lane() {
+        assert!(std::ptr::eq(compile_slots(LARGE_DRIVER_COMPILE - 1), &MEDIUM_COMPILES));
+        assert!(std::ptr::eq(compile_slots(LARGE_DRIVER_COMPILE), &BIG_COMPILES));
         assert!(std::ptr::eq(compile_slots(GIANT_DRIVER_COMPILE - 1), &BIG_COMPILES));
         assert!(std::ptr::eq(compile_slots(GIANT_DRIVER_COMPILE), &GIANT_COMPILES));
+    }
+
+    #[test]
+    fn medium_tier_defaults_scale_with_ram_and_throttle_above_two_when_commit_tight() {
+        assert_eq!(medium_pso_defaults(Some(16u64 << 30)), (2, 3));
+        assert_eq!(medium_pso_defaults(Some(32u64 << 30)), (3, 4));
+        assert_eq!(medium_pso_defaults(Some(64u64 << 30)), (3, 4));
+        assert_eq!(medium_pso_defaults(None), (3, 4));
+
+        // With commit free: 4 wanted medium compiles run concurrently.
+        static S: Slots = Slots::fixed(3, 4);
+        let g1 = big_compile_turn(&S, || true, || true);
+        let g2 = big_compile_turn(&S, || true, || true);
+        let g3 = big_compile_turn(&S, || true, || true);
+        let g4 = big_compile_turn(&S, || true, || true);
+        assert_eq!(*S.n.lock().unwrap(), 4);
+        drop((g1, g2, g3, g4));
+
+        // Without commit free: wanted burst still gets 2 slots (no deadlock) but pauses slots 3..4.
+        let w1 = big_compile_turn(&S, || false, || true);
+        let w2 = big_compile_turn(&S, || false, || true);
+        assert_eq!(*S.n.lock().unwrap(), 2);
+        let t = std::thread::spawn(|| {
+            let _g = big_compile_turn(&S, || false, || true);
+        });
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "3rd wanted slot must wait when commit headroom is exhausted");
+        drop((w1, w2));
+        t.join().unwrap();
+        assert_eq!(*S.n.lock().unwrap(), 0);
     }
 
     #[test]
@@ -4521,7 +4633,7 @@ mod big_compile_tests {
     #[test]
     fn the_concurrency_limit_holds_and_all_finish() {
         use std::sync::atomic::AtomicUsize;
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2, wanted_most: 2 };
+        static S: Slots = Slots::fixed(2, 2);
         static IN: AtomicUsize = AtomicUsize::new(0);
         static PEAK: AtomicUsize = AtomicUsize::new(0);
         // the two holders of the slots meet here: both are inside at once, deterministically
@@ -4549,8 +4661,9 @@ mod big_compile_tests {
     fn small_and_title_thread_compiles_bypass_the_gate() {
         // every slot taken: a small compile on a worker, and a huge one on an unnamed (title)
         // thread, both go on at once
-        // (both lanes: a huge compile of any size would block on a gate it should bypass)
-        let mut held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)).collect();
+        // (all three lanes: a huge compile of any size would block on a gate it should bypass)
+        let mut held: Vec<_> = (0..medium_pso_concurrency()).map(|_| big_compile_turn(&MEDIUM_COMPILES, || true, || false)).collect();
+        held.extend((0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)));
         held.push(big_compile_turn(&GIANT_COMPILES, || true, || false));
         let small = std::thread::Builder::new()
             .name("xcl-pso-test".into())
@@ -4578,7 +4691,7 @@ mod big_compile_tests {
 
     #[test]
     fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2 };
+        static S: Slots = Slots::fixed(1, 2);
         let first = big_compile_turn(&S, || true, || false);
         let t = std::thread::spawn(|| {
             let _g = big_compile_turn(&S, || true, || false);
@@ -5950,6 +6063,10 @@ unsafe fn go_background(
     // a big compute program that writes nothing but images: binds can go on without it
     let image_only = compute && super::pso_async::image_skip() && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
     let bvh_trav = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::uses_bvh_intersect(b)));
+    let heavy_compute = compute
+        && bvh_gate_enabled()
+        && super::pso_async::async_heavy_compute()
+        && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::compute_code_len(b).is_some_and(|n| n >= crate::gpu::effects::HEAVY_CODE)));
     if compute {
         if let OwnedDesc::Compute(_, b) = &owned {
             if let Some(cs) = b.first() {
@@ -5979,8 +6096,11 @@ unsafe fn go_background(
     if image_only {
         super::pso_async::image_only(*ppv as usize);
     }
-    if bvh_trav {
+    if bvh_trav && bvh_gate_enabled() {
         super::pso_async::bvh_traversal(*ppv as usize);
+    }
+    if heavy_compute {
+        super::pso_async::heavy_compute(*ppv as usize);
     }
     Some(hr)
 }

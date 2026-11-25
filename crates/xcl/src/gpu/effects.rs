@@ -109,6 +109,16 @@ pub fn big_and_image_only(blob: &[u8]) -> bool {
     code.len() >= BIG_CODE && of(&code).is_some_and(|e| !e.memory)
 }
 
+/// Console RDNA2 code bytes (24 KiB, ~6 000 instructions, ~512+ KiB DXIL) from which a compute
+/// shader is treated as heavyweight for async-only compilation so title threads never freeze
+/// compiling multi-10s RT compute shaders synchronously.
+pub const HEAVY_CODE: usize = 24 << 10;
+
+/// Length in bytes of the compute program's RDNA2 code (`None` if not a valid console CS).
+pub fn compute_code_len(blob: &[u8]) -> Option<usize> {
+    compute_code(blob).map(|c| c.len())
+}
+
 /// Whether the compute shader `blob` issues `IMAGE_BVH_INTERSECT_RAY` or `IMAGE_BVH64_INTERSECT_RAY`.
 pub fn uses_bvh_intersect(blob: &[u8]) -> bool {
     let Some(code) = compute_code(blob) else { return false };
