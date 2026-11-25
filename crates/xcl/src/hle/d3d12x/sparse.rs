@@ -236,6 +236,9 @@ struct State {
     parked: FxHashMap<usize, (u32, u32)>,
     /// unmapped parked pool tiles awaiting `self.queue` and in-flight title queues before entering `free`
     quarantined: VecDeque<RetiredTiles>,
+    /// unpinned unused pool tiles queued from `forget_in` (cannot signal queues under D3D12 release locks)
+    /// until `flush_pending_quarantine` places them behind GPU fences
+    pending_quarantine: Vec<(u32, u32)>,
     /// per-title-queue fences used to mark in-flight GPU work (`note_queue`)
     queue_fences: FxHashMap<usize, (ID3D12CommandQueue, ID3D12Fence, u64)>,
     /// placed buffers → the pool tiles they use
@@ -559,6 +562,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             pinned: FxHashMap::default(),
             parked: FxHashMap::default(),
             quarantined: VecDeque::new(),
+            pending_quarantine: Vec::new(),
             queue_fences: FxHashMap::default(),
             buffers: FxHashMap::default(),
             to_zero: Vec::new(),
@@ -608,6 +612,7 @@ impl State {
     }
 
     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
+        self.flush_pending_quarantine();
         self.drain_quarantined();
         if self.free.is_empty() && self.flush_parked() {
             self.drain_quarantined();
@@ -1421,15 +1426,42 @@ impl State {
         }
     }
 
-    /// a pool tile no window maps, none is parked on and no buffer uses goes back to the free list
+    /// Queue a pool tile that no window maps, none is parked on, and no buffer pins for GPU fence
+    /// quarantine. Never pushes straight to `free` or signals queues here (called from `forget_in`
+    /// during D3D12 `Release`); `flush_pending_quarantine` attaches completion fences before reuse.
     fn release_if_unused(&mut self, tile: (u32, u32)) {
         if !self.pinned.contains_key(&tile)
             && !self.mapped.values().any(|e| e.pool == tile)
             && !self.parked.values().any(|&p| p == tile)
             && !self.quarantined.iter().any(|b| b.tiles.contains(&tile))
+            && !self.pending_quarantine.contains(&tile)
+            && !self.free.contains(&tile)
         {
-            self.free.push(tile);
+            self.pending_quarantine.push(tile);
         }
+    }
+
+    /// Move any `pending_quarantine` tiles (unpinned when a placed buffer was released) into the
+    /// GPU fence quarantine behind `self.fence` and every known title queue.
+    unsafe fn flush_pending_quarantine(&mut self) -> bool {
+        if self.pending_quarantine.is_empty() {
+            return false;
+        }
+        let tiles: Vec<(u32, u32)> = self
+            .pending_quarantine
+            .drain(..)
+            .filter(|tile| {
+                !self.pinned.contains_key(tile)
+                    && !self.mapped.values().any(|e| e.pool == *tile)
+                    && !self.parked.values().any(|&p| p == *tile)
+                    && !self.quarantined.iter().any(|b| b.tiles.contains(tile))
+            })
+            .collect();
+        if tiles.is_empty() {
+            return false;
+        }
+        self.quarantine_tiles(tiles);
+        true
     }
 
     unsafe fn note_queue(&mut self, q: &ID3D12CommandQueue) -> bool {
@@ -1527,6 +1559,15 @@ impl State {
             self.unmap_tiles(&r, b, &ts);
         }
         self.signal();
+        for tile in self.pending_quarantine.drain(..) {
+            if !self.pinned.contains_key(&tile)
+                && !self.mapped.values().any(|e| e.pool == tile)
+                && !self.quarantined.iter().any(|b| b.tiles.contains(&tile))
+                && !tiles.contains(&tile)
+            {
+                tiles.push(tile);
+            }
+        }
         self.quarantine_tiles(tiles);
         true
     }
@@ -1572,8 +1613,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     s.note_queue(queue);
     // the title's work sees what was decommitted unmapped, as it was
     let flushed = s.flush_parked();
+    let quarantined = s.flush_pending_quarantine();
     let drained = s.drain_quarantined();
-    if flushed || drained {
+    if flushed || quarantined || drained {
         s.retire_free_pools();
     }
     let t_locked = std::time::Instant::now();
@@ -1662,16 +1704,19 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
-    let mut g = lock_state();
-    let s = g.as_mut()?;
     let start = va & !(TILE - 1);
     let delta = va - start;
     let bytes = desc.Width as usize;
     if bytes == 0 {
         return None;
     }
-    s.window_index(start)?;
-    s.window_index(va.checked_add(bytes)?.checked_sub(1)?)?;
+    let last = va.checked_add(bytes)?.checked_sub(1)?;
+    {
+        let g = lock_state();
+        let s = g.as_ref()?;
+        s.window_index(start)?;
+        s.window_index(last)?;
+    }
     let mut d = *desc;
     d.Width = (delta + bytes) as u64;
     d.Alignment = 0;
@@ -1681,10 +1726,14 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     if state & (D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32 | D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32) != 0 {
         d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     }
+    // Create the reserved resource without holding STATE so concurrent final Release -> forget_buffer
+    // cannot queue a reused COM pointer in FORGOTTEN and later evict this live buffer (#2457).
     let hr = super::real::dev_create_reserved_resource(this, &d as *const _ as usize, state as usize, 0, riid, ppv);
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         return None;
     }
+    let mut g = lock_state();
+    let s = g.as_mut()?;
     // its tiles: the window's video memory at the same addresses; probe actual OS commitment
     // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes
     s.ensure_mapped(start, delta + bytes, |t| query_tile_holes(t));
@@ -1865,6 +1914,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 quarantined: VecDeque::new(),
+                pending_quarantine: Vec::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -2073,6 +2123,7 @@ mod tests {
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
                 quarantined: VecDeque::new(),
+                pending_quarantine: Vec::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -2170,6 +2221,7 @@ mod tests {
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
                 quarantined: VecDeque::new(),
+                pending_quarantine: Vec::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -2295,6 +2347,7 @@ mod tests {
             pinned: FxHashMap::default(),
             parked: FxHashMap::default(),
             quarantined: VecDeque::new(),
+            pending_quarantine: Vec::new(),
             queue_fences: FxHashMap::default(),
             buffers: FxHashMap::default(),
             to_zero: Vec::new(),
@@ -2574,6 +2627,59 @@ mod tests {
             }
             let decommit = t.elapsed();
             println!("early: {n} pages: commit {:.1} ms, decommit {:.1} ms", commit.as_secs_f64() * 1e3, decommit.as_secs_f64() * 1e3);
+        }
+    }
+
+    /// Releasing a placed buffer that was the last pin on an already-unmapped tile must queue the
+    /// tile in `pending_quarantine` (never directly in `free`) and keep it out of `free` until
+    /// `flush_pending_quarantine` + active title-queue fences complete (#2457).
+    #[test]
+    fn gpu_unpinned_unused_tile_waits_in_quarantine_before_free() {
+        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            let title_queue: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            let gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate fence");
+            let _release_gate = SignalOnDrop(gate.clone(), 1);
+            assert!(s.note_queue(&title_queue));
+
+            s.commit_range(base, TILE);
+            let tile = s.mapped[&base].pool;
+            const BUF: usize = 0xDEAD_BEE0;
+            s.pinned.insert(tile, 1);
+            s.buffers.insert(BUF, vec![tile]);
+
+            // Decommit and flush while still pinned by BUF: tile is unmapped from window, NOT freed.
+            s.decommit_range(base, TILE);
+            assert!(s.flush_parked());
+            assert!(!s.free.contains(&tile));
+            assert!(s.quarantined.is_empty());
+
+            // Stall title_queue behind `gate` to simulate in-flight GPU work reading BUF.
+            title_queue.Wait(&gate, 1).expect("wait on gate");
+
+            // Buffer release unpins tile: must enter pending_quarantine, NOT free.
+            forget_in(&mut s, BUF);
+            assert!(!s.pinned.contains_key(&tile));
+            assert!(!s.free.contains(&tile), "unpinned tile must not bypass quarantine into free");
+            assert_eq!(s.pending_quarantine, vec![tile]);
+
+            // Flushing pending_quarantine attaches title_queue fence; tile stays quarantined until gate signals.
+            assert!(s.flush_pending_quarantine());
+            assert!(s.pending_quarantine.is_empty());
+            assert!(!s.drain_quarantined(), "tile must remain quarantined while title queue is blocked");
+            assert!(!s.free.contains(&tile));
+
+            gate.Signal(1).expect("signal gate");
+            let start = std::time::Instant::now();
+            while !s.drain_quarantined() && start.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(s.free.contains(&tile), "tile should enter free once title queue fence completes");
+
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 }

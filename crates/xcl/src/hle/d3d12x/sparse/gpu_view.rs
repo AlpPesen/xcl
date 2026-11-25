@@ -583,6 +583,7 @@ mod tests {
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
                 quarantined: VecDeque::new(),
+                pending_quarantine: Vec::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
