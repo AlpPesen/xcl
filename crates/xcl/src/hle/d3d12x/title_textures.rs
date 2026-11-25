@@ -1552,35 +1552,43 @@ impl DetilePool {
             std::sync::Condvar::new(),
             std::sync::Condvar::new(),
         ));
-        for id in 0..helpers {
+        let mut spawned = 0usize;
+        for _ in 0..helpers {
+            let id = spawned;
             let shared = Arc::clone(&state);
-            let _ = std::thread::Builder::new().name(format!("xcl-detile-{id}")).spawn(move || {
-                let mut seen = 0u64;
-                loop {
-                    let job = {
-                        let mut g = shared.0.lock().unwrap();
-                        while g.gen == seen {
-                            g = shared.1.wait(g).unwrap();
-                        }
-                        seen = g.gen;
-                        if id < g.active_helpers {
-                            g.func.map(|f| (f, g.ctx))
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some((func, ctx)) = job {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { func(ctx as *const c_void) }));
-                        let mut g = shared.0.lock().unwrap();
-                        g.pending_helpers -= 1;
-                        if g.pending_helpers == 0 {
-                            shared.2.notify_one();
+            if std::thread::Builder::new()
+                .name(format!("xcl-detile-{id}"))
+                .spawn(move || {
+                    let mut seen = 0u64;
+                    loop {
+                        let job = {
+                            let mut g = shared.0.lock().unwrap();
+                            while g.gen == seen {
+                                g = shared.1.wait(g).unwrap();
+                            }
+                            seen = g.gen;
+                            if id < g.active_helpers {
+                                g.func.map(|f| (f, g.ctx))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((func, ctx)) = job {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { func(ctx as *const c_void) }));
+                            let mut g = shared.0.lock().unwrap();
+                            g.pending_helpers -= 1;
+                            if g.pending_helpers == 0 {
+                                shared.2.notify_one();
+                            }
                         }
                     }
-                }
-            });
+                })
+                .is_ok()
+            {
+                spawned += 1;
+            }
         }
-        DetilePool { run_lock: Mutex::new(()), state, helpers }
+        DetilePool { run_lock: Mutex::new(()), state, helpers: spawned }
     }
 
     fn run<F: Fn() + Sync>(&self, total_threads: usize, f: &F) {
