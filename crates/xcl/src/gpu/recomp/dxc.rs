@@ -918,6 +918,16 @@ pub fn in_cached_only() -> bool {
 }
 
 pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
+    // LOCAL EXPERIMENT: XCL_LOOP_FOR=<text in the HLSL> XCL_LOOP_N=<budget>: the loop budget of that program alone
+    let patched;
+    let src = match (std::env::var("XCL_LOOP_FOR"), std::env::var("XCL_LOOP_N")) {
+        (Ok(t), Ok(n)) if !t.is_empty() && src.contains(&t) => {
+            patched = src.replacen("static uint xcl_budget = 1u << 16;", &format!("static uint xcl_budget = {n}u;"), 1);
+            crate::xlog_info!("[SHADER] loop budget {n} for a program of {} B HLSL ({entry}, {profile})", src.len());
+            &patched[..]
+        }
+        _ => src,
+    };
     compile_cached_in(&cache_dir(), src, entry, profile)
 }
 
