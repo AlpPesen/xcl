@@ -1886,12 +1886,12 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
     out
 }
 
-/// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
-/// as much as the detile of a video frame), else read page run by page run.
+/// The title's bytes at `at`: borrowed directly only inside the permanently-committed coherent
+/// UMA window; any other address (alias spaces, sparse reservations, or title heaps) can be
+/// concurrently decommitted by another thread between a readability check and the read, so read
+/// page run by page run via `read_committed` (`ReadProcessMemory`) without faulting.
 unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
-    // (in a space of physical pages the title maps and unmaps them all the time, so a page can go
-    // away between the check and the read: `read_committed` copies without faulting)
-    if !crate::hle::kernelx::alias::in_space(at) && crate::gpu::shader::readable(at, len) {
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
     } else {
         std::borrow::Cow::Owned(read_committed(at, len))
@@ -3366,5 +3366,16 @@ mod tests {
                 assert_eq!(s.load(Ordering::Relaxed), (i + 1) * (round + 1));
             }
         }
+    }
+
+    #[test]
+    fn title_bytes_outside_uma_copies_safely_via_read_committed() {
+        let mut buf = vec![0x5Au8; 4096];
+        buf[0] = 0x11;
+        buf[4095] = 0xEE;
+        let got = unsafe { title_bytes(buf.as_ptr() as usize, buf.len()) };
+        assert!(matches!(got, std::borrow::Cow::Owned(_)), "non-UMA allocations must copy via read_committed so concurrent decommits cannot fault");
+        assert_eq!(got.len(), 4096);
+        assert_eq!((got[0], got[1], got[4095]), (0x11, 0x5A, 0xEE));
     }
 }
