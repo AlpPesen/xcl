@@ -267,13 +267,22 @@ pub mod mirrors {
     /// nothing else). `None` – nothing recorded – when a batch or a range is not readable, a
     /// range leaves the pool or has an unknown kind, or the call names over `MOST` pages.
     pub unsafe fn apply_batches(count: u32, batches: usize, pool: usize, pool_pages: u32) -> Option<Mapped> {
+        let changes = decode_batches(count, batches, pool, pool_pages)?;
+        record(changes)
+    }
+
+    /// The mappings of one call of the page-mapping method (`apply_batches`), checked whole:
+    /// (GPU-view page, the pool page it is given or `None`: unmapped), in the call's order.
+    /// `None` when a batch or a range is not readable, a range leaves the pool or has an unknown
+    /// kind, or the call names over `MOST` pages.
+    pub unsafe fn decode_batches(count: u32, batches: usize, pool: usize, pool_pages: u32) -> Option<Vec<(usize, Option<usize>)>> {
         const BATCH: usize = 24;
         const RANGE: usize = 12;
         const MOST: usize = 1 << 20;
         let readable = crate::gpu::shader::readable;
         let n = count as usize;
         if n == 0 {
-            return Some(Mapped::default());
+            return Some(Vec::new());
         }
         if n > MOST || !readable(batches, n * BATCH) {
             return None;
@@ -309,6 +318,11 @@ pub mod mirrors {
                 at += len * PAGE;
             }
         }
+        Some(changes)
+    }
+
+    /// `apply_batches`'s record of the decoded mappings.
+    unsafe fn record(changes: Vec<(usize, Option<usize>)>) -> Option<Mapped> {
         // the physical page the title has mapped at each pool page: what the console maps
         let changes: Vec<(usize, Option<Shown>)> = {
             let away = super::AWAY.lock().unwrap();
