@@ -1521,11 +1521,109 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     out
 }
 
-/// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
+/// Batches of at least this many bytes are detiled on several threads (`hash_and_detile_all`)
 const PARALLEL_BYTES: usize = 1 << 20;
 
+struct DetileState {
+    gen: u64,
+    active_helpers: usize,
+    pending_helpers: usize,
+    func: Option<unsafe fn(*const c_void)>,
+    ctx: usize,
+}
+
+/// Reusable persistent worker pool for parallel texture hashing and detiling, avoiding per-submit
+/// OS thread creation and DLL attach/detach overhead during streaming bursts.
+struct DetilePool {
+    run_lock: Mutex<()>,
+    state: Arc<(Mutex<DetileState>, std::sync::Condvar, std::sync::Condvar)>,
+    helpers: usize,
+}
+
+impl DetilePool {
+    fn new(max_threads: usize) -> Self {
+        let helpers = max_threads.saturating_sub(1);
+        let state = Arc::new((
+            Mutex::new(DetileState { gen: 0, active_helpers: 0, pending_helpers: 0, func: None, ctx: 0 }),
+            std::sync::Condvar::new(),
+            std::sync::Condvar::new(),
+        ));
+        for id in 0..helpers {
+            let shared = Arc::clone(&state);
+            let _ = std::thread::Builder::new().name(format!("xcl-detile-{id}")).spawn(move || {
+                let mut seen = 0u64;
+                loop {
+                    let job = {
+                        let mut g = shared.0.lock().unwrap();
+                        while g.gen == seen {
+                            g = shared.1.wait(g).unwrap();
+                        }
+                        seen = g.gen;
+                        if id < g.active_helpers {
+                            g.func.map(|f| (f, g.ctx))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((func, ctx)) = job {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { func(ctx as *const c_void) }));
+                        let mut g = shared.0.lock().unwrap();
+                        g.pending_helpers -= 1;
+                        if g.pending_helpers == 0 {
+                            shared.2.notify_one();
+                        }
+                    }
+                }
+            });
+        }
+        DetilePool { run_lock: Mutex::new(()), state, helpers }
+    }
+
+    fn run<F: Fn() + Sync>(&self, total_threads: usize, f: &F) {
+        let helpers = total_threads.saturating_sub(1).min(self.helpers);
+        if helpers == 0 {
+            f();
+            return;
+        }
+        unsafe fn trampoline<F: Fn() + Sync>(ctx: *const c_void) {
+            (*(ctx as *const F))();
+        }
+        let _serial = self.run_lock.lock().unwrap();
+        {
+            let mut g = self.state.0.lock().unwrap();
+            g.func = Some(trampoline::<F>);
+            g.ctx = (f as *const F) as usize;
+            g.active_helpers = helpers;
+            g.pending_helpers = helpers;
+            g.gen = g.gen.wrapping_add(1);
+            self.state.1.notify_all();
+        }
+        let caller_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        {
+            let mut g = self.state.0.lock().unwrap();
+            while g.pending_helpers > 0 {
+                g = self.state.2.wait(g).unwrap();
+            }
+            g.func = None;
+            g.ctx = 0;
+            g.active_helpers = 0;
+        }
+        if let Err(payload) = caller_res {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+fn detile_pool() -> &'static DetilePool {
+    static POOL: std::sync::OnceLock<DetilePool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let max_threads = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8);
+        DetilePool::new(max_threads)
+    })
+}
+
 /// Read each texture once, optionally skip unchanged content (`LAST_CONTENT`), and detile from the
-/// same buffer — in parallel across worker threads when the batch reaches `PARALLEL_BYTES`.
+/// same buffer — using the persistent detile worker pool when the batch reaches `PARALLEL_BYTES`.
 unsafe fn hash_and_detile_all(
     picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>)],
     bytes: usize,
@@ -1552,27 +1650,15 @@ unsafe fn hash_and_detile_all(
         return items.iter().map(|&(res, va, tex)| work(res, va, tex)).collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut out: Vec<Option<Vec<Subresource>>> = (0..items.len()).map(|_| None).collect();
-    let done: Vec<Vec<(usize, Option<Vec<Subresource>>)>> = std::thread::scope(|s| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                s.spawn(|| {
-                    let mut mine = Vec::new();
-                    loop {
-                        let k = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(res, va, tex)) = items.get(k) else { break };
-                        mine.push((k, work(res, va, tex)));
-                    }
-                    mine
-                })
-            })
-            .collect();
-        workers.into_iter().map(|w| w.join().unwrap_or_default()).collect()
+    let out: Vec<Mutex<Option<Vec<Subresource>>>> = (0..items.len()).map(|_| Mutex::new(None)).collect();
+    detile_pool().run(threads, &|| loop {
+        let k = next.fetch_add(1, Ordering::Relaxed);
+        let Some(&(res, va, tex)) = items.get(k) else { break };
+        if let Some(subs) = work(res, va, tex) {
+            *out[k].lock().unwrap() = Some(subs);
+        }
     });
-    for (k, subs) in done.into_iter().flatten() {
-        out[k] = subs;
-    }
-    out
+    out.into_iter().map(|m| m.into_inner().unwrap()).collect()
 }
 
 /// `subresources` of each (address, texture), in order, on up to `threads` threads.
@@ -2821,5 +2907,24 @@ mod tests {
         assert!(t.mark_gpu_written(0x100));
         let (hits, _) = t.dirty_and_pending(&dirty, 0x1000);
         assert_eq!(hits, vec![0x300]);
+    }
+
+    #[test]
+    fn detile_pool_reuses_workers_across_multiple_batches() {
+        let pool = DetilePool::new(4);
+        for round in 0..4usize {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let slots: Vec<std::sync::atomic::AtomicUsize> = (0..64).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
+            pool.run(4, &|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= slots.len() {
+                    break;
+                }
+                slots[i].store((i + 1) * (round + 1), Ordering::Relaxed);
+            });
+            for (i, s) in slots.iter().enumerate() {
+                assert_eq!(s.load(Ordering::Relaxed), (i + 1) * (round + 1));
+            }
+        }
     }
 }
