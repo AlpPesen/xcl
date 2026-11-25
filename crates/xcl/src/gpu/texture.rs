@@ -507,19 +507,7 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         None => Uploader::new(dev)?,
     };
     // where each texture's texels go in the upload buffer
-    let mut failed = Vec::new();
-    let mut planned = Vec::with_capacity(items.len());
-    let mut total = 0u64;
-    for (k, (res, subs, states)) in items.iter().enumerate() {
-        match layout(dev, res, subs, states, states) {
-            Ok(l) => {
-                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
-                total = base + l.total;
-                planned.push((k, l, base));
-            }
-            Err(e) => failed.push((k, e)),
-        }
-    }
+    let (failed, planned, total) = plan_batch(dev, items);
     if planned.is_empty() {
         put_back(key, up);
         return Ok(failed);
@@ -548,6 +536,105 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     up.last_used_frame = CURRENT_FRAME.load(std::sync::atomic::Ordering::Relaxed);
     put_back(key, up);
     Ok(failed)
+}
+
+unsafe fn plan_batch(dev: &ID3D12Device, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> (Vec<(usize, String)>, Vec<(usize, Layout, u64)>, u64) {
+    let mut failed = Vec::new();
+    let mut planned = Vec::with_capacity(items.len());
+    let mut total = 0u64;
+    for (k, (res, subs, states)) in items.iter().enumerate() {
+        match layout(dev, res, subs, states, states) {
+            Ok(l) => {
+                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
+                total = base + l.total;
+                planned.push((k, l, base));
+            }
+            Err(e) => failed.push((k, e)),
+        }
+    }
+    (failed, planned, total)
+}
+
+struct StagingSlot {
+    dev_key: usize,
+    cap: u64,
+    pooled: Option<MappedStaging>,
+    _unpooled: Option<ID3D12Resource>,
+}
+
+impl Drop for StagingSlot {
+    fn drop(&mut self) {
+        if let Some(ms) = self.pooled.take() {
+            if self.cap <= STAGING_POOL_MAX_ITEM && staging_pool_cap_bytes() > 0 {
+                let now_ms = monotonic_ms();
+                let frame = CURRENT_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+                let mut pools = STAGING_POOLS.lock().unwrap();
+                let pool = pools
+                    .get_or_insert_with(Default::default)
+                    .entry(self.dev_key)
+                    .or_insert_with(|| StagingPool::new(staging_pool_cap_bytes()));
+                let _ = pool.release(self.cap, ms, now_ms, frame);
+            }
+        }
+    }
+}
+
+/// GPU-side upload resources kept alive until `queue`'s fence passes the submitted batch.
+/// Dropping an `InFlight` returns pooled `<= 8 MiB` staging buffers to `STAGING_POOLS` and frees
+/// oversized staging buffers immediately.
+pub struct InFlight {
+    _alloc: ID3D12CommandAllocator,
+    _list: ID3D12GraphicsCommandList,
+    _staging: StagingSlot,
+    pub bytes: u64,
+}
+
+/// Record and execute a batch of texture uploads directly on `queue` without waiting on the CPU.
+/// The returned `InFlight` must stay alive until `queue` completes this submission.
+pub unsafe fn submit_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<(Vec<(usize, String)>, Option<InFlight>), String> {
+    let (failed, planned, bytes) = plan_batch(dev, items);
+    if planned.is_empty() {
+        return Ok((failed, None));
+    }
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+    let dev_key = windows::core::Interface::as_raw(dev) as usize;
+    let slot = if let Some(bucket) = (staging_pool_cap_bytes() > 0).then(|| staging_pool_bucket(bytes)).flatten() {
+        let cached = STAGING_POOLS
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|m| m.get_mut(&dev_key))
+            .and_then(|pool| pool.acquire(bucket));
+        let (cap, ms) = match cached {
+            Some(hit) => hit,
+            None => {
+                let b = buffer(dev, bucket)?;
+                let mut mapped = std::ptr::null_mut();
+                b.Map(0, None, Some(&mut mapped)).map_err(err)?;
+                (bucket, MappedStaging(b, mapped as *mut u8))
+            }
+        };
+        for (k, layout, base) in &planned {
+            let (res, subs, states) = &items[*k];
+            record_into(&list, res, subs, layout, states, states, &ms.0, ms.1, *base);
+        }
+        StagingSlot { dev_key, cap, pooled: Some(ms), _unpooled: None }
+    } else {
+        let staging = buffer(dev, bytes)?;
+        let mut mapped = std::ptr::null_mut();
+        staging.Map(0, None, Some(&mut mapped)).map_err(err)?;
+        for (k, layout, base) in &planned {
+            let (res, subs, states) = &items[*k];
+            record_into(&list, res, subs, layout, states, states, &staging, mapped as *mut u8, *base);
+        }
+        staging.Unmap(0, None);
+        StagingSlot { dev_key, cap: bytes, pooled: None, _unpooled: Some(staging) }
+    };
+    list.Close().map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    let tracked = slot.cap;
+    Ok((failed, Some(InFlight { _alloc: alloc, _list: list, _staging: slot, bytes: tracked })))
 }
 
 fn put_back(key: usize, up: Uploader) {
