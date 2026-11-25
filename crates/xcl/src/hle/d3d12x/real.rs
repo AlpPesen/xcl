@@ -1919,14 +1919,45 @@ static BVH_BUILD_READY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// At least one `DispatchX(..., 0x20)` BVH builder PSO failed or stayed pending: gate stays closed.
 static BVH_BUILD_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Policy for gating RT traversal (`image_bvh*_intersect_ray`) and RT companion compute shaders
+/// (`XCL_RT_GATE`):
+/// - `hold` / `1` / unset (default): hold RT shaders back without translating, enqueueing, or
+///   compiling them (0 ms compile, 0 MB RAM, no unguarded null-BVH traversal faults). Pairs
+///   cleanly with `XCL_AMBIENT=auto` (`!bvh_traversal_allowed()`).
+/// - `auto`: hold back RT shaders until a `DispatchX(..., 0x20)` BVH builder pass succeeds with
+///   zero failed builder PSOs.
+/// - `0` / `off` / `allow`: disable gating; compile and run RT shaders freely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RtGateMode {
+    Off,
+    Auto,
+    Hold,
+}
+
+fn parse_rt_gate_mode(raw: Option<&str>) -> RtGateMode {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("0" | "off" | "false" | "allow") => RtGateMode::Off,
+        Some("auto") => RtGateMode::Auto,
+        _ => RtGateMode::Hold,
+    }
+}
+
+fn rt_gate_mode() -> RtGateMode {
+    static MODE: OnceLock<RtGateMode> = OnceLock::new();
+    *MODE.get_or_init(|| parse_rt_gate_mode(std::env::var("XCL_RT_GATE").ok().as_deref()))
+}
+
 fn bvh_gate_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_RT_GATE").map_or(true, |v| v.trim() != "0"))
+    rt_gate_mode() != RtGateMode::Off
 }
 
 /// Whether BVH traversal compute shaders (`image_bvh*_intersect_ray`) are allowed to run.
 pub(super) fn bvh_traversal_allowed() -> bool {
-    !bvh_gate_enabled() || (BVH_BUILD_READY.load(Ordering::Acquire) && !BVH_BUILD_FAILED.load(Ordering::Acquire))
+    match rt_gate_mode() {
+        RtGateMode::Off => true,
+        RtGateMode::Hold => false,
+        RtGateMode::Auto => BVH_BUILD_READY.load(Ordering::Acquire) && !BVH_BUILD_FAILED.load(Ordering::Acquire),
+    }
 }
 
 /// Whether any BVH builder pass failed (all-or-nothing gate disables further partial builds).
@@ -1936,7 +1967,9 @@ pub(super) fn bvh_builder_failed() -> bool {
 
 pub(super) fn note_bvh_builder_dispatched() {
     if !BVH_BUILD_FAILED.load(Ordering::Acquire) && !BVH_BUILD_READY.swap(true, Ordering::AcqRel) {
-        crate::xlog_info!("D3D12.X: BVH builder dispatch ready — enabling RT traversal shaders");
+        if rt_gate_mode() == RtGateMode::Auto {
+            crate::xlog_info!("D3D12.X: BVH builder dispatch ready — enabling RT traversal shaders");
+        }
     }
 }
 
@@ -4415,13 +4448,14 @@ enum SlotLimit {
 /// A counting semaphore: background driver compiles of big programs at once.
 struct Slots {
     n: Mutex<usize>,
+    wanted_waiters: AtomicUsize,
     cv: std::sync::Condvar,
     limit: SlotLimit,
 }
 
 impl Slots {
     const fn fixed(most: usize, wanted_most: usize) -> Self {
-        Self { n: Mutex::new(0), cv: std::sync::Condvar::new(), limit: SlotLimit::Fixed(most, wanted_most) }
+        Self { n: Mutex::new(0), wanted_waiters: AtomicUsize::new(0), cv: std::sync::Condvar::new(), limit: SlotLimit::Fixed(most, wanted_most) }
     }
 
     fn most(&self) -> usize {
@@ -4450,14 +4484,45 @@ impl Drop for SlotGuard {
     }
 }
 
+struct WantedWaiterGuard {
+    slots: &'static Slots,
+    registered: bool,
+}
+
+impl WantedWaiterGuard {
+    fn new(slots: &'static Slots) -> Self {
+        Self { slots, registered: false }
+    }
+
+    fn set(&mut self, active: bool) {
+        if active && !self.registered {
+            self.slots.wanted_waiters.fetch_add(1, Ordering::AcqRel);
+            self.registered = true;
+        } else if !active && self.registered {
+            self.slots.wanted_waiters.fetch_sub(1, Ordering::AcqRel);
+            self.registered = false;
+        }
+    }
+}
+
+impl Drop for WantedWaiterGuard {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
+
 const LARGE_DRIVER_COMPILE: usize = 512 << 10;
-static MEDIUM_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), limit: SlotLimit::Medium };
-static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), limit: SlotLimit::Big };
+static MEDIUM_COMPILES: Slots = Slots { n: Mutex::new(0), wanted_waiters: AtomicUsize::new(0), cv: std::sync::Condvar::new(), limit: SlotLimit::Medium };
+static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), wanted_waiters: AtomicUsize::new(0), cv: std::sync::Condvar::new(), limit: SlotLimit::Big };
 /// True giant DXIL shaders (`>= 900 KiB`, e.g. >1 MiB RT/compute shaders that can take >60-140s
 /// in the driver compiler) get their own dedicated 1-slot lane so they never starve `MEDIUM_COMPILES`
 /// (`256-512 KiB`) or `BIG_COMPILES` (`512-900 KiB`).
 const GIANT_DRIVER_COMPILE: usize = 900 << 10;
 static GIANT_COMPILES: Slots = Slots::fixed(1, 1);
+
+fn is_preload_worker() -> bool {
+    std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso-pre-"))
+}
 
 fn compile_slots(bytes: usize) -> &'static Slots {
     if bytes >= GIANT_DRIVER_COMPILE {
@@ -4497,7 +4562,7 @@ fn pso_trace() -> bool {
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    let _slot = huge.then(|| big_compile_turn_with(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted, is_preload_worker()));
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4549,20 +4614,34 @@ fn gate_compute_driver_compile(has_isa_cached_blob: bool) -> bool {
 /// `slots.wanted_most()` (default 2 for `>= 256 KB`, 1 for `>= 4 MiB` giant shaders) so a wanted
 /// build is not stuck behind 1 background build while a burst of lazy binds still cannot spike
 /// driver compiler commit into OOM.
+#[cfg(test)]
 fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> SlotGuard {
+    big_compile_turn_with(slots, commit_free, wanted, false)
+}
+
+fn big_compile_turn_with(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool, is_preload: bool) -> SlotGuard {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
+    let mut waiter = WantedWaiterGuard::new(slots);
     let mut n = slots.n.lock().unwrap();
     loop {
         let is_wanted = wanted();
+        waiter.set(is_wanted);
         let cap = if is_wanted { slots.wanted_most() } else { slots.most() };
         let ok = if is_wanted {
             // Always allow the first 2 wanted slots (never deadlock under tight commit); extra
             // wanted slots on wider tiers (e.g. MEDIUM_COMPILES cap 4) require commit headroom.
             *n < cap && (*n < 2 || commit_free())
+        } else if is_preload {
+            // Speculative `xcl-pso-pre-*` preload threads (`THREAD_PRIORITY_LOWEST`) may hold at
+            // most 1 slot in a lane (`*n == 0`) and yield whenever any foreground `wanted` compile
+            // is waiting or commit headroom is tight — leaving >= 1 tight-commit slot (and all
+            // extra wanted slots) exclusively for foreground compiles like two-pass MS PSOs.
+            *n == 0 && slots.wanted_waiters.load(Ordering::Acquire) == 0 && commit_free()
         } else {
-            *n < cap && commit_free()
+            *n < cap && slots.wanted_waiters.load(Ordering::Acquire) == 0 && commit_free()
         };
         if ok {
+            waiter.set(false);
             *n += 1;
             return SlotGuard(slots);
         }
@@ -4707,6 +4786,36 @@ mod big_compile_tests {
         assert_eq!(parsed.len(), 2);
         assert!(is_rt_gated_cs(b"HDR\0CS_RaytracingResolve_01\0"));
         assert!(is_rt_gated_cs(b"HDR\0CS_IrradianceCache_Shade_Low\0"));
+        assert_eq!(parse_rt_gate_mode(None), RtGateMode::Hold);
+        assert_eq!(parse_rt_gate_mode(Some("")), RtGateMode::Hold);
+        assert_eq!(parse_rt_gate_mode(Some("1")), RtGateMode::Hold);
+        assert_eq!(parse_rt_gate_mode(Some("hold")), RtGateMode::Hold);
+        assert_eq!(parse_rt_gate_mode(Some("AUTO")), RtGateMode::Auto);
+        assert_eq!(parse_rt_gate_mode(Some("0")), RtGateMode::Off);
+        assert_eq!(parse_rt_gate_mode(Some("off")), RtGateMode::Off);
+        assert_eq!(parse_rt_gate_mode(Some("allow")), RtGateMode::Off);
+    }
+
+    #[test]
+    fn preload_never_takes_second_slot_or_starves_wanted_compile() {
+        static S: Slots = Slots::fixed(3, 4);
+        let p1 = big_compile_turn_with(&S, || true, || false, true);
+        assert_eq!(*S.n.lock().unwrap(), 1);
+        // A second speculative preload compile must wait even though `most == 3`, so preload
+        // never occupies both tight-commit slots (`*n < 2`) and starves foreground builds.
+        let p2 = std::thread::spawn(|| {
+            let _g = big_compile_turn_with(&S, || true, || false, true);
+        });
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!p2.is_finished(), "second preload compile must wait behind the first");
+        // A foreground wanted compile enters immediately even when commit headroom is tight!
+        let t0 = Instant::now();
+        let w1 = big_compile_turn_with(&S, || false, || true, false);
+        assert!(t0.elapsed() < Duration::from_secs(1), "wanted compile must not wait behind preload");
+        assert_eq!(*S.n.lock().unwrap(), 2);
+        drop((w1, p1));
+        p2.join().unwrap();
+        assert_eq!(*S.n.lock().unwrap(), 0);
     }
 
     #[test]
@@ -4839,6 +4948,11 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     let cs = shader_bytes(&d.CS)?;
     if !is_console(cs) {
         return None;
+    }
+    // Under `XCL_RT_GATE=hold` (default), RT traversal and RT companion shaders are held back
+    // without translating or compiling on the driver (belt-and-suspenders guard for direct paths).
+    if rt_gate_mode() == RtGateMode::Hold && is_rt_gated_cs(cs) {
+        return Some(Err(()));
     }
     // made when first bound (`pso_async::lazy`): not even translated now
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
@@ -6408,9 +6522,79 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     hr
 }
 
+/// When `XCL_RT_GATE` is in `Hold` mode (default), RT traversal and RT companion compute shaders
+/// (`is_rt_gated_cs`) receive a lightweight stand-in pipeline immediately without translating,
+/// enqueueing a worker job, or calling `CreateComputePipelineState` on the console shader.
+/// Eliminates multi-minute / multi-GB driver compiles (e.g. >1 MiB ray-activation passes) and
+/// prevents unguarded `image_bvh*_intersect_ray` dispatches from faulting before null-BVH guards
+/// land. `is_translated_compute` stays `false` while `is_console_compute` is `true`, so `Dispatch`
+/// and `ExecuteIndirect` skip them cleanly with zero work.
+unsafe fn maybe_rt_gated_compute_pso(
+    this: *mut c_void,
+    f: PsoFn,
+    desc: *const c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> Option<HRESULT> {
+    if rt_gate_mode() != RtGateMode::Hold {
+        return None;
+    }
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
+    let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+    let cs = shader_bytes(&d.CS)?;
+    if !crate::gpu::recomp::pso::is_console(cs) || !is_rt_gated_cs(cs) {
+        return None;
+    }
+    let key = if super::standin::enabled() && !ppv.is_null() { compute_key(this, desc) } else { None };
+    let mut driver = 0usize;
+    let hr = match key {
+        Some(key) => {
+            let made = super::standin::shell(key, || {
+                let mut out = std::ptr::null_mut();
+                let hr = standin_compute(this, f, desc, &pc_iid(Kind::PipelineState), &mut out);
+                if hr < 0 || out.is_null() { Err(hr) } else { Ok(out as usize) }
+            });
+            match made {
+                Ok((shell, d)) => {
+                    *ppv = shell;
+                    driver = d;
+                    S_OK
+                }
+                Err(hr) => hr,
+            }
+        }
+        None => standin_compute(this, f, desc, riid, ppv),
+    };
+    if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+        return None;
+    }
+    if driver != 0 {
+        super::pso_async::submit_gated(*ppv as usize, driver);
+    }
+    let record = crate::gpu::shader::fnv64(cs);
+    static GATED_COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = GATED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: RT-gated compute PSO {record:016x} held back without compiling ({n} so far; XCL_RT_GATE=hold, set XCL_RT_GATE=auto or 0 to enable)"
+        );
+    }
+    LAST_COMPUTE_TRANSLATED.with(|c| c.set(false));
+    LAST_COMPUTE_RS.with(|c| c.set(0));
+    note_compute_threads(*ppv as usize, cs);
+    note_bvh_traversal(*ppv as usize, cs);
+    note_console_compute(hr, ppv);
+    Some(hr)
+}
+
 unsafe fn create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    if let Some(hr) = maybe_rt_gated_compute_pso(this, f, desc, riid, ppv) {
+        return hr;
+    }
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
         if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, compute_key, build_compute)) {
@@ -6698,7 +6882,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let bytes = stream.shader_bytes() + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    let _slot = gate.then(|| big_compile_turn_with(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted, is_preload_worker()));
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
     }

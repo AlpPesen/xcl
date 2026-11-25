@@ -1243,6 +1243,32 @@ impl Pending {
     }
 }
 
+/// Register a permanently gated stand-in pipeline (e.g. RT compute held back under
+/// `XCL_RT_GATE=hold`) with `done = true`, `job = None`, `sent = true`, and `real = 0`.
+/// Never enqueues a worker job, never translates or calls `CreateComputePipelineState`, maps
+/// `standin -> driver` cleanly via `stand()` for `SetPipelineState`/`resolve`/`resolve_wait`,
+/// reports `is_pending(standin) == false`, and releases cleanly via `released()`.
+pub fn submit_gated(standin: usize, driver: usize) {
+    let p = Arc::new(Pending {
+        job: Mutex::new(None),
+        sent: std::sync::atomic::AtomicBool::new(true),
+        real: AtomicUsize::new(0),
+        driver: AtomicUsize::new(driver),
+        done: Mutex::new(true),
+        cv: Condvar::new(),
+        compute: true,
+        key: 0,
+        used: Default::default(),
+        orphan: Default::default(),
+        late: std::sync::atomic::AtomicBool::new(true),
+        spared: std::sync::atomic::AtomicBool::new(false),
+        bvh_traversal: std::sync::atomic::AtomicBool::new(true),
+        deprioritized: std::sync::atomic::AtomicBool::new(true),
+        demand: Default::default(),
+    });
+    PENDING.write().unwrap().get_or_insert_with(HashMap::new).insert(standin, p);
+}
+
 /// Stand-in `standin` is no driver object (`standin::shell`): binds get `driver` in its place.
 /// Told before the title has the stand-in.
 pub fn shared(standin: usize, driver: usize) {
@@ -1258,8 +1284,12 @@ pub fn resolve(pso: usize) -> usize {
     p.note_use();
     match p.real.load(Ordering::Acquire) {
         0 => {
-            // a lazy one is wanted now: to the workers
+            // a lazy one is wanted now: to the workers (unless RT-gated while BVH traversal is
+            // held back, so gated RT shaders never enqueue or burn driver compile RAM)
             let stand = p.stand(pso);
+            if p.bvh_traversal.load(Ordering::Acquire) && !super::real::bvh_traversal_allowed() {
+                return stand;
+            }
             if !p.sent.swap(true, Ordering::AcqRel) {
                 enqueue(p);
             }
@@ -1454,6 +1484,9 @@ static FRAME_WAIT: Mutex<FrameWaitBudget> = Mutex::new(FrameWaitBudget::new());
 fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {
+            if p.bvh_traversal.load(Ordering::Acquire) && !super::real::bvh_traversal_allowed() {
+                return p.stand(pso);
+            }
             if !p.sent.swap(true, Ordering::AcqRel) {
                 enqueue(p.clone());
             }
@@ -1679,5 +1712,18 @@ mod pso_queue_tests {
         b.record(2, std::time::Duration::from_millis(12));
         b.record(1, std::time::Duration::from_millis(5));
         assert_eq!(b.remaining(2, cap), std::time::Duration::from_millis(12));
+    }
+
+    #[test]
+    fn submit_gated_maps_driver_without_pending_or_enqueue() {
+        let standin = 0x7E57_9A7Eu64 as usize;
+        let driver = 0x7E57_D12Eu64 as usize;
+        submit_gated(standin, driver);
+        assert!(!is_pending(standin), "gated stand-in must not appear pending");
+        assert_eq!(resolve(standin), driver);
+        assert_eq!(resolve_wait(standin), driver);
+        assert_eq!(resolve_for_bind(standin), driver);
+        assert_eq!(released(standin), 0);
+        assert_eq!(resolve(standin), standin);
     }
 }
