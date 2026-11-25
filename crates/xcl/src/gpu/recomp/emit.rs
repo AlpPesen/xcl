@@ -17,6 +17,8 @@ pub(super) enum Flow {
 }
 
 pub(super) struct Em {
+    /// whole-wave reductions (`wave32_reductions`)
+    pub reductions: super::Reductions,
     opt: Options,
     out: String,
     pub indent: usize,
@@ -592,6 +594,7 @@ impl Em {
     pub fn new(opt: Options) -> Self {
         Em {
             opt,
+            reductions: Default::default(),
             out: String::new(),
             indent: 1,
             sgprs: BTreeSet::new(),
@@ -1266,6 +1269,7 @@ impl Em {
             *self.ignored.entry(name).or_default() += 1;
             return Flow::Next;
         }
+        let seed = self.reductions.seeds.get(&d.pc).copied();
         let r = match d.enc.name {
             "ENC_SOPP" => return self.sopp(d, &name, next),
             "ENC_SOP1" | "ENC_SOP2" | "ENC_SOPC" | "ENC_SOPK" => self.salu(d, &name),
@@ -1281,6 +1285,10 @@ impl Em {
         };
         if let Err(why) = r {
             self.unsupported(d, why);
+        }
+        if let Some(v) = seed {
+            let v = self.vreg(v);
+            self.line(&format!("uint xcl_seed_{:x} = {v};", d.pc));
         }
         Flow::Next
     }
@@ -4001,6 +4009,12 @@ impl Em {
             }
             "v_readlane_b32" => {
                 let t = self.t();
+                // the end of a whole-wave reduction (`wave32_reductions`)
+                if let Some((seed, op)) = self.reductions.reads.get(&d.pc) {
+                    self.line(&format!("uint {t} = xcl_red_{op}(xcl_seed_{seed:x});"));
+                    self.write32(&dst, &t);
+                    return Ok(());
+                }
                 let rla = self.rla_uniform_fn();
                 let read = format!("{rla}({a}, {b} & {wmask}u)");
                 // wave64 VS / PS (`upper_lanes`): in a 32-lane wave, lanes 32..63 without a lane
@@ -4753,6 +4767,9 @@ impl Em {
         h.push_str(PRELUDE);
         if matches!(self.opt.mode, Mode::Pixel(_)) {
             h.push_str(PRELUDE_PIXEL);
+        }
+        if !self.reductions.reads.is_empty() {
+            h.push_str(PRELUDE_REDUCE);
         }
         if self.x64() {
             self.x64_prelude(&mut h);
@@ -6107,6 +6124,41 @@ void xcl_s_barrier() {
     }
     if (WaveReadLaneFirst(_ok) == 0u) xcl_bar_alive = false;
     GroupMemoryBarrier();
+}
+"#;
+
+/// Whole-wave reductions of wave32 VS / PS programs (`wave32_reductions`). The console's combine
+/// the lanes through DPP and permlane steps that pass partial results through lanes that were
+/// never launched (`s_or_saveexec -1` runs them); here those lanes do not exist and the steps
+/// read 0 from them, so a wave that is not full lost the words of live lanes. The lanes of each
+/// half of a 64-lane wave are a console wave of their own. A helper lane is in no wave
+/// operation and gets the result of a live lane of its quad (every quad has one).
+const PRELUDE_REDUCE: &str = r#"
+uint xcl_red_share(uint r) {
+#ifdef XCL_PIXEL
+    uint hw = WaveGetLaneIndex();
+    uint nib = (WaveActiveBallot(true)[hw >> 5] >> (hw & 28u)) & 15u;
+    uint q0 = QuadReadLaneAt(r, 0u), q1 = QuadReadLaneAt(r, 1u), q2 = QuadReadLaneAt(r, 2u), q3 = QuadReadLaneAt(r, 3u);
+    uint k = firstbitlow(nib);
+    r = (k & 2u) != 0u ? ((k & 1u) != 0u ? q3 : q2) : ((k & 1u) != 0u ? q1 : q0);
+#endif
+    return r;
+}
+uint xcl_red_or(uint x) {
+    uint a = WaveActiveBitOr(select(xcl_half == 0u, x, 0u)), b = WaveActiveBitOr(select(xcl_half == 0u, 0u, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+uint xcl_red_max(uint x) {
+    uint a = WaveActiveMax(select(xcl_half == 0u, x, 0u)), b = WaveActiveMax(select(xcl_half == 0u, 0u, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+uint xcl_red_and(uint x) {
+    uint a = WaveActiveBitAnd(select(xcl_half == 0u, x, 0xFFFFFFFFu)), b = WaveActiveBitAnd(select(xcl_half == 0u, 0xFFFFFFFFu, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+uint xcl_red_min(uint x) {
+    uint a = WaveActiveMin(select(xcl_half == 0u, x, 0xFFFFFFFFu)), b = WaveActiveMin(select(xcl_half == 0u, 0xFFFFFFFFu, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
 }
 "#;
 
