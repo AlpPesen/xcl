@@ -5849,14 +5849,16 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
     let mut s = String::new();
     if let Some(coherent) = heap {
         // one access: window k is descriptor MEM_HEAP_BASE + k; an `xcl_w` outside the windows
-        // does what the switch's `default` does
-        let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
-        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] if (xcl_w >= {windows}u) {{ return uint4(0u, 0u, 0u, 0u); }} XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
-        for (ret, name, params, args, def) in sigs {
+        // takes the null view at MEM_HEAP_NULL, which does what the switch's `default` does. No
+        // branch: a guard gives each access two paths, exploding basic blocks and handle PHIs in
+        // large HLSL pixel shaders and causing drivers to stall or reject them (#1695).
+        let null = super::MEM_HEAP_NULL - super::MEM_HEAP_BASE;
+        let index = if windows >= null { format!("min(xcl_w, {null}u)") } else { format!("select(xcl_w < {windows}u, xcl_w, {null}u)") };
+        let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + {index})]", super::MEM_HEAP_BASE);
+        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
+        for (ret, name, params, args, _) in sigs {
             let r = if ret == "void" { "" } else { "return " };
-            // (the switch's `break` leaves the accessor)
-            let outside = def.replace("break;", "return;");
-            let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ [branch] if (xcl_w >= {windows}u) {{ {outside} }} XCL_MW; {r}m.{name}({args}); }}");
+            let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ XCL_MW; {r}m.{name}({args}); }}");
         }
         return s;
     }

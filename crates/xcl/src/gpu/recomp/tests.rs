@@ -4061,23 +4061,30 @@ fn gpu_mesh_mode_reads_memory_windows() {
 /// accesses in window 0.
 #[test]
 fn gpu_memory_windows_above_4_gib() {
-    memory_windows_above_4_gib(false);
+    memory_windows_above_4_gib(2, false);
 }
 
 /// The same program with the windows taken from the descriptor heap (`Options::heap_windows`):
 /// same results, and no `switch` over windows in the HLSL.
 #[test]
 fn gpu_memory_windows_from_the_heap() {
-    memory_windows_above_4_gib(true);
+    memory_windows_above_4_gib(2, true);
 }
 
-fn memory_windows_above_4_gib(heap: bool) {
+#[test]
+fn gpu_memory_windows_beyond_the_root_uavs() {
+    for windows in [8, 16] {
+        memory_windows_above_4_gib(windows, true);
+    }
+}
+
+fn memory_windows_above_4_gib(windows: usize, heap: bool) {
     if !gpu_ready() {
         return;
     }
-    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
-    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
-    assert_eq!(w1 - w0, 1 << 32);
+    let arena = crate::gpu::uma::Uma::with_windows(windows, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(windows - 1).0 as u64);
+    assert_eq!(w1 - w0, ((windows - 1) as u64) << 32);
     let word = |a: u64| unsafe { &mut *(a as *mut u32) };
     *word(w1 + 0x1000) = 0xC0FFEE;
     *word(w1 + 0x1004) = 0x1234;
@@ -4102,12 +4109,18 @@ fn memory_windows_above_4_gib(heap: bool) {
     let p = prog(&refs);
     let one = translate(&p, &Options::default()).unwrap();
     assert!(!one.hlsl.contains("mem1") && !one.hlsl.contains("xcl_w =") && !one.hlsl.contains("xcl_m"), "one window: the single-window HLSL");
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: windows as u32, heap_windows: heap, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
     assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
-    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(4u + xcl_w)]"), heap);
     let hlsl_dxil = || super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
-    let dxil = direct_or(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() }), hlsl_dxil());
+    let dxil = if windows > 4 && runner::direct_dxil() {
+        crate::gpu::dxil::kernel::translate(&p, crate::gpu::dxil::kernel::KernelOptions {
+            wave64: true, split: runner::split_wave64(),
+            mem_windows: windows as u32 | super::HEAP_WINDOWS, sampler_base: 0,
+        }).expect("expanded direct DXIL")
+    } else {
+        direct_or(&p, &on_gpu(Options { mem_windows: windows as u32, heap_windows: heap, ..Default::default() }), hlsl_dxil())
+    };
     let hi = |a: u64| (a >> 32) as u32;
     let mut st = KernelState::default();
     st.sgpr[2..4].copy_from_slice(&[(w1 + 0x1000) as u32, hi(w1)]);
@@ -4136,6 +4149,12 @@ fn memory_windows_above_4_gib(heap: bool) {
     }
     assert_eq!(*word(w1 + 0x6000), 64, "global_atomic_add in window 1");
     assert_eq!(*word(w0 + 0x6000), 0, "nothing in window 0 at the same low address");
+    if heap {
+        let null = super::MEM_HEAP_NULL - super::MEM_HEAP_BASE;
+        let index = if windows as u32 >= null { format!("min(xcl_w, {null}u)") } else { format!("select(xcl_w < {windows}u, xcl_w, {null}u)") };
+        assert!(t.hlsl.contains(&format!("ResourceDescriptorHeap[NonUniformResourceIndex({}u + {index})]", super::MEM_HEAP_BASE)));
+        assert!(!t.hlsl.contains("if (xcl_w"), "heap windows: no branch around an access");
+    }
 }
 
 /// Out-of-UMA addresses must NEVER alias onto live UMA windows via `& 3`:
@@ -4148,24 +4167,33 @@ fn memory_windows_above_4_gib(heap: bool) {
 ///   on `global_load`/`global_store` updates the target window accurately.
 #[test]
 fn gpu_memory_windows_reject_out_of_uma_aliasing() {
-    memory_windows_reject_out_of_uma_aliasing(false);
+    memory_windows_reject_out_of_uma_aliasing(false, 2);
 }
 
 /// The same with the windows taken from the descriptor heap (`Options::heap_windows`): an
 /// address outside them reads 0 and drops its stores and atomics there too.
 #[test]
 fn gpu_heap_windows_reject_out_of_uma_aliasing() {
-    memory_windows_reject_out_of_uma_aliasing(true);
+    memory_windows_reject_out_of_uma_aliasing(true, 2);
 }
 
-fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
+/// Cover partial and complete expanded layouts; the full layout uses the min-index path.
+#[test]
+fn gpu_heap_windows_reject_out_of_uma_aliasing_all_slots() {
+    for windows in [4, 8, 16] {
+        memory_windows_reject_out_of_uma_aliasing(true, windows);
+    }
+}
+
+fn memory_windows_reject_out_of_uma_aliasing(heap: bool, windows: u32) {
     if !gpu_ready() {
         return;
     }
-    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let arena = crate::gpu::uma::Uma::with_windows(windows as usize, 1 << 20).unwrap();
     let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
     assert_eq!(w1 - w0, 1 << 32);
     let base_hi = (w0 >> 32) as u32;
+    let outside = windows.max(4);
     assert!(base_hi >= 4);
     let word = |a: u64| unsafe { &mut *(a as *mut u32) };
 
@@ -4212,17 +4240,23 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     ];
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let p = prog(&refs);
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: windows, heap_windows: heap, ..Default::default() })).unwrap();
     assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap);
     let hlsl_dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
-    let dxil = direct_or(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() }), hlsl_dxil);
+    let dxil = if windows > 4 && runner::direct_dxil() {
+        crate::gpu::dxil::kernel::translate(&p, crate::gpu::dxil::kernel::KernelOptions {
+            wave64: true, split: runner::split_wave64(), mem_windows: windows | super::HEAP_WINDOWS, sampler_base: 0,
+        }).expect("expanded direct DXIL")
+    } else {
+        direct_or(&p, &on_gpu(Options { mem_windows: windows, heap_windows: heap, ..Default::default() }), hlsl_dxil)
+    };
 
     let mut st = KernelState::default();
-    st.sgpr[2..4].copy_from_slice(&[0x1000, base_hi + 4]); // s[2:3]: out-of-UMA hi = base_hi + 4
+    st.sgpr[2..4].copy_from_slice(&[0x1000, base_hi + outside]); // s[2:3]: out-of-UMA hi = base_hi + outside
     st.sgpr[4..6].copy_from_slice(&[0x4000, 0]); // s[4:5]: hi == 0 32-bit descriptor read
-    st.sgpr[8..12].copy_from_slice(&[0x1000, ((base_hi + 5) & 0xFFFF) | (4 << 16), 64, 0]); // out-of-UMA V# (aliases w1 under & 3)
+    st.sgpr[8..12].copy_from_slice(&[0x1000, ((base_hi + outside + 1) & 0xFFFF) | (4 << 16), 64, 0]); // out-of-UMA V# (aliases w1 under & 3)
     st.sgpr[12..16].copy_from_slice(&[0x5000, ((base_hi + 1) & 0xFFFF) | (4 << 16), 64, 0]); // valid strided V# in w1
-    st.sgpr[16..20].copy_from_slice(&[0x3000, ((base_hi + 4) & 0xFFFF) | (4 << 16), 64, 0]); // out-of-UMA atomic V# (aliases w0 under & 3)
+    st.sgpr[16..20].copy_from_slice(&[0x3000, ((base_hi + outside) & 0xFFFF) | (4 << 16), 64, 0]); // out-of-UMA atomic V# (aliases w0 under & 3)
     st.sgpr[20..22].copy_from_slice(&[0xFFFF_FFF0, base_hi]); // carry base
     st.sgpr[22..24].copy_from_slice(&[0, base_hi]); // borrow base (0 - 16 borrows into base_hi - 1)
     for r in st.vgpr.iter_mut() {
@@ -4233,11 +4267,11 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
         r[11] = 0x7777_7777;
         r[14] = 0xBAD0_DEAD;
         r[4] = 0x1000;
-        r[5] = base_hi + 4; // out-of-UMA global_store (aliases w0 under & 3)
+        r[5] = base_hi + outside; // out-of-UMA global_store (aliases w0 under & 3)
         r[6] = 0x2000;
         r[7] = 0; // hi == 0 global_store (null pointer -> must be dropped)
         r[8] = 0x2000;
-        r[9] = base_hi + 5; // out-of-UMA global_atomic_add (aliases w1 under & 3)
+        r[9] = base_hi + outside + 1; // out-of-UMA global_atomic_add (aliases w1 under & 3)
         r[12] = 0x3000;
         r[13] = 0xFFFF_FFFF; // out-of-UMA global_atomic_inc CAS loop
         r[16] = 0x20; // carry offset: 0xFFFF_FFF0 + 0x20 = 0x1_0000_0010 -> w1 + 0x10
