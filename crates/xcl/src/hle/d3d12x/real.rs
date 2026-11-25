@@ -3141,10 +3141,47 @@ macro_rules! creator {
             }
             if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
                 adopt(*ppv, $kind);
+                if $method.starts_with("CreateCommittedResource") {
+                    note_committed(this, *ppv);
+                }
             }
             hr
         }
     };
+}
+
+/// local: what was committed (resources of their own heap), by shape: (heap type, dimension,
+/// width, height, format) -> (made, bytes)
+static COMMITTED: Mutex<Option<HashMap<(i32, i32, u64, u32, i32), (u64, u64)>>> = Mutex::new(None);
+
+unsafe fn note_committed(dev: *mut c_void, res: *mut c_void) {
+    let (Some(dev), Some(r)) = (ID3D12Device::from_raw_borrowed(&dev), ID3D12Resource::from_raw_borrowed(&res)) else { return };
+    let d = r.GetDesc();
+    let (mut props, mut flags) = (D3D12_HEAP_PROPERTIES::default(), D3D12_HEAP_FLAGS::default());
+    let _ = r.GetHeapProperties(Some(&mut props), Some(&mut flags));
+    let bytes = dev.GetResourceAllocationInfo(0, &[d]).SizeInBytes;
+    let mut g = COMMITTED.lock().unwrap();
+    let e = g.get_or_insert_with(HashMap::new).entry((props.Type.0, d.Dimension.0, d.Width, d.Height, d.Format.0)).or_default();
+    e.0 += 1;
+    if bytes != u64::MAX {
+        e.1 += bytes;
+    }
+}
+
+/// local: the committed shapes that were made since the last report, biggest first
+pub fn committed_report() -> Option<String> {
+    static LAST: Mutex<Option<HashMap<(i32, i32, u64, u32, i32), (u64, u64)>>> = Mutex::new(None);
+    let now = COMMITTED.lock().unwrap().clone()?;
+    let mut last = LAST.lock().unwrap();
+    let before = last.replace(now.clone()).unwrap_or_default();
+    let mut d: Vec<_> = now.iter().map(|(k, v)| (k, v.0 - before.get(k).map_or(0, |b| b.0), v.1 - before.get(k).map_or(0, |b| b.1))).filter(|x| x.1 > 0).collect();
+    d.sort_by_key(|x| std::cmp::Reverse(x.2));
+    let total: u64 = d.iter().map(|x| x.2).sum();
+    if total < 64 << 20 {
+        return None;
+    }
+    let top: Vec<String> = d.iter().take(6).map(|(k, n, b)| format!("{n}x heap {} dim {} {}x{} fmt {}: {} MB", k.0, k.1, k.2, k.3, k.4, b >> 20)).collect();
+    Some(format!("{} MB in {} resources: {}", total >> 20, d.iter().map(|x| x.1).sum::<u64>(), top.join("; ")))
 }
 
 creator!(dev_create_command_queue, "CreateCommandQueue", Kind::CommandQueue, [a1]);

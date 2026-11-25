@@ -465,6 +465,13 @@ unsafe fn shared_record_buffer(dev: &ID3D12Device, need: u64) -> Result<(ID3D12R
 /// The record buffer of this list for `need_bytes` (at most 128 MiB): buffer, address, bytes.
 unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64, u64), String> {
     let need = need_bytes.max(4 << 20).next_multiple_of(1 << 20).min(128 << 20);
+    {
+        // local: which way the records go, once each
+        static SAID: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
+        let one = one_direct_queue();
+        let on = shared_records_on();
+        SAID[(on && one) as usize].call_once(|| crate::xlog_info!("D3D12.X: two-pass records: {} (switch {on}, one direct queue {one})", if on && one { "shared" } else { "a buffer of each list" }));
+    }
     if shared_records_on() && one_direct_queue() {
         let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
         let (buf, cap) = shared_record_buffer(&dev, need)?;

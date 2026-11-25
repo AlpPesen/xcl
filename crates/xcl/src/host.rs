@@ -70,6 +70,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
+                if let Some(t) = crate::hle::d3d12x::real::committed_report() {
+                    crate::xlog_info!("committed since the last line: {t}");
+                }
                 let mb = |b: u64| b >> 20;
                 crate::xlog_info!(
                     "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
