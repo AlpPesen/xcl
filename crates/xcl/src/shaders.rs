@@ -1204,10 +1204,13 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
 /// (the > 8 MB HLSL programs DXC compiles at `-O0`, #1269).
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    library: Option<crate::hle::d3d12x::pso_library::MmapPipelineLibrary>,
     signatures: Mutex<std::collections::HashMap<(bool, Vec<u32>), windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     made: AtomicUsize,
     refused: AtomicUsize,
     reused: AtomicUsize,
+    lib_reused: AtomicUsize,
+    lib_stored: AtomicUsize,
     split_programs: AtomicUsize,
     split_pieces: AtomicUsize,
     /// programs over `max_dxil` with no blob yet, and their DXIL bytes
@@ -1241,6 +1244,17 @@ mod pipeline_cap_tests {
         assert_eq!(pipeline_cap_kb(Some("0")), 0);
         // not a number: the default, not a crash
         assert_eq!(pipeline_cap_kb(Some("off")), 8192);
+    }
+
+    #[test]
+    fn offline_pipeline_library_key_matches_runtime_standard_and_split_keys() {
+        let dxil = b"DXBC-offline-precompile-test";
+        let samplers = [([1u32, 2, 3, 4], false)];
+        let std_key = crate::hle::d3d12x::real::compute_library_key(dxil, &samplers, 0, false);
+        let split_key = crate::hle::d3d12x::real::compute_library_key(dxil, &samplers, 0, true);
+        assert!(std_key.starts_with("c-"));
+        assert_eq!(split_key, format!("s{std_key}"));
+        assert_ne!(std_key, split_key);
     }
 
     #[test]
@@ -1417,16 +1431,25 @@ impl Pipelines {
         unsafe {
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
             let sel = crate::gpu::adapter::Selector::from_env_or("auto");
-            let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+            let (adapter, desc) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
+            // Match `real::init`'s adapter string verbatim so offline `--precompile --pipelines`
+            // opens and populates the exact same `pso-library/<hash>/gen-*.plib` directory.
+            let adapter_name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+            let library = (!cfg!(test))
+                .then(|| crate::hle::d3d12x::pso_library::MmapPipelineLibrary::open_or_create(&dev, &adapter_name))
+                .flatten();
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
             let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
             Ok(Pipelines {
                 dev,
+                library,
                 signatures: Mutex::new(Default::default()),
                 made: AtomicUsize::new(0),
                 refused: AtomicUsize::new(0),
                 reused: AtomicUsize::new(0),
+                lib_reused: AtomicUsize::new(0),
+                lib_stored: AtomicUsize::new(0),
                 split_programs: AtomicUsize::new(0),
                 split_pieces: AtomicUsize::new(0),
                 capped: AtomicUsize::new(0),
@@ -1507,6 +1530,22 @@ impl Pipelines {
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
             ..Default::default()
         };
+        let lib_key = crate::hle::d3d12x::real::compute_library_key(dxil, samplers, desc.Flags.0, chained);
+        let has_override = path_override.is_some();
+        if !has_override {
+            if let Some(lib) = self.library.as_ref() {
+                if unsafe { lib.load_compute(&lib_key, &desc) }.is_some() {
+                    self.lib_reused.fetch_add(1, Ordering::Relaxed);
+                    self.reused.fetch_add(1, Ordering::Relaxed);
+                    let done = self.made.fetch_add(1, Ordering::Relaxed) + 1;
+                    drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                    if done % 25 == 0 {
+                        eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
+                    }
+                    return;
+                }
+            }
+        }
         use crate::hle::d3d12x::real::driver_cache;
         let path = path_override.or_else(|| {
             #[cfg(test)]
@@ -1575,12 +1614,25 @@ impl Pipelines {
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
         let done = match r {
-            Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
+            Ok(pso) => {
+                if !has_override {
+                    if let Some(lib) = self.library.as_ref() {
+                        if unsafe { lib.store(&lib_key, &pso) } {
+                            self.lib_stored.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                self.made.fetch_add(1, Ordering::Relaxed) + 1
+            }
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
         };
         if done % 25 == 0 {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
         }
+    }
+
+    fn flush(&self) -> Option<PathBuf> {
+        unsafe { self.library.as_ref()?.flush() }
     }
 }
 
@@ -1726,8 +1778,19 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         println!("compute programs passed over (no earlier run used their pipeline): {}", unused.into_inner());
     }
     if let Some(p) = pipelines {
+        let saved_plib = p.flush();
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
+        let lib_reused = p.lib_reused.load(Ordering::Relaxed);
+        let lib_stored = p.lib_stored.load(Ordering::Relaxed);
+        if lib_reused != 0 || lib_stored != 0 || saved_plib.is_some() {
+            println!(
+                "pipeline library (.plib): {} loaded, {} stored{}",
+                lib_reused,
+                lib_stored,
+                saved_plib.as_ref().map_or_else(String::new, |path| format!(" -> {}", path.display()))
+            );
+        }
         let split_programs = p.split_programs.load(Ordering::Relaxed);
         if split_programs != 0 {
             println!("split compute programs: {} ({} pieces)", split_programs, p.split_pieces.load(Ordering::Relaxed));

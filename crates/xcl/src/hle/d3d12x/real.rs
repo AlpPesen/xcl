@@ -10189,6 +10189,19 @@ pub fn flush_pipeline_library() {
     pso_lib::flush_now();
 }
 
+/// Deterministic cross-run `.plib` key for a translated compute pipeline (`c-...` for standard
+/// 6-parameter ABI root signatures, `sc-...` for 8-parameter `dispatch_chain` root signatures),
+/// shared between runtime PSO creation and offline `xcl shaders --precompile --pipelines`.
+pub(crate) fn compute_library_key(
+    dxil: &[u8],
+    samplers: &[crate::gpu::recomp::pso::StaticSampler],
+    flags: i32,
+    chained: bool,
+) -> String {
+    let key = pso_lib::compute_key(dxil, samplers, flags);
+    if chained { format!("s{key}") } else { key }
+}
+
 /// Runtime wiring for `pso_library::MmapPipelineLibrary`: deterministic cross-run pipeline keys,
 /// kept-open per-device library lookup, load/store helpers, and debounced background generational
 /// persistence (zero heap copy, never replaces an actively mapped `.plib`).
