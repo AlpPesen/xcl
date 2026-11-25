@@ -1961,8 +1961,24 @@ fn note_compute_threads(pso: usize, cs: &[u8]) {
     }
 }
 
+/// Compute shaders that feed RT ray-tracing passes without directly issuing
+/// `image_bvh*_intersect_ray` (e.g. giant screen-probe ray-activation passes). Gating them
+/// alongside BVH traversal under `XCL_RT_GATE` avoids >100 s compile freezes on world entry
+/// and prevents them from clearing lighting/shadow/reflection buffers before RT traversal is ready.
+const RT_COMPANION_CS_HASHES: &[u64] = &[
+    0x95cc_1328_8a27_a96e,
+];
+
+fn is_rt_gated_cs_hash(hash: u64) -> bool {
+    RT_COMPANION_CS_HASHES.contains(&hash)
+}
+
+fn is_rt_gated_cs(cs: &[u8]) -> bool {
+    is_rt_gated_cs_hash(crate::gpu::shader::fnv64(cs)) || crate::gpu::effects::uses_bvh_intersect(cs)
+}
+
 fn note_bvh_traversal(pso: usize, cs: &[u8]) {
-    if pso != 0 && crate::gpu::effects::uses_bvh_intersect(cs) {
+    if pso != 0 && is_rt_gated_cs(cs) {
         BVH_TRAVERSAL_PSOS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
     }
 }
@@ -4609,6 +4625,8 @@ mod big_compile_tests {
         assert!(std::ptr::eq(compile_slots(GIANT_DRIVER_COMPILE - 1), &BIG_COMPILES));
         assert!(std::ptr::eq(compile_slots(GIANT_DRIVER_COMPILE), &GIANT_COMPILES));
         assert!(std::ptr::eq(compile_slots(1_061_720), &GIANT_COMPILES));
+        assert!(is_rt_gated_cs_hash(0x95cc_1328_8a27_a96e));
+        assert!(!is_rt_gated_cs_hash(0xef5e_ce92_2dc3_3bfe));
     }
 
     #[test]
@@ -6183,7 +6201,7 @@ unsafe fn go_background(
     // a big compute program that writes nothing but images: binds can go on without it
     let big_image_only = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
     let image_only = big_image_only && super::pso_async::image_skip();
-    let bvh_trav = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::uses_bvh_intersect(b)));
+    let bvh_trav = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| is_rt_gated_cs(b)));
     let heavy_compute = compute
         && super::pso_async::async_heavy_compute()
         && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::compute_code_len(b).is_some_and(|n| n >= crate::gpu::effects::HEAVY_CODE)));
