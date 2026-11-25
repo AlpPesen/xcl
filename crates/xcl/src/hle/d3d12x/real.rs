@@ -9164,7 +9164,11 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
-        let _ = super::alloc_pool::note_resubmits(this, chunk);
+        // a list still on the GPU from its previous submit: that one first (the PC does not take
+        // a list again before then)
+        if super::alloc_pool::note_resubmits(this, chunk) > 0 {
+            super::alloc_pool::wait_for_previous_submits(chunk);
+        }
         f(this, chunk.len() as u32, chunk.as_ptr());
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
