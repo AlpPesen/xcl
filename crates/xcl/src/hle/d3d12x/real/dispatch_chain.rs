@@ -223,16 +223,46 @@ fn scratch_bytes(needed: u64, group: u64, budget: u64, had: Option<u64>, live: u
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScratchOomFallback {
+    /// Reuse the recording's existing scratch buffer (running smaller slabs).
+    ReuseExisting,
+    /// Allocate a minimal 1-workgroup scratch buffer instead of falling back to `Chain::whole()`.
+    TryMinimal(u64),
+    /// Neither existing reuse nor a smaller allocation is viable.
+    None,
+}
+
+/// Choose a smaller-slab fallback when growing `scratch_buffer` fails under VRAM pressure.
+fn scratch_oom_fallback(had_bytes: Option<u64>, attempted: u64, group: u64) -> ScratchOomFallback {
+    if had_bytes.is_some_and(|h| h >= group) {
+        ScratchOomFallback::ReuseExisting
+    } else if attempted > group {
+        ScratchOomFallback::TryMinimal(group)
+    } else {
+        ScratchOomFallback::None
+    }
+}
+
 /// A scratch for a chain of `needed` bytes recorded on `list` with `allocator`, and whether a
 /// chain before it on the list used it.
 unsafe fn scratch_for(dev: &ID3D12Device, list: usize, allocator: usize, needed: u64, group: u64) -> Option<(Arc<Scratch>, bool)> {
     let had = SHARED.lock().unwrap().get(&list).filter(|s| s.0 == allocator).and_then(|s| s.1.upgrade());
-    let (bytes, make) = scratch_bytes(needed, group, scratch_budget(), had.as_ref().map(|s| s.bytes), LIVE.load(Ordering::Relaxed), scratch_total());
+    let had_bytes = had.as_ref().map(|s| s.bytes);
+    let (bytes, make) = scratch_bytes(needed, group, scratch_budget(), had_bytes, LIVE.load(Ordering::Relaxed), scratch_total());
     if !make {
         return had.map(|s| (s, true));
     }
-    let s = Arc::new(Scratch { buffer: scratch_buffer(dev, bytes)?, bytes });
-    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    let (buffer, actual) = match scratch_buffer(dev, bytes) {
+        Some(b) => (b, bytes),
+        None => match scratch_oom_fallback(had_bytes, bytes, group) {
+            ScratchOomFallback::ReuseExisting => return had.map(|s| (s, true)),
+            ScratchOomFallback::TryMinimal(min_bytes) => (scratch_buffer(dev, min_bytes)?, min_bytes),
+            ScratchOomFallback::None => return None,
+        },
+    };
+    let s = Arc::new(Scratch { buffer, bytes: actual });
+    let live = LIVE.fetch_add(actual, Ordering::Relaxed) + actual;
     PEAK.fetch_max(live, Ordering::Relaxed);
     SHARED.lock().unwrap().insert(list, (allocator, Arc::downgrade(&s)));
     Some((s, false))
@@ -318,5 +348,19 @@ mod tests {
     fn whole_nonblocking_returns_not_split_for_unknown_pso() {
         assert!(matches!(unsafe { super::whole_nonblocking(0) }, super::WholeStatus::NotSplit));
         assert!(matches!(unsafe { super::whole_nonblocking(0x7800_0001) }, super::WholeStatus::NotSplit));
+    }
+
+    #[test]
+    fn scratch_oom_fallback_reuses_existing_or_shrinks_to_one_group() {
+        use super::{scratch_oom_fallback, ScratchOomFallback};
+        let group = 256 << 10;
+        // Existing list scratch fits >= 1 group: reuse it with smaller slabs instead of Chain::whole.
+        assert_eq!(scratch_oom_fallback(Some(2 * MB), 64 * MB, group), ScratchOomFallback::ReuseExisting);
+        assert_eq!(scratch_oom_fallback(Some(group), 64 * MB, group), ScratchOomFallback::ReuseExisting);
+        // No usable existing scratch, attempted > 1 group: shrink to minimal 1-group scratch.
+        assert_eq!(scratch_oom_fallback(None, 64 * MB, group), ScratchOomFallback::TryMinimal(group));
+        assert_eq!(scratch_oom_fallback(Some(group - 1), 4 * MB, group), ScratchOomFallback::TryMinimal(group));
+        // Already attempted minimal 1-group allocation with no usable existing scratch: give up.
+        assert_eq!(scratch_oom_fallback(None, group, group), ScratchOomFallback::None);
     }
 }
