@@ -4889,8 +4889,22 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
         }
     }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
+    let water_dst = if d.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
+        && d.Anonymous.SubresourceIndex == 0
+        && x == 0
+        && y == 0
+        && z == 0
+        && bx.is_null()
+    {
+        transmute_copy::<_, usize>(&d.pResource)
+    } else {
+        0
+    };
     if !super::format_alias::try_copy_texture_region(this, &d, x, y, z, &s, bx) {
         pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
+    }
+    if water_dst != 0 {
+        maybe_enqueue_water_readback(this, water_dst);
     }
     std::mem::forget((d, s)); // borrowed resource pointers
 }
@@ -5023,6 +5037,57 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode)
 }
 
+/// If `dst` is a tracked 256×256 `R32_FLOAT` / `R32G32_FLOAT` placed ocean height/displacement
+/// texture, copy subresource 0 into a pooled `READBACK` buffer and queue asynchronous XOR-swizzled
+/// writeback into console memory on `xcl-cpu-writes` after this submission's GPU fence completes.
+unsafe fn maybe_enqueue_water_readback(this: *mut c_void, dst: usize) {
+    let Some(target) = super::cpu_writes::water_readback_target(dst) else { return };
+    if list_type(this) == D3D12_COMMAND_LIST_TYPE_BUNDLE {
+        return;
+    }
+    let Some(dev) = device_of(this) else { return };
+    let total_bytes = u64::from(target.row_pitch) * 256;
+    let Some(rb) = super::cpu_writes::take_water_readback_buf(&dev, total_bytes) else { return };
+    let Some(rb_res) = rb.buf.as_ref() else { return };
+    let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: transmute_copy(&dst),
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+    };
+    let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: transmute_copy(&rb_res.as_raw()),
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: target.format,
+                    Width: 256,
+                    Height: 256,
+                    Depth: 1,
+                    RowPitch: target.row_pitch,
+                },
+            },
+        },
+    };
+    transition(this, dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(
+        this,
+        PC_COPY_TEXTURE_REGION,
+    )(this, &dst_loc, 0, 0, 0, &src_loc, std::ptr::null());
+    transition(this, dst, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    std::mem::forget((src_loc, dst_loc)); // borrowed resource pointers
+    let mut g = LISTS.lock().unwrap();
+    let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
+    s.cpu_writes.push(super::cpu_writes::Write::ReadbackTexture {
+        dst_va: target.va,
+        format: target.format,
+        row_pitch: target.row_pitch,
+        tex: target.tex,
+        buf: rb,
+    });
+}
+
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
@@ -5033,10 +5098,11 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     }
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
-        if super::format_alias::try_copy_resource(this, dst, src) {
-            return;
+        if !super::format_alias::try_copy_resource(this, dst, src) {
+            pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
         }
-        return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+        maybe_enqueue_water_readback(this, dst);
+        return;
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
     copy_buffer_region_x(this, dst, 0, src, 0, n);

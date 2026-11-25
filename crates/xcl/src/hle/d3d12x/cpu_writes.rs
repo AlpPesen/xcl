@@ -10,13 +10,148 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32_FLOAT};
 use windows_sys::Win32::System::Threading as th;
+
+use crate::hle::xg;
+
+/// `XCL_WATER_READBACK=0`: disable GPU->UMA readback of 256×256 `R32_FLOAT` / `R32G32_FLOAT`
+/// placed ocean height/displacement textures.
+pub(super) fn water_readback_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_WATER_READBACK").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Whether `desc` is a 256×256 single-mip 2D `R32_FLOAT` or `R32G32_FLOAT` texture (ocean
+/// heightmap / displacement readback target used by CPU boat/water physics).
+pub(super) fn is_water_readback_desc(desc: &D3D12_RESOURCE_DESC) -> bool {
+    desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.Width == 256
+        && desc.Height == 256
+        && desc.DepthOrArraySize == 1
+        && desc.MipLevels == 1
+        && desc.SampleDesc.Count <= 1
+        && matches!(desc.Format, DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R32G32_FLOAT)
+}
+
+#[derive(Clone)]
+pub(super) struct WaterTarget {
+    pub va: usize,
+    pub format: DXGI_FORMAT,
+    pub row_pitch: u32,
+    pub tex: Arc<xg::Texture>,
+}
+
+static WATER_TARGETS: Mutex<Option<HashMap<usize, WaterTarget>>> = Mutex::new(None);
+static HAS_WATER_TARGETS: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn has_water_readback() -> bool {
+    HAS_WATER_TARGETS.load(Ordering::Acquire)
+}
+
+pub(super) fn register_water_readback(res: usize, va: usize, format: DXGI_FORMAT, tex: Arc<xg::Texture>) {
+    if !water_readback_enabled() || res == 0 || va == 0 {
+        return;
+    }
+    let row_pitch = match format {
+        DXGI_FORMAT_R32_FLOAT => 256 * 4,
+        DXGI_FORMAT_R32G32_FLOAT => 256 * 8,
+        _ => return,
+    };
+    WATER_TARGETS.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+        res,
+        WaterTarget { va, format, row_pitch, tex },
+    );
+    HAS_WATER_TARGETS.store(true, Ordering::Release);
+}
+
+pub(super) fn unregister_water_readback(res: usize) {
+    if !HAS_WATER_TARGETS.load(Ordering::Acquire) {
+        return;
+    }
+    let mut g = WATER_TARGETS.lock().unwrap();
+    if let Some(m) = g.as_mut() {
+        m.remove(&res);
+        if m.is_empty() {
+            HAS_WATER_TARGETS.store(false, Ordering::Release);
+        }
+    }
+}
+
+pub(super) fn water_readback_target(res: usize) -> Option<WaterTarget> {
+    if !water_readback_enabled() || !HAS_WATER_TARGETS.load(Ordering::Acquire) {
+        return None;
+    }
+    WATER_TARGETS.lock().unwrap().as_ref()?.get(&res).cloned()
+}
+
+/// Pooled persistently-mapped `READBACK` buffer returned to `FREE_WATER_RB` on drop once
+/// `xcl-cpu-writes` finishes swizzling the heightmap into console memory.
+pub(super) struct WaterReadbackBuf {
+    pub buf: Option<ID3D12Resource>,
+    pub mapped: usize,
+    pub bytes: u64,
+    pub dev_key: usize,
+}
+
+unsafe impl Send for WaterReadbackBuf {}
+unsafe impl Sync for WaterReadbackBuf {}
+
+const MAX_POOLED_WATER_RB: usize = 16;
+static FREE_WATER_RB: Mutex<Vec<(ID3D12Resource, usize, u64, usize)>> = Mutex::new(Vec::new());
+
+impl Drop for WaterReadbackBuf {
+    fn drop(&mut self) {
+        let Some(buf) = self.buf.take() else { return };
+        let mapped = std::mem::replace(&mut self.mapped, 0);
+        let mut free = FREE_WATER_RB.lock().unwrap();
+        if free.len() < MAX_POOLED_WATER_RB && mapped != 0 {
+            free.push((buf, mapped, self.bytes, self.dev_key));
+        } else if mapped != 0 {
+            unsafe { buf.Unmap(0, None) };
+        }
+    }
+}
+
+/// Acquire a persistently-mapped `READBACK` buffer of at least `bytes` bytes for `dev`.
+pub(super) unsafe fn take_water_readback_buf(dev: &ID3D12Device, bytes: u64) -> Option<Arc<WaterReadbackBuf>> {
+    let dev_key = dev.as_raw() as usize;
+    {
+        let mut free = FREE_WATER_RB.lock().unwrap();
+        if let Some(i) = free.iter().position(|(_, _, cap, d)| *d == dev_key && *cap >= bytes) {
+            let (buf, mapped, cap, d) = free.swap_remove(i);
+            return Some(Arc::new(WaterReadbackBuf { buf: Some(buf), mapped, bytes: cap, dev_key: d }));
+        }
+    }
+    let hp = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+        ..Default::default()
+    };
+    let mut rb: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).ok()?;
+    let rb = rb?;
+    let _ = rb.SetName(windows::core::w!("xcl water heightmap readback"));
+    let mut mapped = std::ptr::null_mut();
+    rb.Map(0, None, Some(&mut mapped)).ok()?;
+    if mapped.is_null() {
+        return None;
+    }
+    Some(Arc::new(WaterReadbackBuf { buf: Some(rb), mapped: mapped as usize, bytes, dev_key }))
+}
 
 /// A bottom-of-pipe write into memory outside unified memory, applied by the CPU once the
 /// queue's fence reaches the submission that recorded it.
@@ -28,6 +163,10 @@ pub(super) enum Write {
     /// (`src`), copied atomically to `va` once the queue's fence completes. Holding `_buf` keeps
     /// the mapping alive until the worker finishes.
     ReadbackU64 { va: usize, src: usize, _buf: ID3D12Resource },
+    /// A 256×256 `R32_FLOAT` / `R32G32_FLOAT` ocean height/displacement texture read back from
+    /// VRAM into a persistently mapped READBACK buffer, tiled back into console memory `dst_va`
+    /// with `tex.chain.tile_level` once the queue's fence completes.
+    ReadbackTexture { dst_va: usize, format: DXGI_FORMAT, row_pitch: u32, tex: Arc<xg::Texture>, buf: Arc<WaterReadbackBuf> },
 }
 
 struct Job {
@@ -76,6 +215,9 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                         Write::ReadbackU64 { va, src, .. } => {
                             let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
                             write_u64_now(*va, value);
+                        }
+                        Write::ReadbackTexture { dst_va, format, row_pitch, tex, buf } => {
+                            write_texture_now(*dst_va, *format, *row_pitch, tex, buf);
                         }
                     }
                 }
@@ -138,6 +280,97 @@ unsafe fn write_u64_now(va: usize, value: u64) {
 pub(super) unsafe fn max_u64_now(va: usize, value: u64) {
     if u64_writable_now(va) {
         (*(va as *const AtomicU64)).fetch_max(value, Ordering::AcqRel);
+    }
+}
+
+/// Whether the entire byte span `[va, va + bytes)` is committed, writable, and without `PAGE_GUARD`.
+unsafe fn range_writable_now(va: usize, bytes: usize) -> bool {
+    if va == 0 || bytes == 0 {
+        return false;
+    }
+    let Some(end) = va.checked_add(bytes) else { return false };
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
+        return true;
+    }
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
+    let mut cur = va;
+    while cur < end {
+        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(cur as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
+            return false;
+        }
+        if m.Protect & PAGE_GUARD != 0 || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 {
+            return false;
+        }
+        let region_end = (m.BaseAddress as usize).saturating_add(m.RegionSize);
+        if region_end <= cur {
+            return false;
+        }
+        cur = region_end;
+    }
+    true
+}
+
+fn main_surface(tex: &xg::Texture) -> Option<(usize, &xg::Surface)> {
+    let plane = tex.planes.get(tex.main)?;
+    let xg::PlaneKind::Surface(ref s) = plane.kind else { return None };
+    Some((plane.offset as usize, s))
+}
+
+/// Swizzle `linear` rows (`row_pitch` bytes per row, 256 rows) into Xbox console tiled layout
+/// inside `dst` using the main plane's `Surface::chain.tile_level`.
+fn tile_readback_into_slice(dst: &mut [u8], linear: &[u8], row_pitch: u32, tex: &xg::Texture) -> bool {
+    let Some((_, surface)) = main_surface(tex) else { return false };
+    let Some(l0) = surface.chain.levels.first() else { return false };
+    let bpe = surface.bpe as usize;
+    let packed_row = l0.width.saturating_mul(bpe);
+    let pitch = row_pitch as usize;
+    let slice_bytes = surface.chain.slice_bytes;
+    if packed_row == 0 || pitch < packed_row || slice_bytes == 0 || dst.len() < slice_bytes {
+        return false;
+    }
+    let Some(src_need) = pitch.checked_mul(l0.height) else { return false };
+    if linear.len() < src_need {
+        return false;
+    }
+    if pitch == packed_row {
+        surface.chain.tile_level(&mut dst[..slice_bytes], 0, 0, &linear[..src_need]);
+    } else {
+        let mut packed = Vec::with_capacity(packed_row * l0.height);
+        for row in 0..l0.height {
+            let start = row * pitch;
+            packed.extend_from_slice(&linear[start..start + packed_row]);
+        }
+        surface.chain.tile_level(&mut dst[..slice_bytes], 0, 0, &packed);
+    }
+    true
+}
+
+/// Write a completed GPU readback of a 256×256 ocean height/displacement texture back into
+/// console memory in its Xbox XOR-swizzled layout.
+unsafe fn write_texture_now(dst_va: usize, format: DXGI_FORMAT, row_pitch: u32, tex: &xg::Texture, buf: &WaterReadbackBuf) {
+    if buf.mapped == 0 {
+        return;
+    }
+    let Some((plane_off, surface)) = main_surface(tex) else { return };
+    let Some(target_va) = super::title_textures::mirror_source(dst_va).checked_add(plane_off) else { return };
+    let dst_bytes = surface.chain.slice_bytes;
+    if dst_bytes == 0 {
+        return;
+    }
+    let _open = crate::hle::kernelx::lazy::ensure(target_va, dst_bytes);
+    if !range_writable_now(target_va, dst_bytes) {
+        return;
+    }
+    let linear = std::slice::from_raw_parts(buf.mapped as *const u8, buf.bytes as usize);
+    let dst = std::slice::from_raw_parts_mut(target_va as *mut u8, dst_bytes);
+    if tile_readback_into_slice(dst, linear, row_pitch, tex) {
+        std::sync::atomic::fence(Ordering::Release);
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || (n.is_power_of_two() && n >= 64) {
+            crate::xlog_info!("D3D12.X: water heightmap readback #{n} (256x256 fmt {}, -> {target_va:#x}, {dst_bytes} B)", format.0);
+        }
     }
 }
 
@@ -270,6 +503,48 @@ mod tests {
                 std::thread::yield_now();
             }
             assert_eq!(*dst, expected);
+        }
+    }
+
+    #[test]
+    fn water_readback_desc_matches_256_float_heightmaps_only() {
+        let base = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32_FLOAT,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        assert!(is_water_readback_desc(&base));
+        assert!(is_water_readback_desc(&D3D12_RESOURCE_DESC { Format: DXGI_FORMAT_R32G32_FLOAT, ..base }));
+        assert!(!is_water_readback_desc(&D3D12_RESOURCE_DESC { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM, ..base }));
+        assert!(!is_water_readback_desc(&D3D12_RESOURCE_DESC { Width: 512, ..base }));
+        assert!(!is_water_readback_desc(&D3D12_RESOURCE_DESC { MipLevels: 2, ..base }));
+        assert!(!is_water_readback_desc(&D3D12_RESOURCE_DESC { DepthOrArraySize: 2, ..base }));
+        assert!(!is_water_readback_desc(&D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, ..base }));
+    }
+
+    #[test]
+    fn tile_readback_roundtrips_256_r32_and_r32g32_heightmaps() {
+        for (fmt, bpe) in [(DXGI_FORMAT_R32_FLOAT.0 as u32, 4usize), (DXGI_FORMAT_R32G32_FLOAT.0 as u32, 8usize)] {
+            let mut x = [0u8; 0x38];
+            x[0..4].copy_from_slice(&(D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32).to_le_bytes());
+            x[0x10..0x18].copy_from_slice(&256u64.to_le_bytes());
+            x[0x18..0x1C].copy_from_slice(&256u32.to_le_bytes());
+            x[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+            x[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+            x[0x20..0x24].copy_from_slice(&fmt.to_le_bytes());
+            x[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            x[0x2C..0x30].copy_from_slice(&0x11Bu32.to_le_bytes()); // console swizzle 64KB_R_X (0x100 | 27)
+            let tex = xg::Texture::new(&x).expect("256x256 console texture layout");
+            let (_, surface) = main_surface(&tex).expect("main color surface");
+            let linear: Vec<u8> = (0..(256 * 256 * bpe)).map(|i| ((i * 31 + 17) & 0xFF) as u8).collect();
+            let mut tiled = vec![0u8; surface.chain.slice_bytes];
+            assert!(tile_readback_into_slice(&mut tiled, &linear, (256 * bpe) as u32, &tex));
+            assert_eq!(surface.chain.detile_level(&tiled, 0, 0), linear);
         }
     }
 }
