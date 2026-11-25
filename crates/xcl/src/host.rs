@@ -52,6 +52,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let mut last = snap();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
+                // a device removed while every title thread waits: nothing else would ask
+                crate::hle::d3d12x::real::stop_if_device_removed();
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();
                 crate::xlog_info!(
