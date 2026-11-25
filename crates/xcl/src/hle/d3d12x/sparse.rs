@@ -1361,50 +1361,224 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     s.readback_ranges(&merged);
 }
 
+/// Pooled per-`Map` synchronous readback resources so concurrent `ID3D12Resource::Map` readbacks
+/// record, submit, and GPU-wait OUTSIDE the global `STATE` lock (avoiding `STATE` convoy stalls).
+struct ReadbackJob {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    buf: ID3D12Resource,
+    event: HANDLE,
+    mapped: usize,
+    cap: usize,
+    dev_key: usize,
+}
+
+unsafe impl Send for ReadbackJob {}
+
+impl Drop for ReadbackJob {
+    fn drop(&mut self) {
+        if !self.event.is_invalid() {
+            unsafe { let _ = windows::Win32::Foundation::CloseHandle(self.event); }
+        }
+    }
+}
+
+const MAX_RB_JOBS: usize = 16;
+const MIN_RB_JOB_BYTES: usize = 256 << 10;
+static FREE_RB_JOBS: Mutex<Vec<ReadbackJob>> = Mutex::new(Vec::new());
+
+unsafe fn take_readback_job(dev: &ID3D12Device, need: usize) -> Option<ReadbackJob> {
+    let dev_key = dev.as_raw() as usize;
+    let want = need.max(MIN_RB_JOB_BYTES).min(READBACK_STAGING);
+    {
+        let mut free = FREE_RB_JOBS.lock().unwrap();
+        if let Some(i) = free.iter().position(|j| j.dev_key == dev_key && j.cap >= want) {
+            return Some(free.swap_remove(i));
+        }
+    }
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).ok()?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &alloc, None).ok()?;
+    let _ = list.Close();
+    let mut d = buffer_desc(want as u64);
+    d.Flags = D3D12_RESOURCE_FLAG_NONE;
+    let mut r: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE,
+        &d,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        None,
+        &mut r,
+    )
+    .ok()?;
+    let buf = r?;
+    let mut p = std::ptr::null_mut();
+    buf.Map(0, None, Some(&mut p)).ok()?;
+    if p.is_null() {
+        return None;
+    }
+    let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).ok()?;
+    Some(ReadbackJob { alloc, list, buf, event, mapped: p as usize, cap: want, dev_key })
+}
+
+fn return_readback_job(job: ReadbackJob) {
+    let mut free = FREE_RB_JOBS.lock().unwrap();
+    if free.len() < MAX_RB_JOBS {
+        free.push(job);
+    }
+}
+
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
 /// a non-empty read range, or `Map(0, NULL)` on a sparse readback resource): flushes pending
 /// tile clears and unsubmitted CPU-changed chunks first so CPU writes are preserved, then
-/// copies the range back from VRAM into CPU memory.
+/// copies the range back from VRAM into CPU memory using a per-call pooled `ReadbackJob` whose
+/// GPU fence wait runs OUTSIDE the global `STATE` lock.
 pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let mut g = lock_state();
-    let Some(s) = g.as_mut() else { return };
-    if s.window_index(va).is_none() {
-        return;
-    }
-    let zeroed = std::mem::take(&mut s.to_zero);
-    if !zeroed.is_empty() {
-        for &(a, n) in &zeroed {
-            s.clear_sent_range(a, n);
+    // 1. Flush pending clears & dirty CPU chunks under `STATE`, collect mapped spans, then release
+    //    `STATE` before recording/waiting so other `Map` threads and `before_execute` never stall.
+    let (dev, spans): (ID3D12Device, Vec<(usize, ID3D12Resource, u64, usize)>) = {
+        let mut g = lock_state();
+        let Some(s) = g.as_mut() else { return };
+        if s.window_index(va).is_none() {
+            return;
         }
-        s.upload_zeros(&zeroed);
-    }
-    // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)`
-    let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
-    let mut pg = va & !(PAGE - 1);
-    let end = va + len;
-    while pg < end {
-        let t = pg & !(TILE - 1);
-        let tile_end = (t + TILE).min(end);
-        if let Some(entry) = s.mapped.get_mut(&t) {
-            let mut p = pg;
-            while p < tile_end {
-                let idx = (p - t) / PAGE;
-                if entry.holes & (1u16 << idx) == 0 {
-                    let bytes = std::slice::from_raw_parts(p as *const u8, PAGE);
-                    scan_page(bytes, p, &mut entry.sent[idx], &mut dirty_runs);
+        let zeroed = std::mem::take(&mut s.to_zero);
+        if !zeroed.is_empty() {
+            for &(a, n) in &zeroed {
+                s.clear_sent_range(a, n);
+            }
+            s.upload_zeros(&zeroed);
+        }
+        // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)`
+        let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
+        let mut pg = va & !(PAGE - 1);
+        let end = va + len;
+        while pg < end {
+            let t = pg & !(TILE - 1);
+            let tile_end = (t + TILE).min(end);
+            if let Some(entry) = s.mapped.get_mut(&t) {
+                let mut p = pg;
+                while p < tile_end {
+                    let idx = (p - t) / PAGE;
+                    if entry.holes & (1u16 << idx) == 0 {
+                        let bytes = std::slice::from_raw_parts(p as *const u8, PAGE);
+                        scan_page(bytes, p, &mut entry.sent[idx], &mut dirty_runs);
+                    }
+                    p += PAGE;
                 }
-                p += PAGE;
+            }
+            pg = tile_end;
+        }
+        if !dirty_runs.is_empty() {
+            s.upload_dirty(&dirty_runs);
+        }
+        let mut spans = Vec::new();
+        let mut done = 0usize;
+        while done < len {
+            let cur = va + done;
+            let tile = cur & !(TILE - 1);
+            let Some(wi) = s.window_index(cur) else { break };
+            let b = s.windows[wi].0;
+            let to_tile_end = (tile + TILE) - cur;
+            if !s.mapped.contains_key(&tile) {
+                done += (len - done).min(to_tile_end);
+                continue;
+            }
+            let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
+            let chunk = (len - done).min(to_tile_end).min(to_win_end);
+            spans.push((cur, s.windows[wi].1.clone(), (cur - b) as u64, chunk));
+            done += chunk;
+        }
+        if spans.is_empty() {
+            return;
+        }
+        (s.dev.clone(), spans)
+    };
+
+    let total_need: usize = spans.iter().map(|s| s.3).sum();
+    let Some(job) = take_readback_job(&dev, total_need) else {
+        let mut g = lock_state();
+        if let Some(s) = g.as_mut() {
+            s.readback_ranges(&[(va, len)]);
+        }
+        return;
+    };
+
+    let mut idx = 0usize;
+    let mut sub_off = 0usize;
+    let mut pending: Vec<(usize, usize, usize)> = Vec::new();
+    while idx < spans.len() {
+        let mut used = 0usize;
+        pending.clear();
+        if job.alloc.Reset().is_err() || job.list.Reset(&job.alloc, None).is_err() {
+            break;
+        }
+        while idx < spans.len() && used < job.cap {
+            let (dst, ref win_buf, src_base, span_len) = spans[idx];
+            let rem = span_len - sub_off;
+            let take = rem.min(job.cap - used);
+            job.list.CopyBufferRegion(&job.buf, used as u64, win_buf, src_base + sub_off as u64, take as u64);
+            pending.push((dst + sub_off, used, take));
+            used += take;
+            sub_off += take;
+            if sub_off >= span_len {
+                idx += 1;
+                sub_off = 0;
             }
         }
-        pg = tile_end;
+        if pending.is_empty() || job.list.Close().is_err() {
+            break;
+        }
+        let Ok(cmd_list) = job.list.cast::<ID3D12CommandList>() else { break };
+        // 2. Submit & signal atomically under `STATE` (strictly ordered after our uploads on `s.queue`),
+        //    then release `STATE` BEFORE waiting on the GPU fence.
+        let wait_target = {
+            let mut g = lock_state();
+            let Some(s) = g.as_mut() else { break };
+            super::title_textures::own_work(|| {
+                s.queue.ExecuteCommandLists(&[Some(cmd_list)]);
+            });
+            s.signal();
+            (s.fence.clone(), s.value)
+        };
+        if wait_target.1 > 0 && wait_target.0.GetCompletedValue() < wait_target.1 {
+            let _ = wait_target.0.SetEventOnCompletion(wait_target.1, job.event);
+            windows::Win32::System::Threading::WaitForSingleObject(job.event, 5000);
+            if wait_target.0.GetCompletedValue() < wait_target.1 {
+                crate::xlog_warn!(
+                    "sparse: readback_now queue has not reached fence value {} after 5 s (at {})",
+                    wait_target.1,
+                    wait_target.0.GetCompletedValue()
+                );
+            }
+        }
+        // 3. Copy only still-committed non-hole bytes into host memory and sync `sent` hashes.
+        let mut g = lock_state();
+        let Some(s) = g.as_mut() else { break };
+        let p = job.mapped as *const u8;
+        for &(dst, off, chunk) in &pending {
+            let mut at = dst;
+            let mut src_off = off;
+            let end = dst + chunk;
+            while at < end {
+                let pg = at & !(PAGE - 1);
+                let t = pg & !(TILE - 1);
+                let page_idx = (pg - t) / PAGE;
+                let step = (pg + PAGE).min(end) - at;
+                if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << page_idx) == 0) {
+                    std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
+                }
+                at += step;
+                src_off += step;
+            }
+            s.sync_sent_range(dst, chunk);
+        }
+        s.reclaim_ring();
     }
-    if !dirty_runs.is_empty() {
-        s.upload_dirty(&dirty_runs);
-    }
-    s.readback_ranges(&[(va, len)]);
+    return_readback_job(job);
 }
 
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that

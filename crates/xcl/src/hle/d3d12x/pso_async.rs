@@ -1762,6 +1762,11 @@ pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
 }
 
+/// `pso` is a stand-in with no real pipeline yet (still building or build failed: draws nothing).
+pub fn is_stand_in(pso: usize) -> bool {
+    entry(pso).is_some_and(|p| p.real.load(Ordering::Acquire) == 0)
+}
+
 /// One of the title's threads is about to wait for `pso`.
 pub fn want(pso: usize) {
     if let Some(p) = entry(pso) {

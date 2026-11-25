@@ -2834,6 +2834,14 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     pc_dm(this, x, y, z);
 }
 
+/// An ExecuteIndirect that could have drawn is skipped: mark any active occlusion query visible
+/// so the title does not treat skipped geometry as occluded (Dispatch signatures make no samples).
+fn note_skipped_indirect(this: *mut c_void, sig: usize) {
+    if !signature_dispatches(sig) {
+        super::list_x::note_dropped_draw(this);
+    }
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
@@ -2938,6 +2946,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if super::pso_async::is_pending(raw_pso) {
+            note_skipped_indirect(this, sig);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -2950,6 +2959,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // with the title's graphics root signature (e.g. a non-DispatchMesh indirect draw or a
         // root-changing signature) invalidates the command list (Close → E_INVALIDARG).
         if let Some(tp) = super::real::two_pass_of(pso) {
+            note_skipped_indirect(this, sig);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -2983,6 +2993,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
+        if gfx {
+            note_skipped_indirect(this, sig);
+        }
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
@@ -3130,6 +3143,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
         }
         Err(e) => {
+            if gfx {
+                note_skipped_indirect(this, sig);
+            }
             if guarded.is_some() {
                 if let Some(real) = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)) {
                     list.SetPipelineState(real);
@@ -3451,6 +3467,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // DrawInstanced / DrawIndexedInstanced against a mesh PSO invalidates the command list
         // (Close → E_INVALIDARG).
         if let Some(tp) = super::real::two_pass_of(real) {
+            super::list_x::note_dropped_draw(this);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -3480,7 +3497,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
         // the title's root signature, which nothing else binds on the PC list – a draw without
         // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
-        if super::pso_async::is_pending(pso) {
+        if super::pso_async::is_stand_in(pso) {
             super::list_x::note_dropped_draw(this);
         }
         let rs = with(this, |s| s.rs_gfx) as *mut c_void;

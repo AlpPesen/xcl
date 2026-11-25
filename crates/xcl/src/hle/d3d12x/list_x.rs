@@ -3302,7 +3302,10 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     let old_next = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
-        let old = m.remove(&(next_pc as usize));
+        let mut old = m.remove(&(next_pc as usize));
+        // A spare that was previously a first segment holds the allocator its deferred segments
+        // recorded on: keep it alive while those dispatches may still execute on the GPU (#2549).
+        let own_alloc = old.as_mut().and_then(|o| o.own_alloc.take());
         if let Some(ref o) = old {
             if !o.pending_waits.is_empty() {
                 PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
@@ -3333,6 +3336,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
                 pred_in_state: false,
                 predication,
                 bindings: bindings.clone(),
+                own_alloc,
                 ..Default::default()
             },
         );
@@ -3979,7 +3983,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     };
 
     let ext_closed = *(target as *const usize);
-    let init_pso = super::pso_async::resolve_for_bind(bound_pso);
+    let init_pso = super::pso_async::resolve(bound_pso);
     let reset_hr = super::alloc_pool::reset_list(target as usize, alloc, list_type(target).0, |pc_alloc| {
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
     });
@@ -4848,7 +4852,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     // A failed native Reset leaves the old recording alive. Do not discard its tracked state or
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
-    let resolved = super::pso_async::resolve_for_bind(pso);
+    let resolved = super::pso_async::resolve(pso);
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
     let hr = super::alloc_pool::reset_list(this as usize, alloc, ty, |pc_alloc| {
