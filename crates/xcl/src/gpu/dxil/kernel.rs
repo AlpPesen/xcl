@@ -546,6 +546,8 @@ impl Lw {
                 .max()
                 .unwrap_or(0),
             exec_cache: HashMap::new(),
+            compact_blk_pc: None,
+            compact_lit: None,
             xs: None,
             xw: None,
             xc: None,

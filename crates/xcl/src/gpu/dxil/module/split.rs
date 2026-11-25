@@ -1106,6 +1106,8 @@ mod tests {
                 let taken = lw.cmp(Pred::ULt, tid, width);
                 lw.s.m.cond_br(taken, next, alt);
                 lw.s.m.set_block(alt);
+                let alt_val = lw.addc(val, 1);
+                lw.s.raw_store(mem, offset, &[alt_val]);
                 lw.s.m.br(next);
                 lw.s.m.set_block(next);
             }
