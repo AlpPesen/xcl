@@ -331,7 +331,7 @@ unsafe impl Sync for Base {}
 static BASES: std::sync::RwLock<Option<HashMap<usize, Arc<Base>>>> = std::sync::RwLock::new(None);
 /// Cached derived PSOs for `RSSetDepthBiasX`: (base PSO, override) → owned derived PSO.
 /// Released when the base PSO is released in `forget_base`.
-static DEPTH_BIAS_PSOS: Mutex<Option<HashMap<(usize, DepthBias), usize>>> = Mutex::new(None);
+static DEPTH_BIAS_PSOS: std::sync::RwLock<Option<HashMap<(usize, DepthBias), usize>>> = std::sync::RwLock::new(None);
 
 fn rd32(d: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(d[o..o + 4].try_into().unwrap())
@@ -400,7 +400,7 @@ pub(super) fn base_depth_bias_info(pso: usize) -> Option<(bool, DepthBias)> {
 
 #[cfg(test)]
 pub(super) fn depth_bias_cache_len() -> usize {
-    DEPTH_BIAS_PSOS.lock().unwrap().as_ref().map_or(0, HashMap::len)
+    DEPTH_BIAS_PSOS.read().unwrap().as_ref().map_or(0, HashMap::len)
 }
 
 #[cfg(test)]
@@ -422,7 +422,7 @@ pub(super) fn forget_base(pso: usize) {
         m.remove(&pso);
     }
     let gone: Vec<usize> = {
-        let mut g = DEPTH_BIAS_PSOS.lock().unwrap();
+        let mut g = DEPTH_BIAS_PSOS.write().unwrap();
         match g.as_mut() {
             Some(m) => {
                 let mut out = Vec::new();
@@ -453,7 +453,7 @@ pub(super) unsafe fn depth_bias_pso(dev: *mut c_void, base: usize, bias: DepthBi
     if dev.is_null() || base == 0 {
         return None;
     }
-    if let Some(&cached) = DEPTH_BIAS_PSOS.lock().unwrap().as_ref().and_then(|m| m.get(&(base, bias))) {
+    if let Some(&cached) = DEPTH_BIAS_PSOS.read().unwrap().as_ref().and_then(|m| m.get(&(base, bias))) {
         return Some(cached);
     }
     let b = BASES.read().unwrap().as_ref().and_then(|m| m.get(&base).cloned())?;
@@ -479,7 +479,7 @@ pub(super) unsafe fn depth_bias_pso(dev: *mut c_void, base: usize, bias: DepthBi
     let result = {
         // re-check base liveness so we never leak a derived PSO for a concurrently released base
         let alive = BASES.read().unwrap().as_ref().is_some_and(|m| m.contains_key(&base));
-        let mut g = DEPTH_BIAS_PSOS.lock().unwrap();
+        let mut g = DEPTH_BIAS_PSOS.write().unwrap();
         let map = g.get_or_insert_with(HashMap::new);
         if !alive {
             release_extra = derived;
@@ -694,7 +694,7 @@ fn uav_format_supported_by_caps(format: u32, support1: u32, support2: u32) -> bo
     (support2 & typed_rw) != 0
 }
 
-static UAV_FORMAT_SUPPORT: Mutex<Option<HashMap<((u32, i32), u32), bool>>> = Mutex::new(None);
+static UAV_FORMAT_SUPPORT: std::sync::RwLock<Option<HashMap<((u32, i32), u32), bool>>> = std::sync::RwLock::new(None);
 
 /// Query (and cache per adapter LUID + format) whether the PC device supports `ALLOW_UNORDERED_ACCESS`
 /// on `format`. Falls back to `texture_format_allows_uav` if the device cannot be queried.
@@ -710,7 +710,7 @@ unsafe fn device_format_supports_uav(device: *mut c_void, format: u32) -> bool {
     };
     let luid = dev.GetAdapterLuid();
     let key = ((luid.LowPart, luid.HighPart), format);
-    if let Some(&cached) = UAV_FORMAT_SUPPORT.lock().unwrap().as_ref().and_then(|m| m.get(&key)) {
+    if let Some(&cached) = UAV_FORMAT_SUPPORT.read().unwrap().as_ref().and_then(|m| m.get(&key)) {
         return cached;
     }
     let mut fs = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
@@ -729,7 +729,7 @@ unsafe fn device_format_supports_uav(device: *mut c_void, format: u32) -> bool {
     } else {
         true
     };
-    UAV_FORMAT_SUPPORT.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, supported);
+    UAV_FORMAT_SUPPORT.write().unwrap().get_or_insert_with(HashMap::new).insert(key, supported);
     supported
 }
 
@@ -897,7 +897,7 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
 }
 
 /// Cached host `D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW` answers per `(adapter LUID, DXGI_FORMAT)`.
-static TYPED_UAV_SUPPORT: Mutex<Option<HashMap<((u32, i32), i32), bool>>> = Mutex::new(None);
+static TYPED_UAV_SUPPORT: std::sync::RwLock<Option<HashMap<((u32, i32), i32), bool>>> = std::sync::RwLock::new(None);
 
 /// Map sRGB formats (never valid for PC UAVs) to their linear UAV-capable counterparts.
 pub fn pc_uav_linear_format(fmt: u32) -> u32 {
@@ -920,7 +920,7 @@ pub(super) unsafe fn pc_typed_uav_supported(dev_raw: *mut c_void, fmt: i32) -> b
     };
     let luid = dev.GetAdapterLuid();
     let key = ((luid.LowPart, luid.HighPart), fmt);
-    if let Some(&cached) = TYPED_UAV_SUPPORT.lock().unwrap().as_ref().and_then(|m| m.get(&key)) {
+    if let Some(&cached) = TYPED_UAV_SUPPORT.read().unwrap().as_ref().and_then(|m| m.get(&key)) {
         return cached;
     }
     let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
@@ -932,7 +932,7 @@ pub(super) unsafe fn pc_typed_uav_supported(dev_raw: *mut c_void, fmt: i32) -> b
     } else {
         data.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
     };
-    TYPED_UAV_SUPPORT.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, supported);
+    TYPED_UAV_SUPPORT.write().unwrap().get_or_insert_with(HashMap::new).insert(key, supported);
     supported
 }
 
@@ -1722,7 +1722,7 @@ mod tests {
             assert!(device_format_supports_uav(ptr, 24) && dev.checks == 2);
             assert!(device_format_supports_uav(ptr, 24) && dev.checks == 2);
         }
-        if let Some(m) = UAV_FORMAT_SUPPORT.lock().unwrap().as_mut() {
+        if let Some(m) = UAV_FORMAT_SUPPORT.write().unwrap().as_mut() {
             m.remove(&((luid_a.LowPart, luid_a.HighPart), 24));
             m.remove(&((luid_b.LowPart, luid_b.HighPart), 24));
         }
@@ -1761,7 +1761,7 @@ mod tests {
             get_copyable_footprints_x(&mut dev as *mut FakeAdoptedDev as *mut c_void, x.as_ptr(), 0, 1, 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut total);
         }
         assert_eq!((dev.calls, dev.last_flags & 4, total), (2, 0, 65536));
-        if let Some(m) = UAV_FORMAT_SUPPORT.lock().unwrap().as_mut() {
+        if let Some(m) = UAV_FORMAT_SUPPORT.write().unwrap().as_mut() {
             m.remove(&((luid.LowPart, luid.HighPart), 24));
         }
     }

@@ -44,10 +44,23 @@ impl Held {
         self.open.is_empty() && self.sealed.is_empty()
     }
 
+    fn needs_seal(&self, seal_now: bool) -> bool {
+        !self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY))
+    }
+
+    /// Take out the sealed batches every queue is past without touching `open`.
+    unsafe fn reap(&mut self) -> Vec<usize> {
+        let mut gone = Vec::new();
+        while self.sealed.front().is_some_and(|b| b.marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v)) {
+            gone.extend(self.sealed.pop_front().unwrap().dead);
+        }
+        gone
+    }
+
     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
     /// and take out the batches every queue is past: the resources to release now.
     unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<usize> {
-        if !self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)) {
+        if self.needs_seal(seal_now) {
             let mut marks = Vec::with_capacity(queues.len());
             let mut ok = true;
             for q in queues {
@@ -76,11 +89,7 @@ impl Held {
                 self.sealed.push_back(Batch { dead, marks });
             }
         }
-        let mut gone = Vec::new();
-        while self.sealed.front().is_some_and(|b| b.marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v)) {
-            gone.extend(self.sealed.pop_front().unwrap().dead);
-        }
-        gone
+        self.reap()
     }
 }
 
@@ -95,21 +104,7 @@ pub fn enabled() -> bool {
 /// how long a last `Release` itself waits for queues with nothing to do to say so
 const IDLE_WAIT: Duration = Duration::from_micros(300);
 
-/// `res` (an adopted resource) holds one reference that is now this module's. With no work in
-/// flight it goes before this returns (the queues pass a fence value at once): a title that
-/// frees the memory under a resource right after its last `Release` finds it unpinned, as
-/// before. Otherwise the thread here lets it go.
-pub unsafe fn hold(res: usize) {
-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
-    let start = Instant::now();
-    drain_known(true);
-    while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
-        std::hint::spin_loop();
-        drain_known(false);
-    }
-    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
-        return;
-    }
+fn ensure_thread() {
     // A thread of its own lets the held ones go: the title may release a resource and then
     // wait for its memory without another submit (an imported heap pins the pages under its
     // resources – unmapping them stood still while one was held "until the next submit").
@@ -122,24 +117,67 @@ pub unsafe fn hold(res: usize) {
     });
 }
 
-/// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
-/// upload ones.
-pub unsafe fn drain_known(seal_now: bool) {
+/// `res` (an adopted resource) holds one reference that is now this module's. With no work in
+/// flight it goes before this returns (the queues pass a fence value at once): a title that
+/// frees the memory under a resource right after its last `Release` finds it unpinned, as
+/// before. Otherwise the thread here lets it go.
+pub unsafe fn hold(res: usize) {
+    let busy = {
+        let mut g = HELD.lock().unwrap();
+        let h = g.get_or_insert_with(Held::default);
+        let busy = !h.sealed.is_empty();
+        h.open.push(res);
+        busy
+    };
+    if busy {
+        // A sealed batch is already in flight on the GPU: let the background thread batch
+        // this release into the next SEAL_EVERY signal instead of issuing a per-release
+        // Signal on every queue and spinning IDLE_WAIT on the caller's thread.
+        ensure_thread();
+        return;
+    }
+    let start = Instant::now();
+    drain_known(true);
+    while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
+        std::hint::spin_loop();
+        drain_known(false);
+    }
     if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
         return;
     }
-    let mut queues: Vec<ID3D12CommandQueue> = Vec::new();
-    for raw in super::present::known_queues() {
-        let raw = raw as *mut c_void;
-        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&raw) {
-            queues.push(q.clone());
+    ensure_thread();
+}
+
+/// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
+/// upload ones.
+pub unsafe fn drain_known(seal_now: bool) {
+    let need_queues = {
+        let g = HELD.lock().unwrap();
+        let Some(h) = g.as_ref() else { return };
+        if h.is_empty() {
+            return;
         }
-    }
-    queues.extend(super::sparse::queue());
-    queues.extend(super::title_textures::upload_queues());
-    let gone = match HELD.lock().unwrap().as_mut() {
-        Some(h) => h.drain(&queues, seal_now),
-        None => return,
+        h.needs_seal(seal_now)
+    };
+    let gone = if need_queues {
+        let mut queues: Vec<ID3D12CommandQueue> = Vec::new();
+        for raw in super::present::known_queues() {
+            let raw = raw as *mut c_void;
+            if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&raw) {
+                queues.push(q.clone());
+            }
+        }
+        queues.extend(super::sparse::queue());
+        queues.extend(super::title_textures::upload_queues());
+        match HELD.lock().unwrap().as_mut() {
+            Some(h) => h.drain(&queues, seal_now),
+            None => return,
+        }
+    } else {
+        match HELD.lock().unwrap().as_mut() {
+            Some(h) => h.reap(),
+            None => return,
+        }
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
     for res in gone {
@@ -215,5 +253,17 @@ mod tests {
         held.open.push(0x1000);
         assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
         assert!(held.is_empty());
+    }
+
+    /// `reap()` only drains completed sealed batches and never prematurely releases `open` items.
+    #[test]
+    fn reap_keeps_open_items_and_respects_seal_interval() {
+        let mut held = Held::default();
+        held.last_seal = Some(Instant::now());
+        held.open.push(0x2000);
+        assert!(!held.needs_seal(false), "within SEAL_EVERY: batching defers sealing");
+        assert!(held.needs_seal(true), "explicit seal_now seals immediately");
+        assert!(unsafe { held.reap() }.is_empty());
+        assert_eq!(held.open, vec![0x2000]);
     }
 }

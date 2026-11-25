@@ -382,7 +382,7 @@ unsafe fn open_uma(device: &ID3D12Device) {
 
 pub fn stats() -> D3d12Stats {
     let classes = CLASSES
-        .lock()
+        .read()
         .map(|g| {
             g.iter()
                 .map(|c| ClassStat { interface: c.iface.name.to_string(), public_methods: c.public, internal_slots: c.scanned - c.public })
@@ -665,7 +665,7 @@ struct Class {
     scanned: usize,
 }
 
-static CLASSES: Mutex<Vec<Class>> = Mutex::new(Vec::new());
+static CLASSES: std::sync::RwLock<Vec<Class>> = std::sync::RwLock::new(Vec::new());
 static EXTS: std::sync::RwLock<Option<HashSet<usize>>> = std::sync::RwLock::new(None);
 
 unsafe fn vt(obj: *mut c_void) -> *const usize {
@@ -728,7 +728,7 @@ fn is_ext(v: usize) -> bool {
 }
 
 fn kind_of(ext: usize) -> Option<Kind> {
-    CLASSES.lock().unwrap().iter().find(|c| c.ext == ext).map(|c| c.kind)
+    CLASSES.read().unwrap().iter().find(|c| c.ext == ext).map(|c| c.kind)
 }
 
 /// If a native D3D12 method (such as `Close` or `Reset` on Agility SDK 1.620+, or copy-list
@@ -771,8 +771,8 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
 }
 
 unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
-    if let Some(c) = CLASSES.lock().unwrap().iter().find(|c| c.orig == orig && c.kind == kind) {
-        return c.ext;
+    if let Some(ext) = CLASSES.read().unwrap().iter().find(|c| c.orig == orig && c.kind == kind).map(|c| c.ext) {
+        return ext;
     }
     let ot = orig as *const usize;
     // most derived PC interface this object implements
@@ -886,7 +886,7 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         scanned - public,
         crate::modules::describe_address(orig)
     );
-    CLASSES.lock().unwrap().push(Class { orig, kind, ext, iface, public, scanned });
+    CLASSES.write().unwrap().push(Class { orig, kind, ext, iface, public, scanned });
     ext
 }
 
@@ -1467,10 +1467,10 @@ fn has_coherent_headroom(u: &crate::gpu::uma::Uma, rounded: usize) -> bool {
 
 /// Sparse-backed buffers whose `Map(0, NULL, ...)` should read back their full range from VRAM
 /// (readback buffers that spilled to sparse VRAM or `COPY_DEST` buffers in `CUSTOM + WRITE_BACK`).
-static SPARSE_READBACK: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static SPARSE_READBACK: std::sync::RwLock<Option<HashSet<usize>>> = std::sync::RwLock::new(None);
 
 fn note_sparse_readback(res: usize) {
-    SPARSE_READBACK.lock().unwrap().get_or_insert_with(HashSet::new).insert(res);
+    SPARSE_READBACK.write().unwrap().get_or_insert_with(HashSet::new).insert(res);
 }
 
 /// Whether `props` asks for CPU-cached readback memory. On Xbox UMA, `D3D12_HEAP_TYPE_CUSTOM`
@@ -1690,14 +1690,14 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
                         super::sparse::readback_now(p + begin, end - begin);
                     }
                 }
-            } else if SPARSE_READBACK.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
+            } else if SPARSE_READBACK.read().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
                 super::sparse::readback_now(p, bytes);
             }
         }
         if !data.is_null() {
             *data = p as *mut c_void;
         }
-        UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
+        UNMAPPABLE.write().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
         return S_OK;
     }
     // the PC's Map only on a resource it can map: on a reserved one or one without CPU pages it is
@@ -1716,7 +1716,7 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
             if !data.is_null() {
                 *data = p as *mut c_void;
             }
-            UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
+            UNMAPPABLE.write().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
             S_OK
         }
         None => {
@@ -1765,10 +1765,10 @@ pub(super) fn note_title_address(res: usize, va: usize) {
 }
 
 /// resources whose Map gave their unified-memory address (no PC mapping to undo)
-static UNMAPPABLE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static UNMAPPABLE: std::sync::RwLock<Option<HashSet<usize>>> = std::sync::RwLock::new(None);
 
 unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c_void) {
-    if UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
+    if UNMAPPABLE.read().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
         return;
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, slot_of(this, "Unmap")));
@@ -1795,13 +1795,13 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         f(this)
     };
     if n == 0 {
-        if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
+        if let Some(s) = UNMAPPABLE.write().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
-        if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
+        if let Some(s) = SPARSE_READBACK.write().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
-        if let Some(s) = RESERVED.lock().unwrap().as_mut() {
+        if let Some(s) = RESERVED.write().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
         if let Some(m) = BUFFER_DELTA.write().unwrap().as_mut() {
@@ -1866,42 +1866,42 @@ unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
 static TRANSLATED_COMPUTE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
 /// graphics pipelines built from translated console shaders
-static TRANSLATED_GRAPHICS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static TRANSLATED_GRAPHICS: std::sync::RwLock<Option<HashSet<usize>>> = std::sync::RwLock::new(None);
 
 /// Whether `pso` is a graphics pipeline of translated console shaders.
 /// `XCL_TRACE_FRAME`: the console VS and PS (their dump names' hashes) of a translated PSO.
-static PSO_SHADERS: Mutex<Option<HashMap<usize, (u64, u64)>>> = Mutex::new(None);
+static PSO_SHADERS: std::sync::RwLock<Option<HashMap<usize, (u64, u64)>>> = std::sync::RwLock::new(None);
 
 /// translated pipeline → its input layout as text (`XCL_TRACE_FRAME`)
-static PSO_LAYOUTS: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
+static PSO_LAYOUTS: std::sync::RwLock<Option<HashMap<usize, String>>> = std::sync::RwLock::new(None);
 
 pub fn pso_layout(pso: usize) -> Option<String> {
-    PSO_LAYOUTS.lock().unwrap().as_ref()?.get(&pso).cloned()
+    PSO_LAYOUTS.read().unwrap().as_ref()?.get(&pso).cloned()
 }
 
 pub fn pso_shaders(pso: usize) -> Option<(u64, u64)> {
-    PSO_SHADERS.lock().unwrap().as_ref()?.get(&pso).copied()
+    PSO_SHADERS.read().unwrap().as_ref()?.get(&pso).copied()
 }
 
 pub fn is_translated_graphics(pso: usize) -> bool {
-    pso != 0 && TRANSLATED_GRAPHICS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+    pso != 0 && TRANSLATED_GRAPHICS.read().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
 /// graphics pipelines given the generated rect list GS (`rect_list_gs`)
-static RECT_LIST_GS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static RECT_LIST_GS: std::sync::RwLock<Option<HashSet<usize>>> = std::sync::RwLock::new(None);
 
 /// Whether `pso` (as `is_translated_graphics` takes it: a stand-in resolved) draws rect lists
 /// whole with the generated GS. Its draws must not be expanded to two triangles a rect as well:
 /// each half is three corners of the rect and the GS would complete both.
 pub fn has_rect_list_gs(pso: usize) -> bool {
-    pso != 0 && RECT_LIST_GS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+    pso != 0 && RECT_LIST_GS.read().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
 /// Note `pso`, made from `copy`, if it kept the generated rect list GS (`rect_gs`; a pipeline
 /// made again without it, `retry_without_rect_gs`, did not).
 fn note_rect_list_gs(pso: usize, copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect_gs: bool) {
     if pso != 0 && rect_gs && !copy.GS.pShaderBytecode.is_null() {
-        RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+        RECT_LIST_GS.write().unwrap().get_or_insert_with(HashSet::new).insert(pso);
     }
 }
 
@@ -1991,24 +1991,24 @@ pub fn is_translated_compute(pso: usize) -> bool {
 
 /// compute pipelines the title made from a console shader that runs untranslated: a background
 /// build's stand-in (until it is resolved) and the fallback of a console shader that failed
-static CONSOLE_COMPUTE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static CONSOLE_COMPUTE: std::sync::RwLock<Option<HashSet<usize>>> = std::sync::RwLock::new(None);
 
 unsafe fn note_console_compute(hr: HRESULT, ppv: *mut *mut c_void) {
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-        CONSOLE_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+        CONSOLE_COMPUTE.write().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     }
 }
 
 /// Whether `pso` was made from a console compute shader (translated or not); a native PC
 /// compute pipeline is not.
 pub fn is_console_compute(pso: usize) -> bool {
-    pso != 0 && CONSOLE_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+    pso != 0 && CONSOLE_COMPUTE.read().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
 #[cfg(test)]
 pub(super) fn register_console_compute_for_test(pso: usize) {
     if pso != 0 {
-        CONSOLE_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+        CONSOLE_COMPUTE.write().unwrap().get_or_insert_with(HashSet::new).insert(pso);
     }
 }
 
@@ -2022,14 +2022,14 @@ pub(super) fn register_translated_compute_for_test(pso: usize) {
 #[cfg(test)]
 pub(super) fn register_rect_list_gs_for_test(pso: usize) {
     if pso != 0 {
-        RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+        RECT_LIST_GS.write().unwrap().get_or_insert_with(HashSet::new).insert(pso);
     }
 }
 
 #[cfg(test)]
 pub(super) fn register_translated_graphics_for_test(pso: usize) {
     if pso != 0 {
-        TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+        TRANSLATED_GRAPHICS.write().unwrap().get_or_insert_with(HashSet::new).insert(pso);
     }
 }
 
@@ -2044,16 +2044,16 @@ fn forget_pso(pso: usize) {
     if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
-    if let Some(s) = CONSOLE_COMPUTE.lock().unwrap().as_mut() {
+    if let Some(s) = CONSOLE_COMPUTE.write().unwrap().as_mut() {
         s.remove(&pso);
     }
-    if let Some(s) = TRANSLATED_GRAPHICS.lock().unwrap().as_mut() {
+    if let Some(s) = TRANSLATED_GRAPHICS.write().unwrap().as_mut() {
         s.remove(&pso);
     }
-    if let Some(s) = RECT_LIST_GS.lock().unwrap().as_mut() {
+    if let Some(s) = RECT_LIST_GS.write().unwrap().as_mut() {
         s.remove(&pso);
     }
-    if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
+    if let Some(m) = PSO_RS.write().unwrap().as_mut() {
         m.remove(&pso);
     }
     if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
@@ -3143,7 +3143,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
 /// Slot of `method` in the class of an adopted object.
 unsafe fn slot_of(this: *mut c_void, method: &str) -> usize {
     let ext = vt(this) as usize;
-    let g = CLASSES.lock().unwrap();
+    let g = CLASSES.read().unwrap();
     let c = g.iter().find(|c| c.ext == ext).expect("adopted class");
     layout::slot(c.iface, method).expect("method in layout")
 }
@@ -3613,7 +3613,7 @@ creator!(pc_create_reserved_resource1, "CreateReservedResource1", Kind::Resource
 /// `res_map` asks none of them (GetHeapProperties on one is an invalid call too, debug layer
 /// 901). The description guards against an address a later resource reuses without the last
 /// Release having been seen.
-static RESERVED: Mutex<Option<HashMap<usize, D3D12_RESOURCE_DESC>>> = Mutex::new(None);
+static RESERVED: std::sync::RwLock<Option<HashMap<usize, D3D12_RESOURCE_DESC>>> = std::sync::RwLock::new(None);
 
 unsafe fn desc_of(res: *mut c_void) -> Option<D3D12_RESOURCE_DESC> {
     ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc())
@@ -3622,14 +3622,14 @@ unsafe fn desc_of(res: *mut c_void) -> Option<D3D12_RESOURCE_DESC> {
 pub(super) unsafe fn note_reserved(hr: HRESULT, ppv: *mut *mut c_void) -> HRESULT {
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         if let Some(d) = desc_of(*ppv) {
-            RESERVED.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, d);
+            RESERVED.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, d);
         }
     }
     hr
 }
 
 unsafe fn is_reserved(res: *mut c_void) -> bool {
-    let kept = RESERVED.lock().unwrap().as_ref().and_then(|m| m.get(&(res as usize)).copied());
+    let kept = RESERVED.read().unwrap().as_ref().and_then(|m| m.get(&(res as usize)).copied());
     kept.is_some_and(|k| desc_of(res) == Some(k))
 }
 
@@ -3706,7 +3706,7 @@ struct HeapUma {
 
 /// heap → its backing block (allocated lazily on the first placed buffer; sparse VRAM for
 /// DEFAULT/UPLOAD/CUSTOM heaps, coherent committed window for small explicit READBACK heaps)
-static HEAP_UMA: Mutex<Option<HashMap<usize, HeapUma>>> = Mutex::new(None);
+static HEAP_UMA: std::sync::RwLock<Option<HashMap<usize, HeapUma>>> = std::sync::RwLock::new(None);
 
 /// A heap the title made that may hold buffers: a block of unified memory as large stands for
 /// it. On the console every heap is memory the CPU and the GPU address alike, and console code
@@ -3729,7 +3729,7 @@ unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
     let size = d.SizeInBytes as usize;
     let is_rb = d.Properties.Type == D3D12_HEAP_TYPE_READBACK;
     let is_custom_wb = d.Properties.Type == D3D12_HEAP_TYPE_CUSTOM && d.Properties.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
-    HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+    HEAP_UMA.write().unwrap().get_or_insert_with(HashMap::new).insert(
         *ppv as usize,
         HeapUma {
             size,
@@ -3745,7 +3745,7 @@ unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
 /// (taken now if it has none yet; None: not a heap that takes one, or unified memory is full).
 fn heap_block(heap: usize) -> Option<(usize, bool)> {
     let (size, align, prefer_coherent, cpu_readback) = {
-        let g = HEAP_UMA.lock().unwrap();
+        let g = HEAP_UMA.read().unwrap();
         let e = g.as_ref()?.get(&heap)?;
         if let Some(p) = e.block {
             return Some((p, e.cpu_readback));
@@ -3775,7 +3775,7 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
         }
         return None;
     };
-    let mut g = HEAP_UMA.lock().unwrap();
+    let mut g = HEAP_UMA.write().unwrap();
     let Some(e) = g.as_mut().and_then(|m| m.get_mut(&heap)) else {
         drop(g);
         if u.is_sparse(p) {
@@ -3810,7 +3810,7 @@ unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
-        let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
+        let gone = HEAP_UMA.write().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
         if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
                 super::sparse::free(p);
@@ -4153,11 +4153,11 @@ unsafe fn shader_bytes<'a>(b: &D3D12_SHADER_BYTECODE) -> Option<&'a [u8]> {
 
 /// Root signature of every pipeline built from translated console shaders (static samplers
 /// make it per pipeline): the draw binds it instead of the title's.
-static PSO_RS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+static PSO_RS: std::sync::RwLock<Option<HashMap<usize, usize>>> = std::sync::RwLock::new(None);
 
 fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
     if !pso.is_null() {
-        PSO_RS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, rs as usize);
+        PSO_RS.write().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, rs as usize);
     }
 }
 
@@ -4174,11 +4174,11 @@ pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
 /// The root signature a translated pipeline state was created with.
 pub fn pso_root_signature(pso: usize) -> Option<usize> {
     let pso = super::pso_async::resolve(pso);
-    PSO_RS.lock().unwrap().as_ref()?.get(&pso).copied()
+    PSO_RS.read().unwrap().as_ref()?.get(&pso).copied()
 }
 
 /// ABI root signatures with static samplers, by sampler set (owned here, never released).
-static ABI_RS_SAMPLERS: Mutex<Option<HashMap<Vec<u32>, usize>>> = Mutex::new(None);
+static ABI_RS_SAMPLERS: std::sync::RwLock<Option<HashMap<Vec<u32>, usize>>> = std::sync::RwLock::new(None);
 
 /// The XCL ABI root signature with a pipeline's static samplers (the plain one without).
 unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::StaticSampler]) -> Option<*mut c_void> {
@@ -4186,7 +4186,10 @@ unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::Sta
         return abi_rs_raw(this);
     }
     let key: Vec<u32> = samplers.iter().flat_map(|(w, c)| w.iter().copied().chain([*c as u32])).collect();
-    let mut g = ABI_RS_SAMPLERS.lock().unwrap();
+    if let Some(&rs) = ABI_RS_SAMPLERS.read().unwrap().as_ref().and_then(|m| m.get(&key)) {
+        return Some(rs as *mut c_void);
+    }
+    let mut g = ABI_RS_SAMPLERS.write().unwrap();
     let map = g.get_or_insert_with(HashMap::new);
     if let Some(&rs) = map.get(&key) {
         return Some(rs as *mut c_void);
@@ -5610,11 +5613,11 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
-    TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    TRANSLATED_GRAPHICS.write().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
-        PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
+        PSO_SHADERS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
         // the input layout (semantic index, format, slot, offset) – what the vertices are read as
         let il = &d.InputLayout;
         let elems: Vec<String> = if il.NumElements > 0 && !il.pInputElementDescs.is_null() {
@@ -5625,7 +5628,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         } else {
             Vec::new()
         };
-        PSO_LAYOUTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, elems.join(", "));
+        PSO_LAYOUTS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, elems.join(", "));
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 400 {
             let b = &d.BlendState.RenderTarget[0];
@@ -8779,9 +8782,9 @@ mod map_tests {
                 // is not taken for it (its description differs)
                 let upload = buffer(heap(D3D12_HEAP_TYPE_UPLOAD), D3D12_RESOURCE_STATE_GENERIC_READ);
                 let stale = desc_of(r.as_raw()).unwrap();
-                RESERVED.lock().unwrap().as_mut().unwrap().insert(upload.as_raw() as usize, stale);
+                RESERVED.write().unwrap().as_mut().unwrap().insert(upload.as_raw() as usize, stale);
                 assert!(!is_reserved(upload.as_raw()) && mappable(&upload));
-                let mut g = RESERVED.lock().unwrap();
+                let mut g = RESERVED.write().unwrap();
                 let m = g.as_mut().unwrap();
                 m.remove(&(raw as usize));
                 m.remove(&(upload.as_raw() as usize));
@@ -8958,13 +8961,13 @@ mod mesh_stream_tests {
         }
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                CLASSES.lock().unwrap().retain(|c| c.ext != self.ext);
-                if let Some(m) = ABI_RS_SAMPLERS.lock().unwrap().as_mut() {
+                CLASSES.write().unwrap().retain(|c| c.ext != self.ext);
+                if let Some(m) = ABI_RS_SAMPLERS.write().unwrap().as_mut() {
                     m.remove(&self.key);
                 }
             }
         }
-        CLASSES.lock().unwrap().push(Class {
+        CLASSES.write().unwrap().push(Class {
             orig: pc.as_ptr() as usize,
             kind: Kind::Device,
             ext: ext_vtbl,
@@ -8972,7 +8975,7 @@ mod mesh_stream_tests {
             public: iface.methods.len(),
             scanned: iface.methods.len(),
         });
-        ABI_RS_SAMPLERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(key.clone(), 0x1234_5678);
+        ABI_RS_SAMPLERS.write().unwrap().get_or_insert_with(HashMap::new).insert(key.clone(), 0x1234_5678);
         let _cleanup = Cleanup { ext: ext_vtbl, key };
 
         let make_tp = || crate::gpu::recomp::pso::TwoPass {
