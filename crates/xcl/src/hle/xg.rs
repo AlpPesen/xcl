@@ -108,6 +108,15 @@ pub struct Texture {
     pub empty: bool,
     /// D3D12_RESOURCE_DIMENSION
     dimension: u32,
+    /// tiled resource (D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE or console tiled flag bit 27)
+    tiled_resource: bool,
+}
+
+/// Whether `mode` is one of the 7 GFX10 depth/stencil Z swizzle modes accepted by
+/// `XGValidateDepthStencilSwizzleMode` (`4KB_Z`, `64KB_Z`, `4KB_Z_T`, `VAR_Z`, `4KB_Z_X`,
+/// `64KB_Z_X`, `VAR_Z_X`).
+pub fn is_depth_stencil_swizzle_mode(mode: u32) -> bool {
+    matches!(mode, 4 | 8 | 12 | 16 | 20 | 24 | 28)
 }
 
 /// (log2 bytes per element, pixels per element side) of a DXGI format; None for the 96-bit
@@ -187,7 +196,7 @@ impl Texture {
         // is left empty. Render target + depth flags: a render target in a Z mode, unless the
         // format has a stencil
         let depth_buffer = ds && mips == 1 && (planar || !rt);
-        if depth_buffer && mode != 24 {
+        if depth_buffer && !is_depth_stencil_swizzle_mode(mode) {
             return Err(E_INVALIDARG);
         }
         let depth_format = planar || matches!(format, 39 | 40 | 53 | 55);
@@ -232,7 +241,8 @@ impl Texture {
                 Plane { usage, offset: at, kind }
             })
             .collect();
-        Ok(Texture { planes, main: main_at, mips, empty, dimension: dim })
+        let tiled_resource = layout == 2 || (flags & (1 << 27)) != 0;
+        Ok(Texture { planes, main: main_at, mips, empty, dimension: dim, tiled_resource })
     }
 
     /// A 3D texture: one plane of texels, 4KB_S unless the layout names a mode or it is a UAV
@@ -265,7 +275,8 @@ impl Texture {
         let chain = Chain::new_3d(l, width as u32, height, depth, side, mips);
         let first_tail = chain.levels.iter().position(|m| m.tail.is_some()).unwrap_or(chain.levels.len());
         let s = Surface { chain, mode, bpe: 1 << e, side, width: width as u32, height, array: 1, depth, first_tail };
-        Ok(Texture { planes: vec![Plane { usage: 1, offset: 0, kind: PlaneKind::Surface(s) }], main: 0, mips, empty: false, dimension: 4 })
+        let tiled_resource = layout == 2 || (flags & (1 << 27)) != 0;
+        Ok(Texture { planes: vec![Plane { usage: 1, offset: 0, kind: PlaneKind::Surface(s) }], main: 0, mips, empty: false, dimension: 4, tiled_resource })
     }
 
     pub fn size(&self) -> u64 {
@@ -359,6 +370,7 @@ impl Surface {
         match mode {
             0 | 1 | 2 | 5 | 6 | 9 | 10 | 17 | 18 | 21 | 22 | 25 | 26 | 27 => {}
             24 if e <= 3 && !bc => {}
+            4 | 8 | 12 | 16 | 20 | 28 if e <= 3 && !bc => return Err(E_NOTIMPL),
             28 | 31 => return Err(E_NOTIMPL),
             _ => return Err(E_INVALIDARG),
         }
@@ -500,6 +512,8 @@ fn vtbl() -> &'static [usize] {
             let (stub, _) = crate::stubs::make_stub_info("xg_xs.dll", &format!("XGTextureAddressComputer::#{i}"), E_NOTIMPL as u32 as u64);
             v.push(stub);
         }
+        // Slot 12: IsTiledResource (returns bool/u32 from the resource's tiled-resource flag).
+        v.push(is_tiled_resource as usize);
         Box::leak(v.into_boxed_slice())
     })
 }
@@ -589,7 +603,7 @@ unsafe extern "system" fn get_alignment(p: *mut c_void) -> u64 {
 unsafe extern "system" fn get_mip_offset(p: *mut c_void, plane: u32, mip: u32) -> u64 {
     match tex(p).plane_surface(plane) {
         Some((s, at)) if (mip as usize) < s.chain.levels.len() => at + s.mip_offset(mip as usize),
-        _ => 0,
+        _ => u64::MAX,
     }
 }
 
@@ -599,8 +613,12 @@ unsafe extern "system" fn get_texel_offset(p: *mut c_void, plane: u32, mip: u32,
     }
     match tex(p).plane_surface(plane) {
         Some((s, at)) if (mip as usize) < s.chain.levels.len() && slice < s.slices(mip as usize).0 => at + s.element_offset(mip as usize, x as usize, y as usize, slice as usize),
-        _ => 0,
+        _ => u64::MAX,
     }
+}
+
+unsafe extern "system" fn is_tiled_resource(p: *mut c_void) -> u32 {
+    u32::from(tex(p).tiled_resource)
 }
 
 unsafe extern "system" fn not_implemented(_p: *mut c_void) -> HRESULT {
@@ -782,5 +800,47 @@ mod tests {
             assert_eq!(usages_and_bytes(&t), [(1, 4)]);
             assert_eq!((t.size(), t.alignment()), (rgb10a2.size(), rgb10a2.alignment()));
         }
+    }
+
+    #[test]
+    fn computer_vtable_has_13_slots_and_invalid_offsets_return_u64_max() {
+        assert_eq!(vtbl().len(), 13, "XGTextureAddressComputer exposes slots 0..=12");
+        let d = desc(64, 64, 1, 2, 28, 0x109);
+        let mut comp = std::ptr::null_mut();
+        assert_eq!(unsafe { XGCreateTextureComputer(d.as_ptr(), &mut comp) }, S_OK);
+        assert!(!comp.is_null());
+        unsafe {
+            assert_eq!(get_mip_offset(comp, 99, 0), u64::MAX);
+            assert_eq!(get_mip_offset(comp, 0, 99), u64::MAX);
+            assert_eq!(get_texel_offset(comp, 99, 0, 0, 0, 0, 0, std::ptr::null_mut()), u64::MAX);
+            assert_eq!(get_texel_offset(comp, 0, 99, 0, 0, 0, 0, std::ptr::null_mut()), u64::MAX);
+            assert_eq!(get_texel_offset(comp, 0, 0, 0, 0, 99, 0, std::ptr::null_mut()), u64::MAX);
+            assert_eq!(is_tiled_resource(comp), 0);
+            assert_eq!(release(comp), 0);
+        }
+        let tiled = desc(64, 64, 1, 1, 28, 2);
+        let mut comp_tiled = std::ptr::null_mut();
+        assert_eq!(unsafe { XGCreateTextureComputer(tiled.as_ptr(), &mut comp_tiled) }, S_OK);
+        unsafe {
+            assert_eq!(is_tiled_resource(comp_tiled), 1);
+            assert_eq!(release(comp_tiled), 0);
+        }
+    }
+
+    #[test]
+    fn depth_stencil_swizzle_modes_distinguish_valid_z_modes_from_invalid() {
+        for z in [4u32, 8, 12, 16, 20, 24, 28] {
+            assert!(is_depth_stencil_swizzle_mode(z), "Z mode {z} must be valid");
+        }
+        assert!(!is_depth_stencil_swizzle_mode(25));
+        // Valid but unmodelled Z modes return E_NOTIMPL on depth buffers, while non-Z modes return E_INVALIDARG.
+        for z in [4u32, 8, 12, 16, 20, 28] {
+            let mut d = desc(256, 256, 1, 1, 40, 0x100 | z);
+            d[0x30..0x34].copy_from_slice(&2u32.to_le_bytes()); // ALLOW_DEPTH_STENCIL
+            assert_eq!(Texture::new(&d).err(), Some(E_NOTIMPL), "Z mode {z} should return E_NOTIMPL");
+        }
+        let mut bad = desc(256, 256, 1, 1, 40, 0x100 | 25);
+        bad[0x30..0x34].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(Texture::new(&bad).err(), Some(E_INVALIDARG), "non-Z mode 25 must fail with E_INVALIDARG");
     }
 }
