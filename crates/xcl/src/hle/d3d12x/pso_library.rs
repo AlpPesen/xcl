@@ -10,8 +10,9 @@
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::core::{Interface, HSTRING};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -349,27 +350,79 @@ fn cleanup_older_generations(dir: &Path, keep_gen: u64) {
     }
 }
 
-/// Process-wide D3D12 pipeline library backed by a kept-open read-only `MappedBlob` and
-/// generational zero-heap-copy serialization.
-pub struct MmapPipelineLibrary {
-    lib: ID3D12PipelineLibrary1,
-    /// Kept alive for the entire lifetime of `lib` because D3D12 requires the initial blob memory
-    /// to remain valid until the `ID3D12PipelineLibrary` is destroyed.
-    _backing: Option<MappedBlob>,
-    store: LibraryStore,
-    dirty: AtomicU64,
-    saving: AtomicBool,
-    save_lock: Mutex<()>,
-    /// Serializes all `ID3D12PipelineLibrary1` operations (`Load*`, `StorePipeline`,
-    /// `GetSerializedSize`, `Serialize`). `D3D12Core.dll` is not thread-safe for concurrent
-    /// `StorePipeline` + `Load*` (races on internal lookup tables -> 0xc0000005).
-    lib_lock: Mutex<()>,
+/// Minimum newly stored pipelines before triggering a periodic background generation save.
+const SAVE_BATCH_THRESHOLD: u64 = 32;
+/// Minimum spacing between periodic background saves while pipelines are streaming in.
+const SAVE_MIN_INTERVAL: Duration = Duration::from_secs(15);
+/// Idle delay after the last stored pipeline before flushing any remaining tail (`>= 1` dirty).
+const SAVE_IDLE_FLUSH: Duration = Duration::from_secs(5);
+/// Maximum time `flush()` waits on shutdown so exit can never hang behind a slow driver call.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pure save-scheduling decision (unit-testable on CPU):
+/// - Save immediately when `dirty >= SAVE_BATCH_THRESHOLD` and at least `SAVE_MIN_INTERVAL`
+///   elapsed since the last save.
+/// - Or save any tail (`dirty > 0`) once no new pipeline has been stored for `SAVE_IDLE_FLUSH`.
+pub fn should_background_save(dirty: u64, now_ms: u64, last_store_ms: u64, last_save_ms: u64) -> bool {
+    if dirty == 0 {
+        return false;
+    }
+    let since_save = now_ms.saturating_sub(last_save_ms);
+    let since_store = now_ms.saturating_sub(last_store_ms);
+    (dirty >= SAVE_BATCH_THRESHOLD && since_save >= SAVE_MIN_INTERVAL.as_millis() as u64)
+        || (last_store_ms > 0
+            && since_store >= SAVE_IDLE_FLUSH.as_millis() as u64
+            && since_save >= SAVE_IDLE_FLUSH.as_millis() as u64)
 }
 
-// `_backing` is read-only; `lib_lock` serializes all `ID3D12PipelineLibrary1` calls and
-// `save_lock` serializes disk snapshots.
-unsafe impl Send for MmapPipelineLibrary {}
+struct SendPso(ID3D12PipelineState);
+unsafe impl Send for SendPso {}
+
+struct SendLib(ID3D12PipelineLibrary1);
+unsafe impl Send for SendLib {}
+
+enum SaveCmd {
+    Store(String, SendPso),
+    Flush(mpsc::SyncSender<Option<PathBuf>>),
+}
+
+unsafe fn create_empty_library(dev1: &ID3D12Device1) -> Option<ID3D12PipelineLibrary1> {
+    // Pass an explicit NULL pointer with length 0 rather than `&[]`, whose dangling
+    // non-null slice pointer vkd3d-proton rejects with E_INVALIDARG.
+    let mut lib: Option<ID3D12PipelineLibrary1> = None;
+    (Interface::vtable(dev1).CreatePipelineLibrary)(
+        Interface::as_raw(dev1),
+        std::ptr::null(),
+        0,
+        &ID3D12PipelineLibrary1::IID,
+        &mut lib as *mut _ as *mut _,
+    )
+    .ok()
+    .ok()?;
+    lib
+}
+
+/// Process-wide D3D12 pipeline library split into two independent `ID3D12PipelineLibrary1` handles:
+/// - `read_lib`: strictly immutable handle opened from the startup `MappedBlob`, serving concurrent
+///   `Load*` calls lock-free per the D3D12 spec (never mutated by `StorePipeline` or `Serialize`).
+/// - `write_lib`: owned exclusively by the dedicated `xcl-plib-save` worker thread, fed via an
+///   `mpsc` channel so `store()` returns in ~1 µs with zero lock contention on compile workers and
+///   `D3D12Core.dll` never sees concurrent `StorePipeline` + `Load*` or `Serialize` races.
+pub struct MmapPipelineLibrary {
+    read_lib: Option<ID3D12PipelineLibrary1>,
+    /// Kept alive for the entire lifetime of `read_lib` because D3D12 requires the initial blob
+    /// memory to remain valid until the `ID3D12PipelineLibrary` is destroyed.
+    _read_backing: Option<Arc<MappedBlob>>,
+    /// Async command channel to the dedicated `xcl-plib-save` thread owning `write_lib`.
+    /// The mutex protects only the ~50 ns `mpsc::Sender::send` (never any D3D12 call).
+    save_tx: Option<std::sync::Mutex<mpsc::Sender<SaveCmd>>>,
+    dirty: Arc<AtomicU64>,
+}
+
+// `read_lib` is strictly immutable after creation (`Load*` is free-threaded per D3D12 spec when
+// never mutated by `StorePipeline` or `Serialize`); `save_tx` is synchronized by its Mutex.
 unsafe impl Sync for MmapPipelineLibrary {}
+unsafe impl Send for MmapPipelineLibrary {}
 
 impl MmapPipelineLibrary {
     /// Open the latest memory-mapped pipeline library on `device`, falling back to a fresh empty
@@ -380,6 +433,9 @@ impl MmapPipelineLibrary {
         }
         let dev1: ID3D12Device1 = device.cast().ok()?;
         let store = LibraryStore::for_adapter(adapter_name);
+        let mut read_lib: Option<ID3D12PipelineLibrary1> = None;
+        let mut backing: Option<Arc<MappedBlob>> = None;
+
         if let Some((gen, blob)) = store.open_latest() {
             match dev1.CreatePipelineLibrary::<ID3D12PipelineLibrary1>(blob.as_slice()) {
                 Ok(lib) => {
@@ -387,15 +443,8 @@ impl MmapPipelineLibrary {
                         "D3D12.X: opened memory-mapped pipeline library gen-{gen:08x} ({:.1} MiB file-backed)",
                         blob.len() as f64 / (1024.0 * 1024.0)
                     );
-                    return Some(Self {
-                        lib,
-                        _backing: Some(blob),
-                        store,
-                        dirty: AtomicU64::new(0),
-                        saving: AtomicBool::new(false),
-                        save_lock: Mutex::new(()),
-                        lib_lock: Mutex::new(()),
-                    });
+                    read_lib = Some(lib);
+                    backing = Some(Arc::new(blob));
                 }
                 Err(e) => {
                     let stale_path = blob.path().to_path_buf();
@@ -420,27 +469,36 @@ impl MmapPipelineLibrary {
                 }
             }
         }
-        // Pass an explicit NULL pointer with length 0 rather than `&[]`, whose dangling
-        // non-null slice pointer vkd3d-proton rejects with E_INVALIDARG.
-        let mut lib: Option<ID3D12PipelineLibrary1> = None;
-        (Interface::vtable(&dev1).CreatePipelineLibrary)(
-            Interface::as_raw(&dev1),
-            std::ptr::null(),
-            0,
-            &ID3D12PipelineLibrary1::IID,
-            &mut lib as *mut _ as *mut _,
-        )
-        .ok()
-        .ok()?;
-        let lib = lib?;
+
+        // Open a separate write-only `ID3D12PipelineLibrary1` from the same read-only `MappedBlob`
+        // (zero extra RAM) so `xcl-plib-save` exclusively owns `StorePipeline` + `Serialize`.
+        // If a valid `backing` exists and the 2nd handle fails to open, disable saving for this
+        // run rather than overwriting the valid `.plib` with an empty generation.
+        let write_lib = match &backing {
+            Some(blob) => dev1.CreatePipelineLibrary::<ID3D12PipelineLibrary1>(blob.as_slice()).ok(),
+            None => create_empty_library(&dev1),
+        };
+        if read_lib.is_none() && write_lib.is_none() {
+            return None;
+        }
+
+        let dirty = Arc::new(AtomicU64::new(0));
+        let save_tx = write_lib.map(|wlib| {
+            let (tx, rx) = mpsc::channel::<SaveCmd>();
+            let write_backing = backing.clone();
+            let dirty_worker = dirty.clone();
+            let send_lib = SendLib(wlib);
+            let _ = std::thread::Builder::new().name("xcl-plib-save".into()).spawn(move || {
+                run_save_worker(send_lib, write_backing, store, rx, dirty_worker);
+            });
+            std::sync::Mutex::new(tx)
+        });
+
         Some(Self {
-            lib,
-            _backing: None,
-            store,
-            dirty: AtomicU64::new(0),
-            saving: AtomicBool::new(false),
-            save_lock: Mutex::new(()),
-            lib_lock: Mutex::new(()),
+            read_lib,
+            _read_backing: backing,
+            save_tx,
+            dirty,
         })
     }
 
@@ -448,95 +506,152 @@ impl MmapPipelineLibrary {
         if key.is_empty() || desc.pRootSignature.is_none() || desc.CS.pShaderBytecode.is_null() || desc.CS.BytecodeLength == 0 {
             return None;
         }
+        let lib = self.read_lib.as_ref()?;
         let name = HSTRING::from(key);
-        let _g = self.lib_lock.lock().unwrap();
-        self.lib.LoadComputePipeline(&name, desc).ok()
+        lib.LoadComputePipeline(&name, desc).ok()
     }
 
     pub unsafe fn load_graphics(&self, key: &str, desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Option<ID3D12PipelineState> {
         if key.is_empty() || desc.pRootSignature.is_none() {
             return None;
         }
+        let lib = self.read_lib.as_ref()?;
         let name = HSTRING::from(key);
-        let _g = self.lib_lock.lock().unwrap();
-        self.lib.LoadGraphicsPipeline(&name, desc).ok()
+        lib.LoadGraphicsPipeline(&name, desc).ok()
     }
 
     pub unsafe fn load_stream(&self, key: &str, desc: &D3D12_PIPELINE_STATE_STREAM_DESC) -> Option<ID3D12PipelineState> {
         if key.is_empty() || desc.pPipelineStateSubobjectStream.is_null() || desc.SizeInBytes == 0 {
             return None;
         }
+        let lib = self.read_lib.as_ref()?;
         let name = HSTRING::from(key);
-        let _g = self.lib_lock.lock().unwrap();
-        self.lib.LoadPipeline(&name, desc).ok()
+        lib.LoadPipeline(&name, desc).ok()
     }
 
+    /// Enqueue `(key, pso)` for the dedicated `xcl-plib-save` worker thread. Returns immediately
+    /// (~1 µs) with zero driver lock contention on compile workers.
     pub unsafe fn store(&self, key: &str, pso: &ID3D12PipelineState) -> bool {
         if key.is_empty() {
             return false;
         }
-        let name = HSTRING::from(key);
-        let _g = self.lib_lock.lock().unwrap();
-        if self.lib.StorePipeline(&name, pso).is_ok() {
-            self.dirty.fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
+        let Some(tx) = self.save_tx.as_ref() else { return false };
+        tx.lock().unwrap().send(SaveCmd::Store(key.to_string(), SendPso(pso.clone()))).is_ok()
     }
 
     pub fn dirty_count(&self) -> u64 {
         self.dirty.load(Ordering::Relaxed)
     }
 
-    /// Serialize under `save_lock` (already held by caller), taking `lib_lock` so no concurrent
-    /// `StorePipeline` or `Load*` can race `GetSerializedSize` + `Serialize`.
-    unsafe fn save_locked(&self, min_dirty: u64) -> Option<PathBuf> {
-        let dirty_before = self.dirty.load(Ordering::Acquire);
-        if dirty_before < min_dirty {
+    /// Blocking shutdown flush (e.g. `WM_CLOSE` or `XCL_RUN_SECONDS`): asks `xcl-plib-save` to
+    /// drain any queued `StorePipeline` calls and write a fresh `.plib` generation (bounded by
+    /// `FLUSH_TIMEOUT` so shutdown can never hang).
+    pub unsafe fn flush(&self) -> Option<PathBuf> {
+        let tx = self.save_tx.as_ref()?;
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        if tx.lock().unwrap().send(SaveCmd::Flush(reply_tx)).is_err() {
             return None;
         }
-        let (size, saved) = {
-            let _g = self.lib_lock.lock().unwrap();
-            let size = self.lib.GetSerializedSize();
-            let saved = if size > 0 {
-                self.store.write_generation(size, |buf| self.lib.Serialize(buf).is_ok())
-            } else {
-                None
-            };
-            (size, saved)
+        reply_rx.recv_timeout(FLUSH_TIMEOUT).ok().flatten()
+    }
+}
+
+fn run_save_worker(
+    write_lib: SendLib,
+    _backing: Option<Arc<MappedBlob>>,
+    store: LibraryStore,
+    rx: mpsc::Receiver<SaveCmd>,
+    dirty_counter: Arc<AtomicU64>,
+) {
+    let lib = write_lib.0;
+    let epoch = Instant::now();
+    let now_ms = || epoch.elapsed().as_millis() as u64;
+    let mut dirty: u64 = 0;
+    let mut last_store_ms: u64 = 0;
+    let mut last_save_ms: u64 = 0;
+
+    let save_now = |dirty: &mut u64, last_save_ms: &mut u64| -> Option<PathBuf> {
+        if *dirty == 0 {
+            return None;
+        }
+        let count = *dirty;
+        let size = unsafe { lib.GetSerializedSize() };
+        let saved = if size > 0 {
+            store.write_generation(size, |buf| unsafe { lib.Serialize(buf) }.is_ok())
+        } else {
+            None
         };
-        if let Some((gen, _)) = saved {
-            self.dirty.fetch_sub(dirty_before.min(self.dirty.load(Ordering::Relaxed)), Ordering::Relaxed);
+        if let Some((gen, path)) = saved {
+            *dirty = 0;
+            dirty_counter.store(0, Ordering::Release);
+            *last_save_ms = now_ms();
             crate::xlog_info!(
                 "D3D12.X: saved pipeline library gen-{gen:08x} ({:.1} MiB, {} new pipelines)",
                 size as f64 / (1024.0 * 1024.0),
-                dirty_before
+                count
             );
+            Some(path)
+        } else {
+            None
         }
-        saved.map(|(_, p)| p)
-    }
+    };
 
-    /// Non-blocking periodic save: skips if another save is already in progress. Never replaces or
-    /// truncates the open `_backing` file.
-    pub unsafe fn save_if_dirty(&self, min_dirty: u64) -> Option<PathBuf> {
-        if self.dirty.load(Ordering::Relaxed) < min_dirty {
-            return None;
+    let apply_store = |key: String, pso: SendPso, dirty: &mut u64, last_store_ms: &mut u64| {
+        let name = HSTRING::from(key);
+        if unsafe { lib.StorePipeline(&name, &pso.0) }.is_ok() {
+            *dirty += 1;
+            dirty_counter.store(*dirty, Ordering::Release);
+            *last_store_ms = now_ms();
         }
-        if self.saving.swap(true, Ordering::AcqRel) {
-            return None;
-        }
-        let _guard = self.save_lock.lock().unwrap();
-        let saved = self.save_locked(min_dirty);
-        self.saving.store(false, Ordering::Release);
-        saved
-    }
+        drop(pso);
+    };
 
-    /// Blocking shutdown flush (e.g. `WM_CLOSE` or `XCL_RUN_SECONDS`): waits for any in-flight
-    /// background save on `save_lock` to complete cleanly before flushing remaining dirty entries.
-    pub unsafe fn flush(&self) -> Option<PathBuf> {
-        let _guard = self.save_lock.lock().unwrap();
-        self.save_locked(1)
+    loop {
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(SaveCmd::Store(key, pso)) => {
+                apply_store(key, pso, &mut dirty, &mut last_store_ms);
+                // Drain any burst of queued stores before checking periodic save.
+                let mut pending_flush = None;
+                while let Ok(cmd) = rx.try_recv() {
+                    match cmd {
+                        SaveCmd::Store(k, p) => apply_store(k, p, &mut dirty, &mut last_store_ms),
+                        SaveCmd::Flush(reply) => {
+                            pending_flush = Some(reply);
+                            break;
+                        }
+                    }
+                }
+                if let Some(reply) = pending_flush {
+                    let saved = save_now(&mut dirty, &mut last_save_ms);
+                    let _ = reply.send(saved);
+                } else if should_background_save(dirty, now_ms(), last_store_ms, last_save_ms) {
+                    save_now(&mut dirty, &mut last_save_ms);
+                }
+            }
+            Ok(SaveCmd::Flush(reply)) => {
+                let mut extra_flushes = Vec::new();
+                while let Ok(cmd) = rx.try_recv() {
+                    match cmd {
+                        SaveCmd::Store(k, p) => apply_store(k, p, &mut dirty, &mut last_store_ms),
+                        SaveCmd::Flush(r) => extra_flushes.push(r),
+                    }
+                }
+                let saved = save_now(&mut dirty, &mut last_save_ms);
+                let _ = reply.send(saved.clone());
+                for r in extra_flushes {
+                    let _ = r.send(saved.clone());
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if should_background_save(dirty, now_ms(), last_store_ms, last_save_ms) {
+                    save_now(&mut dirty, &mut last_save_ms);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = save_now(&mut dirty, &mut last_save_ms);
+                break;
+            }
+        }
     }
 }
 

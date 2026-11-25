@@ -10195,15 +10195,9 @@ pub fn flush_pipeline_library() {
 mod pso_lib {
     use super::*;
     use crate::hle::d3d12x::pso_library::MmapPipelineLibrary;
+    #[cfg(test)]
+    use crate::hle::d3d12x::pso_library::should_background_save;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
-    /// Minimum newly stored pipelines before triggering a periodic background generation save.
-    const SAVE_BATCH_THRESHOLD: u64 = 32;
-    /// Minimum spacing between periodic background saves while pipelines are streaming in.
-    const SAVE_MIN_INTERVAL: Duration = Duration::from_secs(15);
-    /// Idle delay after the last stored pipeline before flushing any remaining tail (`>= 1` dirty).
-    const SAVE_IDLE_FLUSH: Duration = Duration::from_secs(5);
 
     struct LibState {
         device: usize,
@@ -10214,45 +10208,6 @@ mod pso_lib {
     }
 
     static LIB_STATE: Mutex<Option<LibState>> = Mutex::new(None);
-    static LAST_STORE_MS: AtomicU64 = AtomicU64::new(0);
-    static LAST_SAVE_MS: AtomicU64 = AtomicU64::new(0);
-    static SAVER_STARTED: std::sync::Once = std::sync::Once::new();
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-
-    fn now_ms() -> u64 {
-        EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
-    }
-
-    /// Pure save-scheduling decision (unit-testable on CPU):
-    /// - Save immediately when `dirty >= SAVE_BATCH_THRESHOLD` and at least `SAVE_MIN_INTERVAL`
-    ///   elapsed since the last save.
-    /// - Or save any tail (`dirty > 0`) once no new pipeline has been stored for `SAVE_IDLE_FLUSH`.
-    pub(super) fn should_background_save(dirty: u64, now_ms: u64, last_store_ms: u64, last_save_ms: u64) -> bool {
-        if dirty == 0 {
-            return false;
-        }
-        let since_save = now_ms.saturating_sub(last_save_ms);
-        let since_store = now_ms.saturating_sub(last_store_ms);
-        (dirty >= SAVE_BATCH_THRESHOLD && since_save >= SAVE_MIN_INTERVAL.as_millis() as u64)
-            || (last_store_ms > 0 && since_store >= SAVE_IDLE_FLUSH.as_millis() as u64 && since_save >= SAVE_IDLE_FLUSH.as_millis() as u64)
-    }
-
-    fn ensure_saver_thread() {
-        SAVER_STARTED.call_once(|| {
-            let _ = std::thread::Builder::new().name("xcl-plib-save".into()).spawn(|| loop {
-                std::thread::sleep(Duration::from_secs(2));
-                let lib = LIB_STATE.lock().unwrap().as_ref().and_then(|s| s.lib.clone());
-                let Some(lib) = lib else { continue };
-                let now = now_ms();
-                let dirty = lib.dirty_count();
-                if should_background_save(dirty, now, LAST_STORE_MS.load(Ordering::Acquire), LAST_SAVE_MS.load(Ordering::Acquire)) {
-                    if unsafe { lib.save_if_dirty(1) }.is_some() {
-                        LAST_SAVE_MS.store(now_ms(), Ordering::Release);
-                    }
-                }
-            });
-        });
-    }
 
     unsafe fn library_for(device: *mut c_void) -> Option<Arc<MmapPipelineLibrary>> {
         if cfg!(test) || device.is_null() || !super::super::pso_library::enabled() {
@@ -10284,17 +10239,14 @@ mod pso_lib {
             hits: 0,
             stores: 0,
         });
-        if ret.is_some() {
-            ensure_saver_thread();
-        }
         ret
     }
 
     pub(super) fn flush_now() {
         let lib = LIB_STATE.lock().unwrap().as_ref().and_then(|s| s.lib.clone());
         if let Some(lib) = lib {
-            if unsafe { lib.flush() }.is_some() {
-                LAST_SAVE_MS.store(now_ms(), Ordering::Release);
+            unsafe {
+                let _ = lib.flush();
             }
         }
     }
@@ -10655,7 +10607,6 @@ mod pso_lib {
         }
         let Some(pso) = ID3D12PipelineState::from_raw_borrowed(&pso_raw) else { return };
         if lib.store(key, pso) {
-            LAST_STORE_MS.store(now_ms(), Ordering::Release);
             if let Some(s) = LIB_STATE.lock().unwrap().as_mut() {
                 s.stores += 1;
             }
