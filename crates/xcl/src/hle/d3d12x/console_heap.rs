@@ -674,6 +674,9 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     write(dst, &w[..n]);
     if !src.sampler {
         note_resource(dst, resource_at(src.at).unwrap_or(0));
+        if w[3] >> 28 >= 8 {
+            super::ambient::copy_descriptor(src.index, dst.index);
+        }
     }
 }
 

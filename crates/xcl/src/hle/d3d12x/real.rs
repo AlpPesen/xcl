@@ -1821,6 +1821,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         }
         super::depth_uav::forget(this as usize);
         super::format_alias::forget(this as usize);
+        super::ambient::forget_resource(this as usize);
         let gone = UMA_BUFFERS.write().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -2557,6 +2558,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         }
     }
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
+        super::ambient::note_descriptor(slot.index, 0, 0, 0, false);
         // A null image SRV was already created and published at `slot.index`. Writing `[0; 8]`
         // would point shaders at `ResourceDescriptorHeap[0]` (memory window 0 / uninitialized),
         // so write a valid T# referencing `slot.index` with the view's format class and type.
@@ -2570,11 +2572,13 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         return super::console_heap::write(&slot, &[0; 8]);
     };
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+        super::ambient::note_descriptor(slot.index, 0, 0, 0, false);
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, true));
     }
     let rdesc = r.GetDesc();
+    super::ambient::note_descriptor(slot.index, res as usize, desc.as_ref().map_or(rdesc.Format.0, |v| v.Format.0), rdesc.Format.0, false);
     match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
         Some(t) => super::console_heap::write(&slot, &t),
         None => {
@@ -2956,6 +2960,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&uav_res) else {
+        super::ambient::note_descriptor(slot.index, 0, 0, 0, true);
         // A null image UAV was already created and published at `slot.index + 1`. Create a
         // matching null companion SRV at `slot.index` and write a valid T# referencing
         // `slot.index` so shaders never fall back to `ResourceDescriptorHeap[0]` / `[1]`.
@@ -2974,6 +2979,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     };
     let rd = uav_rd_opt.unwrap();
     if let Some(v) = uav_desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+        super::ambient::note_descriptor(slot.index, 0, 0, 0, true);
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, false));
@@ -2994,6 +3000,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         }
         None => (rd.Format, resource_dim_to_view(&rd), rd.DepthOrArraySize as u32, 0),
     };
+    super::ambient::note_descriptor(slot.index, uav_res as usize, format.0, rd.Format.0, true);
     let Some((fmt, ty, w, h, d, _)) = view_shape(r, format, dim, array, 1) else {
         note_buffer_view();
         return super::console_heap::write(&slot, &[0; 8]);
@@ -4863,6 +4870,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             }
             note_compute_threads(*ppv as usize, cs);
             note_bvh_traversal(*ppv as usize, cs);
+            super::ambient::note_compute_pso(*ppv as usize, cs);
             note_translated_compute(0, ppv);
             TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
             return Some(Ok(0));
@@ -4884,6 +4892,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         }
         note_compute_threads(*ppv as usize, cs);
         note_bvh_traversal(*ppv as usize, cs);
+        super::ambient::note_compute_pso(*ppv as usize, cs);
         note_translated_compute(S_OK, ppv);
         return Some(Ok(S_OK));
     }
@@ -4915,6 +4924,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     note_compute_threads(*ppv as usize, cs);
     note_bvh_traversal(*ppv as usize, cs);
+    super::ambient::note_compute_pso(*ppv as usize, cs);
     note_translated_compute(hr, ppv);
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
@@ -5868,6 +5878,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
             let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
             note_pso_rs(*ppv, rs);
             super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
+            super::ambient::note_graphics_pso(*ppv as usize, shader_bytes(&d.PS));
             TRANSLATED_GRAPHICS.write().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
             note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
             if super::present::trace_frame() {
@@ -5945,6 +5956,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     }
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
+    super::ambient::note_graphics_pso(*ppv as usize, shader_bytes(&d.PS));
     TRANSLATED_GRAPHICS.write().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::present::trace_frame() {
@@ -7033,6 +7045,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     let hr = finish_two_pass(this, &out, tp, rs, "MS", riid, ppv);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
+        super::ambient::note_graphics_pso(*ppv as usize, console_ps);
         if let Some(tp) = two_pass_of(*ppv as usize) {
             super::dred::label_text(tp.compute, || format!("compute pass of ms {:016x}", crate::gpu::shader::fnv64(ms)));
         }
@@ -7111,6 +7124,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     let hr = finish_two_pass(this, &out, tp, rs, "GS", riid, ppv);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("gs", Some(gs)), ("ps", shader_bytes(&d.PS))]);
+        super::ambient::note_graphics_pso(*ppv as usize, shader_bytes(&d.PS));
     }
     hr
 }
