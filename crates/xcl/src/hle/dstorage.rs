@@ -1205,8 +1205,19 @@ impl QueueInner {
         }
     }
 
+    fn should_auto_submit(entries: &[Entry], capacity: usize) -> bool {
+        // Heap-backed `DestinationPageArray` batches may still have their physical-page lists
+        // populated before the title calls `Submit()`: never auto-submit them mid-batch at half
+        // capacity, only if the queue actually fills.
+        let has_deferred_pages = entries
+            .iter()
+            .any(|e| matches!(e, Entry::Request { dest_pages: Some(_), dest_on_stack: false, .. }));
+        let limit = if has_deferred_pages { capacity } else { (capacity / 2).max(1) };
+        entries.len() >= limit
+    }
+
     fn enqueue(self: &Arc<Self>, e: Entry) {
-        let n = {
+        let auto = {
             let mut p = self.pending.lock().unwrap();
             if self.closed.load(Ordering::Acquire) {
                 return;
@@ -1217,10 +1228,9 @@ impl QueueInner {
                 }
             }
             p.entries.push(e);
-            p.entries.len()
+            Self::should_auto_submit(&p.entries, self.capacity)
         };
-        // as on PC: a half-full queue submits by itself
-        if n >= (self.capacity / 2).max(1) {
+        if auto {
             self.submit();
         }
     }
@@ -1235,7 +1245,7 @@ impl QueueInner {
     }
 
     fn enqueue_numbered(self: &Arc<Self>, entry: impl FnOnce(u64) -> Entry) {
-        let n = {
+        let auto = {
             let mut p = self.pending.lock().unwrap();
             if self.closed.load(Ordering::Acquire) {
                 return;
@@ -1243,9 +1253,9 @@ impl QueueInner {
             let seq = p.next_seq;
             p.next_seq += 1;
             p.entries.push(entry(seq));
-            p.entries.len()
+            Self::should_auto_submit(&p.entries, self.capacity)
         };
-        if n >= (self.capacity / 2).max(1) {
+        if auto {
             self.submit();
         }
     }
@@ -2863,5 +2873,25 @@ mod tests {
             queue_release(q);
             status_release(s);
         }
+    }
+
+    #[test]
+    fn deferred_page_array_batch_does_not_auto_submit_at_half_capacity() {
+        let mk = |dest_pages: Option<Vec<usize>>, dest_on_stack: bool| Entry::Request {
+            seq: 1,
+            req: Request::parse(&[0u8; REQUEST_BYTES]),
+            file: None,
+            dest_pages,
+            dest_on_stack,
+            src_pages: None,
+        };
+        // Regular requests still auto-submit at half capacity (capacity = 4 -> 2).
+        assert!(QueueInner::should_auto_submit(&[mk(None, false), mk(None, false)], 4));
+        // Stack-backed page arrays are already snapshotted at enqueue, so half-capacity stays on.
+        assert!(QueueInner::should_auto_submit(&[mk(Some(vec![1]), true), mk(None, false)], 4));
+        // Heap-backed page arrays wait until Submit() or full capacity.
+        assert!(!QueueInner::should_auto_submit(&[mk(Some(vec![1]), false), mk(None, false)], 4));
+        assert!(!QueueInner::should_auto_submit(&[mk(Some(vec![1]), false), mk(None, false), mk(None, false)], 4));
+        assert!(QueueInner::should_auto_submit(&[mk(Some(vec![1]), false), mk(None, false), mk(None, false), mk(None, false)], 4));
     }
 }
