@@ -155,6 +155,22 @@ pub unsafe fn reservation_to_placeholder(at: usize, len: usize) -> bool {
     VirtualFree(at as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0
 }
 
+/// Release every placeholder in `[at, at + len)`, which splitting may have cut into many (views
+/// in it must be unmapped first). True if all of it went.
+///
+/// # Safety
+/// `[at, at + len)` must be placeholders the caller owns.
+pub unsafe fn release_all(at: usize, len: usize) -> bool {
+    let mut p = at;
+    while p < at + len {
+        match allocation_at(p) {
+            Some((base, size, MEM_RESERVE, _)) if base == p && release(p) => p += size,
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Release the placeholder at `at` (its whole extent; views in it must be unmapped first).
 ///
 /// # Safety

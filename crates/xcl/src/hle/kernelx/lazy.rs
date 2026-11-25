@@ -46,6 +46,7 @@ unsafe fn commit(page: usize) -> bool {
     }
     // (a view of a physical page committed here is writable, not guarded: count it as written)
     super::guards::committed(page);
+    super::alias::committed_at(page);
     true
 }
 
