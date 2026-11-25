@@ -213,6 +213,7 @@ fn f16_packed_attributes_interpolate_per_half() {
             PsAttr { kind: 6, register: 1, mask: 3, flat: false, f16: true, pair: Some(2) },
             PsAttr { kind: 6, register: 3, mask: 0xF, flat: false, f16: false, pair: None },
         ]),
+        early_depth: false,
     };
     // a PS returning four values: Some((dword, high)) of attribute 0, None: attr1[k] as f32
     let ps_code = |sel: [Option<(u64, u64)>; 4]| {
