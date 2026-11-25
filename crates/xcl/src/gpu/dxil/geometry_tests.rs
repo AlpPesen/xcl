@@ -186,14 +186,16 @@ fn geometry_epilogue_coalesces_header_and_vertex_stores() {
 
 /// ES+GS with pre-fetched ES vertex inputs (`v9..v12`) under `HEAP_WINDOWS`: `geom_init`
 /// must load pre-fetched vertices from window 0 in the descriptor heap (`MEM_HEAP_BASE`)
-/// rather than the placeholder `lw.mems[0]` handle (#2383).
+/// rather than the placeholder `lw.mems[0]` handle.
 #[test]
 fn geometry_es_inputs_validate_and_run_with_heap_windows() {
     let e = |n: &str, enc: &str, f: &[(&str, u64)], lit: Option<u32>| encode(n, enc, f, lit).unwrap_or_else(|x| panic!("{n}: {x}"));
+    // ES: compute byte offset = 0x100 + v5 * 4, store fetched v9 to window 0 (`hi = base_hi`),
+    // then jump to GS (which ends immediately).
     let mut code = Vec::new();
-    code.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 20), ("SRC0", 130), ("VSRC1", 5)], None));
-    code.extend(e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 20), ("SRC0", 255), ("VSRC1", 20)], Some(0x100)));
-    code.extend(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 21), ("SRC0", 128)], None));
+    code.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 20), ("SRC0", 130), ("VSRC1", 5)], None)); // v20 = v5 * 4
+    code.extend(e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 20), ("SRC0", 255), ("VSRC1", 20)], Some(0x100))); // v20 += 0x100
+    code.extend(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 21), ("SRC0", 128)], None)); // v21 = 0 (hi = uma_base_hi = 0)
     code.extend(e("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 20), ("DATA", 9), ("SADDR", 0x7D), ("OFFSET", 0)], None));
     code.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None));
     let gs_start = code.len() as u64;
@@ -220,9 +222,10 @@ fn geometry_es_inputs_validate_and_run_with_heap_windows() {
     let split = runner::split_wave64();
     let dxil = translate_geometry(&code, opts(split, 4 | HEAP_WINDOWS), &g).unwrap().dxil;
     let mut io = vec![0u32; 128];
-    io[IO_GS_PRIMS] = 1;
-    io[IO_GS_VERTICES] = 0;
+    io[IO_GS_PRIMS] = 1; // 1 primitive = 3 vertices
+    io[IO_GS_VERTICES] = 0; // pre-fetched vertices start at byte 0 of window 0
     let mut mem = vec![0u32; 128];
+    // 3 vertices, 1 register (16 bytes = 4 dwords) each; component 0 is v9.
     mem[0] = 0x1111_0001;
     mem[4] = 0x2222_0002;
     mem[8] = 0x3333_0003;
