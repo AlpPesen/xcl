@@ -1080,7 +1080,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         return; // swap chain is bound to the first queue we presented from
     }
     // rotate to the oldest in-flight allocator slot and wait only for its fence (frame N-2)
-    if let Err(e) = prepare_pipelined_slot(p, frame.is_some()) {
+    if let Err(e) = prepare_pipelined_slot(p, is_frame) {
         p.disabled = matches!(&e, FenceError::Removed(_));
         if !matches!(&e, FenceError::Timeout(_)) {
             crate::xlog_error!("present: previous copy: {e}");
