@@ -200,6 +200,16 @@ pub(in crate::hle::d3d12x) fn list_reset(list: usize) {
     SHARED.lock().unwrap().remove(&list);
 }
 
+#[cfg(test)]
+pub(in crate::hle::d3d12x) fn seed_shared_for_test(list: usize, allocator: usize) {
+    SHARED.lock().unwrap().insert(list, (allocator, std::sync::Weak::new()));
+}
+
+#[cfg(test)]
+pub(in crate::hle::d3d12x) fn has_shared_for_test(list: usize) -> bool {
+    SHARED.lock().unwrap().contains_key(&list)
+}
+
 /// `to` records right after `from` on the same allocator: its chains go on in `from`'s scratch.
 pub(in crate::hle::d3d12x) fn list_follows(from: usize, to: usize) {
     let mut shared = SHARED.lock().unwrap();

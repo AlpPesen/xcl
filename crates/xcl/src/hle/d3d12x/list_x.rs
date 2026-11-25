@@ -898,6 +898,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     let key = list as usize;
     // (of a list that was here before and whose release was not seen: the GPU may still use it)
     release_copy_scratch(key);
+    real::dispatch_chain::list_reset(key);
     let old = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
@@ -937,6 +938,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 pub(super) fn on_release(list: usize) {
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
+    real::dispatch_chain::list_reset(list);
     super::title_textures::list_reset(list);
     super::format_alias::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
@@ -961,6 +963,7 @@ pub(super) fn on_release(list: usize) {
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
+    real::dispatch_chain::list_reset(list);
     super::title_textures::list_reset(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
@@ -2830,6 +2833,7 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
             continue;
         }
         reset_copy_scratch(seg);
+        super::dred::reset(seg);
         if !heaps.is_empty() {
             pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(seg, 28)(seg, heaps.len() as u32, heaps.as_ptr());
         }
@@ -2958,6 +2962,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     };
 
     // the next segment is a recording of its own (reset or made here, not through `cl_reset`)
+    real::dispatch_chain::list_reset(next_pc as usize);
     super::dred::reset(next_pc);
     if init_pso != 0 {
         super::dred::mark_pipeline(next_pc, bound_pso, init_pso);
@@ -3611,6 +3616,11 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
     reset_copy_scratch(target);
+    // `KickoffX` calls PC `Reset` directly (bypassing `real::cl_reset`), so rotate DRED markers here.
+    super::dred::reset(target);
+    if bound_pso != 0 {
+        super::dred::mark_pipeline(target, bound_pso, init_pso);
+    }
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
         restore_bindings(target, &b, ty);
@@ -4466,6 +4476,11 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     }
 
     reset_copy_scratch(this);
+    // `reset_pc` calls PC `Reset` directly (bypassing `real::cl_reset`), so rotate DRED markers here.
+    super::dred::reset(this);
+    if pso != 0 {
+        super::dred::mark_pipeline(this, pso, resolved);
+    }
     super::format_alias::list_reset(this as usize);
     reset_own_alloc(this);
     let is_bundle = {
@@ -8047,5 +8062,24 @@ mod tests {
         assert_eq!(thread_dims_to_groups([70, 1, 1], [64, 1, 1]), Some([2, 1, 1]));
         assert_eq!(thread_dims_to_groups([1920, 1080, 3], [8, 8, 1]), Some([240, 135, 3]));
         assert_eq!(thread_dims_to_groups([1, 1, 1], [0, 0, 0]), Some([1, 1, 1]));
+    }
+
+    #[test]
+    fn dispatch_chain_shared_scratch_clears_on_create_release_and_segment_clear() {
+        let list = 0x7E57_D150usize;
+        let alloc = 0x7E57_D160usize;
+        // 1. on_create clears any stale SHARED entry at a recycled COM pointer.
+        real::dispatch_chain::seed_shared_for_test(list, alloc);
+        assert!(real::dispatch_chain::has_shared_for_test(list));
+        unsafe { on_create(list as *mut c_void, alloc, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        assert!(!real::dispatch_chain::has_shared_for_test(list));
+        // 2. clear_segment_state clears SHARED when a split segment returns to spares.
+        real::dispatch_chain::seed_shared_for_test(list, alloc);
+        clear_segment_state(list);
+        assert!(!real::dispatch_chain::has_shared_for_test(list));
+        // 3. on_release clears SHARED when the list is released.
+        real::dispatch_chain::seed_shared_for_test(list, alloc);
+        on_release(list);
+        assert!(!real::dispatch_chain::has_shared_for_test(list));
     }
 }

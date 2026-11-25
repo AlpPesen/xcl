@@ -433,6 +433,7 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     if left == 0 {
         if let Some(st) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj)) {
             free_uma(&st.uma);
+            super::real::dispatch_chain::list_reset(st.pc);
             let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(pc_vtable_call(st.pc, 2));
             release(st.pc);
         }
@@ -477,7 +478,11 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
     }
     with_list(obj, |st| new_chunk(obj, st));
     let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
-    f(pc, allocator, pc_pso(pso))
+    let hr = f(pc, allocator, pc_pso(pso));
+    if hr >= 0 {
+        super::real::dispatch_chain::list_reset(pc);
+    }
+    hr
 }
 
 unsafe extern "system" fn cl_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
@@ -1298,5 +1303,31 @@ mod tests {
         assert_eq!(clear_uav_gpu_handle(&slot(0, 0x3000), &slot(0x1000, 0x4000)), 0x3000);
         // CPU slot not in GLOBAL: keep g.pc_gpu_uav.
         assert_eq!(clear_uav_gpu_handle(&slot(0x2000, 0x3000), &slot(0, 0)), 0x3000);
+    }
+
+    #[test]
+    fn cl_reset_and_cl_release_clear_dispatch_chain_shared_scratch() {
+        unsafe extern "system" fn fake_release(_this: usize) -> u32 { 0 }
+        unsafe extern "system" fn fake_reset(_this: usize, _alloc: *mut c_void, _pso: *mut c_void) -> HRESULT { S_OK }
+        let mut vt = [0usize; 16];
+        vt[2] = fake_release as usize;
+        vt[10] = fake_reset as usize;
+        #[repr(C)]
+        struct FakePc { vt: *const usize }
+        let pc_obj = Box::new(FakePc { vt: vt.as_ptr() });
+        let pc_ptr = &*pc_obj as *const FakePc as *mut c_void;
+        let pc_key = pc_ptr as usize;
+        let alloc = 0x7E57_C110usize as *mut c_void;
+        unsafe {
+            let cl = create_with_allocator(pc_ptr, alloc);
+            super::super::real::dispatch_chain::seed_shared_for_test(pc_key, alloc as usize);
+            assert!(super::super::real::dispatch_chain::has_shared_for_test(pc_key));
+            assert_eq!(cl_reset(cl, alloc, std::ptr::null_mut()), S_OK);
+            assert!(!super::super::real::dispatch_chain::has_shared_for_test(pc_key), "cl_reset must clear dispatch_chain SHARED");
+
+            super::super::real::dispatch_chain::seed_shared_for_test(pc_key, alloc as usize);
+            assert_eq!(cl_release(cl), 0);
+            assert!(!super::super::real::dispatch_chain::has_shared_for_test(pc_key), "cl_release must clear dispatch_chain SHARED");
+        }
     }
 }
