@@ -190,7 +190,8 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
                 j += 1;
             }
             let (a, b) = (new[i], win + (new[i] - first));
-            s.ensure_mapped(b, (j - i) * TILE, |w| unsafe { query_tile_holes(super::super::title_textures::mirror_source(a + (w - b))) });
+            // SAFETY: the tiles are address space of a window, with no CPU memory behind them
+            unsafe { s.ensure_mapped(b, (j - i) * TILE, |w| query_tile_holes(super::super::title_textures::mirror_source(a + (w - b)))) };
             for &t in &new[i..j] {
                 let w = win + (t - first);
                 if s.mapped.contains_key(&w) {
@@ -269,5 +270,104 @@ mod tests {
         assert_eq!(m.shown_at(&[0xDD_2000]), vec![(0x30_2000, 0xDD_2000)]);
         m.set_read(0xBB_0000, 0xDD_0000);
         assert_eq!(m.fresh, vec![0x30_0000], "the same place again is nothing new");
+    }
+
+    /// The bytes of the title's pages reach the window tiles mapped for them, and again when the
+    /// title writes a page; a page that went away is left as it is.
+    #[test]
+    fn gpu_the_titles_bytes_reach_the_window_tiles_shown_for_them() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let window = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            let source = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert!(window % TILE == 0 && source % TILE == 0);
+            for i in 0..TILE / 4 {
+                *((source + 4 * i) as *mut u32) = i as u32 * 7 + 1;
+            }
+            let mut reserved: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&buffer_desc(TILE as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).expect("reserved buffer");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("list");
+            rb_list.Close().expect("close");
+            let mut slots = Vec::new();
+            for _ in 0..UPLOAD_SLOTS {
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+                list.Close().expect("close");
+                slots.push(UploadSlot { alloc, list, fence_val: 0 });
+            }
+            let mut s = State {
+                dev,
+                queue,
+                fence,
+                value: 0,
+                event,
+                rb_fence,
+                rb_value: 0,
+                windows: vec![(window, reserved.expect("reserved buffer"))],
+                pools: Vec::new(),
+                free: Vec::new(),
+                retired: Vec::new(),
+                mapped: FxHashMap::default(),
+                pinned: FxHashMap::default(),
+                parked: FxHashMap::default(),
+                buffers: FxHashMap::default(),
+                to_zero: Vec::new(),
+                staging: None,
+                ring_write: 0,
+                ring_submitted: 0,
+                ring_free: 0,
+                inflight: VecDeque::new(),
+                zero_buf: None,
+                slots,
+                next_slot: 0,
+                readback: None,
+                rb_alloc,
+                rb_list,
+                rb_last_fence: 0,
+                waited: FxHashMap::default(),
+                runs: None,
+                scratch_runs: Vec::new(),
+            };
+            let mut m = Mirrors::default();
+            s.ensure_mapped(window, TILE, |_| query_tile_holes(source));
+            m.show(window, 0x7FFF_0000, source);
+            let at = |i: usize| *((window + 4 * i) as *const u32);
+            let shown = |s: &mut State, m: &mut Mirrors, dirty: &[usize]| {
+                s.mirror_up(m, dirty);
+                s.readback_ranges(&[(window, TILE)]);
+            };
+            shown(&mut s, &mut m, &[]);
+            assert!((0..TILE / 4).all(|i| at(i) == i as u32 * 7 + 1), "the whole tile at first");
+            // a page the title wrote (and one it did not)
+            *((source + 0x3010) as *mut u32) = 0xDEAD_BEEF;
+            shown(&mut s, &mut m, &[source + 0x3000]);
+            assert_eq!((at(0x3010 / 4), at(0x3014 / 4)), (0xDEAD_BEEF, (0x3014 / 4) as u32 * 7 + 1));
+            // not reported as written: not sent
+            *((source + 0x4010) as *mut u32) = 0x1234_5678;
+            shown(&mut s, &mut m, &[]);
+            assert_eq!(at(0x4010 / 4), (0x4010 / 4) as u32 * 7 + 1);
+            // the page is gone: what the GPU has stays, and nothing faults
+            assert_ne!(VirtualFree(source as *mut c_void, 0, MEM_RELEASE), 0);
+            m.fresh.push(window);
+            shown(&mut s, &mut m, &[source + 0x5000]);
+            assert_eq!(at(0x3010 / 4), 0xDEAD_BEEF);
+            s.wait_for(s.value);
+            drop(s);
+            VirtualFree(window as *mut c_void, 0, MEM_RELEASE);
+        }
     }
 }
