@@ -1271,6 +1271,44 @@ pub unsafe fn free(p: usize) -> bool {
     u.sparse_release(p).is_some()
 }
 
+/// Allocate a VRAM-only sparse block (zero CPU commit, `holes = 0xFFFF` so CPU write-watch
+/// never overwrites GPU UAV writes) for GPU-writable buffers placed outside the UMA windows.
+pub unsafe fn alloc_vram_only(size: usize, align: usize) -> Option<(usize, usize)> {
+    let u = crate::gpu::uma::get()?;
+    let (addr, rounded) = u.sparse_alloc(size, align.max(TILE))?;
+    let ok = {
+        let mut g = lock_state();
+        if let Some(s) = g.as_mut() {
+            s.ensure_mapped(addr, rounded, |_| 0xFFFF);
+            let last_tile = (addr + rounded - 1) & !(TILE - 1);
+            if s.mapped.contains_key(&addr) && s.mapped.contains_key(&last_tile) {
+                true
+            } else {
+                s.decommit_range(addr, rounded);
+                false
+            }
+        } else {
+            false
+        }
+    };
+    if !ok {
+        u.sparse_release(addr);
+        return None;
+    }
+    Some((addr, rounded))
+}
+
+/// Release a VRAM-only sparse block from `alloc_vram_only` (defers tile unmap behind GPU fences).
+pub unsafe fn free_vram_only(p: usize) -> bool {
+    let Some(u) = crate::gpu::uma::get() else { return false };
+    if !u.is_sparse(p) {
+        return false;
+    }
+    let Some((start, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return false };
+    decommitted(start, len);
+    u.sparse_release(p).is_some()
+}
+
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
 /// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
 /// and spin-waits see the GPU writes without clobbering `sent` hashes.
