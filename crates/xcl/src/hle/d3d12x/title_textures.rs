@@ -1146,7 +1146,8 @@ fn content_hash(b: &[u8]) -> u64 {
 /// Frame milestones (relative to last upload or detected content change) at which unwatched
 /// textures (e.g. physical-page / `MEM_MAPPED` views that `GetWriteWatch` cannot track) are
 /// re-fingerprinted to catch late streaming writes that land after an initial zeroed upload.
-const STREAM_RECHECK_MILESTONES: [u64; 5] = [4, 12, 40, 120, 400];
+/// Milestone `1` catches late writes before one-time decoration/face bakes run.
+const STREAM_RECHECK_MILESTONES: [u64; 6] = [1, 4, 12, 40, 120, 400];
 /// Per-slice sample size (start, mid, end -> at most 48 KiB hashed per due texture).
 const STREAM_SAMPLE_SLICE: usize = 16 * 1024;
 
@@ -1350,19 +1351,29 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
 /// and keeps each GPU copy list short enough to avoid WDDM 2 s TDR when thousands of small
 /// textures stream at once.
 const BATCH_BYTES: usize = 32 << 20;
+/// Tighter batch cap under low Windows commit headroom (`vram::commit_low`) so persistent texture
+/// upload staging buffers stay small instead of growing to 64–144 MiB.
+const BATCH_BYTES_LOW_COMMIT: usize = 8 << 20;
 const BATCH_ITEMS: usize = 256;
 
 /// Whether another upload `(next_dev, next_bytes)` still fits in the current batch of
-/// `picked_count` textures totalling `picked_bytes` on `batch_dev`. An empty batch always takes
-/// its first upload (even if larger than `BATCH_BYTES`) so progress is guaranteed.
-fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_dev: usize, next_bytes: usize) -> bool {
+/// `picked_count` textures totalling `picked_bytes` on `batch_dev` under byte cap `max_bytes`.
+/// An empty batch always takes its first upload (even if larger than `max_bytes`) so progress is
+/// guaranteed.
+fn batch_fits_limit(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_dev: usize, next_bytes: usize, max_bytes: usize) -> bool {
     picked_count == 0
         || (picked_count < BATCH_ITEMS
             && next_dev == batch_dev
-            && picked_bytes.saturating_add(next_bytes) <= BATCH_BYTES)
+            && picked_bytes.saturating_add(next_bytes) <= max_bytes)
 }
 
-/// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS` (one list and one wait each).
+#[cfg(test)]
+fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_dev: usize, next_bytes: usize) -> bool {
+    batch_fits_limit(picked_count, picked_bytes, batch_dev, next_dev, next_bytes, BATCH_BYTES)
+}
+
+/// The uploads `todo`, in batches of up to `BATCH_BYTES` (or `BATCH_BYTES_LOW_COMMIT` when Windows
+/// commit is below reserve) and `BATCH_ITEMS` (one list and one wait each).
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
@@ -1376,8 +1387,9 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         let mut bytes = 0usize;
         let mut device = 0usize;
         let skip_unchanged = unchanged_skip();
+        let max_batch_bytes = if super::vram::commit_low() { BATCH_BYTES_LOW_COMMIT } else { BATCH_BYTES };
         while let Some((_, u)) = todo.peek() {
-            if !batch_fits(picked.len(), bytes, device, u.device, u.tex.size() as usize) {
+            if !batch_fits_limit(picked.len(), bytes, device, u.device, u.tex.size() as usize, max_batch_bytes) {
                 break;
             }
             let (r, u) = todo.next().unwrap();
@@ -2994,14 +3006,14 @@ mod tests {
             g.insert(gpu_res_id, StreamRecheck { base_frame: 100, stage: 0, last_fp: fp0 });
         }
 
-        // Before first milestone (+4 frames -> frame 104), nothing is checked or re-queued.
+        // Before first milestone (+1 frame -> frame 101), nothing is checked or re-queued.
         backing[size - 16] = 0xAB;
-        unsafe { recheck_streamed_unwatched_at(&[], 103) };
+        unsafe { recheck_streamed_unwatched_at(&[], 100) };
         assert!(!TEXTURES.lock().unwrap().by_res.get(&res_id).unwrap().pending);
 
-        // At milestone 0 (frame 104), late write is detected: pending becomes true, schedule resets
-        // to base_frame=104, stage=0, and the gpu_written entry is pruned without re-queuing.
-        unsafe { recheck_streamed_unwatched_at(&[], 104) };
+        // At milestone 0 (frame 101), late write is detected: pending becomes true, schedule resets
+        // to base_frame=101, stage=0, and the gpu_written entry is pruned without re-queuing.
+        unsafe { recheck_streamed_unwatched_at(&[], 101) };
         {
             let mut t = TEXTURES.lock().unwrap();
             let e = t.by_res.get_mut(&res_id).unwrap();
@@ -3014,17 +3026,19 @@ mod tests {
             let g = STREAM_RECHECK.lock().unwrap();
             assert!(!g.contains_key(&gpu_res_id), "gpu_written texture must be pruned from STREAM_RECHECK");
             let st = g.get(&res_id).copied().expect("schedule reset after change");
-            assert_eq!((st.base_frame, st.stage), (104, 0));
+            assert_eq!((st.base_frame, st.stage), (101, 0));
             assert_ne!(st.last_fp, fp0);
         }
 
-        // Advance through all 5 milestones with no further writes: entry must not re-queue and must
-        // clean itself up after milestone 4 (+400 frames -> frame 504).
-        for f in [108, 116, 144, 224, 504] {
+        // Advance through all 6 milestones with no further writes: entry must not re-queue and must
+        // clean itself up after milestone 5 (+400 frames -> frame 501).
+        for f in [102, 105, 113, 141, 221, 501] {
             unsafe { recheck_streamed_unwatched_at(&[], f) };
             assert!(!TEXTURES.lock().unwrap().by_res.get(&res_id).unwrap().pending, "unchanged texture must not re-queue at frame {f}");
         }
         assert!(!STREAM_RECHECK.lock().unwrap().contains_key(&res_id), "entry must retire after final 400-frame milestone");
+        assert!(batch_fits_limit(0, 0, 1, 1, BATCH_BYTES, BATCH_BYTES_LOW_COMMIT), "empty batch always makes progress");
+        assert!(!batch_fits_limit(1, BATCH_BYTES_LOW_COMMIT, 1, 1, 1, BATCH_BYTES_LOW_COMMIT), "low-commit cap bounds batch size");
 
         forget(res_id);
         forget(gpu_res_id);
