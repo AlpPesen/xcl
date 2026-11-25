@@ -1423,7 +1423,9 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
 /// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
 /// as much as the detile of a video frame), else read page run by page run.
 unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
-    if crate::gpu::shader::readable(at, len) {
+    // (in a space of physical pages the title maps and unmaps them all the time, so a page can go
+    // away between the check and the read: `read_committed` copies without faulting)
+    if !crate::hle::kernelx::alias::in_space(at) && crate::gpu::shader::readable(at, len) {
         std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
     } else {
         std::borrow::Cow::Owned(read_committed(at, len))
