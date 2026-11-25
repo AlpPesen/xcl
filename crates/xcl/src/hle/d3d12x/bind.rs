@@ -428,10 +428,10 @@ fn two_pass_steps(max: u32) -> impl Iterator<Item = (u32, bool)> {
 
 /// The record buffers all recordings of a device share (`XCL_TWO_PASS_SHARED=0`: one of each list,
 /// kept until its allocator is reset). A retail title's world frame has more than a hundred lists
-/// with two-pass draws: at 32 MiB a list the first frame took 4 GB of video memory. A direct
-/// queue runs its lists in order and every pass over the records ends with a UAV barrier
-/// (`emit_uav_barrier`), so the next list's passes see none of it as long as there is one direct
-/// queue (`one_direct_queue`).
+/// with two-pass draws: at 32 MiB a list the first frames made 68 of them in 4 s. A queue runs
+/// its lists in order and every pass over the records ends with a UAV barrier
+/// (`emit_uav_barrier`), so the next list's passes see none of it as long as all of them go to
+/// one queue (`note_records_queue`).
 static SHARED_RECORDS: Mutex<Vec<(ID3D12Resource, u64, usize)>> = Mutex::new(Vec::new());
 const SHARED_LEAST: u64 = 32 << 20;
 
@@ -440,13 +440,30 @@ fn shared_records_on() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_TWO_PASS_SHARED").map_or(true, |v| v.trim() != "0"))
 }
 
-/// The title submitted work to at most one direct queue so far.
-unsafe fn one_direct_queue() -> bool {
-    let direct = |q: usize| {
-        let raw = q as *mut c_void;
-        ID3D12CommandQueue::from_raw_borrowed(&raw).is_some_and(|q| q.GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT)
-    };
-    super::present::known_queues().into_iter().filter(|&q| direct(q)).count() <= 1
+/// The queue the recordings with two-pass draws go to (0: none yet), and whether a second one
+/// was seen: the shared buffer is for one queue's lists, which run in order.
+static RECORDS_QUEUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RECORDS_QUEUES_DIFFER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `lists` go to `queue` now (`present::note_execute`): the ones that used the shared record
+/// buffer must all go to one queue.
+pub(super) fn note_records_queue(queue: usize, lists: &[*mut c_void]) {
+    if RECORDS_QUEUES_DIFFER.load(Ordering::Relaxed) {
+        return;
+    }
+    let used = STATES.lock().unwrap().as_ref().is_some_and(|m| lists.iter().any(|&l| m.get(&(l as usize)).is_some_and(|s| s.shared_records)));
+    if used && !same_records_queue(&RECORDS_QUEUE, queue) {
+        RECORDS_QUEUES_DIFFER.store(true, Ordering::Relaxed);
+        crate::xlog_warn!("D3D12.X: two-pass draws go to a second queue ({queue:#x}): the record buffers are the lists' own from here");
+    }
+}
+
+/// `queue` is the first one seen, or the same as it (`seen`: 0 before the first).
+fn same_records_queue(seen: &std::sync::atomic::AtomicUsize, queue: usize) -> bool {
+    match seen.compare_exchange(0, queue, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => true,
+        Err(first) => first == queue,
+    }
 }
 
 /// A shared record buffer of at least `need` bytes: buffer, address, bytes.
@@ -468,11 +485,11 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
     {
         // local: which way the records go, once each
         static SAID: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
-        let one = one_direct_queue();
+        let one = !RECORDS_QUEUES_DIFFER.load(Ordering::Relaxed);
         let on = shared_records_on();
-        SAID[(on && one) as usize].call_once(|| crate::xlog_info!("D3D12.X: two-pass records: {} (switch {on}, one direct queue {one})", if on && one { "shared" } else { "a buffer of each list" }));
+        SAID[(on && one) as usize].call_once(|| crate::xlog_info!("D3D12.X: two-pass records: {} (switch {on}, one queue so far {one})", if on && one { "shared" } else { "a buffer of each list" }));
     }
-    if shared_records_on() && one_direct_queue() {
+    if shared_records_on() && !RECORDS_QUEUES_DIFFER.load(Ordering::Relaxed) {
         let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
         let (buf, cap) = shared_record_buffer(&dev, need)?;
         let first = with(this, |s| !std::mem::replace(&mut s.shared_records, true));
@@ -2549,6 +2566,15 @@ void main(uint t : SV_GroupIndex) {
         assert!(pool_keeps(1, 128 << 20, 128 << 20));
         assert!(!pool_keeps(2, 256 << 20, 4 << 20));
         assert!(!pool_keeps(16, 0, 1 << 20));
+    }
+
+    /// A second queue for two-pass draws is told from the first one.
+    #[test]
+    fn two_pass_records_are_shared_on_one_queue_only() {
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        assert!(same_records_queue(&seen, 0x10) && same_records_queue(&seen, 0x10));
+        assert!(!same_records_queue(&seen, 0x20));
+        assert!(same_records_queue(&seen, 0x10));
     }
 
     /// Recordings share one record buffer, a bigger one is made only when that one is too small.

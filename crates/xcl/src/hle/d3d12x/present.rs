@@ -306,6 +306,7 @@ pub fn activity() -> (u64, u64) {
 
 pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     EXECUTES.fetch_add(1, Ordering::Relaxed);
+    super::bind::note_records_queue(queue as usize, lists);
     {
         let mut q = QUEUES.lock().unwrap();
         if !q.contains(&(queue as usize)) {
