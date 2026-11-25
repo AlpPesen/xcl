@@ -162,6 +162,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
         Err(e) => {
             crate::xlog_error!("loading the game failed: {e}");
             crate::report::write_final(Some(format!("loader: {e}")));
+            crate::hle::kernelx::restore_fine_timer();
             return 0x7C1_0002;
         }
     };
@@ -172,5 +173,6 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::hle::d3d12x::real::flush_pipeline_library();
     crate::report::write_final(None);
     crate::log::flush();
+    crate::hle::kernelx::restore_fine_timer();
     code as i32
 }

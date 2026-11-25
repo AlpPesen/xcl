@@ -4275,6 +4275,7 @@ pub fn end_title(code: u32) -> ! {
             }
         }
         drain_gpu();
+        crate::hle::kernelx::restore_fine_timer();
         crate::log::flush();
         windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code);
     }

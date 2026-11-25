@@ -7,7 +7,7 @@
 #![allow(non_snake_case)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation as fnd;
 use windows_sys::Win32::System::LibraryLoader as ll;
@@ -78,6 +78,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         SetThreadpoolAffinityMask,
         SetThreadAffinityMask,
         SetThreadGroupAffinity,
+        SetThreadPriority,
         QueryProcessorSchedulingStatistics,
         GetConsoleType,
         OutputDebugStringA,
@@ -2197,6 +2198,35 @@ pub unsafe extern "system" fn SetThreadGroupAffinity(h: HANDLE, a: *const GROUP_
     thr::SetThreadGroupAffinity(h, &fit, prev)
 }
 
+fn priority_boost_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_PRIORITY").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Floor guest/title thread priorities at `THREAD_PRIORITY_BELOW_NORMAL` (`-1`) so console
+/// background/streaming threads requesting `LOWEST` (`-2`) or `IDLE` (`-15`) are not starved
+/// on Windows 11 hybrid E-cores. Values `>= THREAD_PRIORITY_BELOW_NORMAL` (including normal,
+/// high, time-critical, and background-mode flags) pass through unchanged.
+fn clamp_thread_priority(priority: i32, floor_enabled: bool) -> i32 {
+    if floor_enabled && priority < thr::THREAD_PRIORITY_BELOW_NORMAL {
+        thr::THREAD_PRIORITY_BELOW_NORMAL
+    } else {
+        priority
+    }
+}
+
+pub unsafe extern "system" fn SetThreadPriority(h: HANDLE, priority: i32) -> BOOL {
+    let clamped = clamp_thread_priority(priority, priority_boost_enabled());
+    if clamped != priority {
+        static CLAMPED: AtomicU64 = AtomicU64::new(0);
+        let n = CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            crate::xlog_info!("SetThreadPriority: floored {priority} → {clamped} (THREAD_PRIORITY_BELOW_NORMAL; #{n})");
+        }
+    }
+    thr::SetThreadPriority(h, clamped)
+}
+
 pub unsafe extern "system" fn QueryProcessorSchedulingStatistics(out: *mut [u64; 3]) {
     if out.is_null() {
         return;
@@ -2239,6 +2269,16 @@ extern "system" {
     fn NtSetTimerResolution(desired: u32, set: u8, current: *mut u32) -> i32;
 }
 
+#[link(name = "winmm", kind = "raw-dylib")]
+extern "system" {
+    fn timeBeginPeriod(period: u32) -> u32;
+    fn timeEndPeriod(period: u32) -> u32;
+}
+
+/// Active timer-resolution requests so `restore_fine_timer()` can cleanly release both on exit.
+static TIMER_MM_ACTIVE: AtomicBool = AtomicBool::new(false);
+static TIMER_NT_FINEST: AtomicU32 = AtomicU32::new(0);
+
 pub fn host_os_version() -> (u32, u32, u32) {
     unsafe {
         let mut v: OsVersionInfoW = std::mem::zeroed();
@@ -2248,12 +2288,13 @@ pub fn host_os_version() -> (u32, u32, u32) {
     }
 }
 
-/// The finest timer Windows offers (0.5 ms) for the title: with the default 15.6 ms tick every
-/// sleep rounds up (a retail game's audio mixer ran at a third of real time). Windows 11 keeps
-/// it while the window is hidden only when told to. Also opt out of Windows 11 Efficiency Mode
+/// The finest timer Windows offers (0.5 ms via `NtSetTimerResolution`, plus `timeBeginPeriod(1)`
+/// fallback) for the title: with the default 15.6 ms tick every sleep rounds up (a retail game's
+/// audio mixer ran at a third of real time). Windows 11 keeps it while the window is hidden only
+/// when told to. Also opt out of Windows 11 Efficiency Mode
 /// (`PROCESS_POWER_THROTTLING_EXECUTION_SPEED`) and lift process priority to `ABOVE_NORMAL` so
 /// foreground title rendering/streaming threads are not demoted behind background OS work
-/// (`XCL_PRIORITY=0` disables priority boost).
+/// (`XCL_PRIORITY=0` disables priority boost and thread-priority flooring).
 pub fn fine_timer() {
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, ProcessPowerThrottling, SetPriorityClass, SetProcessInformation, ABOVE_NORMAL_PRIORITY_CLASS,
@@ -2281,27 +2322,61 @@ pub fn fine_timer() {
         };
         unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &eco_only as *const _ as *const c_void, size) };
     }
-    let boosted = if std::env::var("XCL_PRIORITY").map_or(true, |v| v.trim() != "0") {
+    let boosted = if priority_boost_enabled() {
         unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) != 0 }
+    } else {
+        false
+    };
+    let mm_ok = if TIMER_MM_ACTIVE.load(Ordering::Acquire) {
+        true
+    } else if unsafe { timeBeginPeriod(1) } == 0 {
+        TIMER_MM_ACTIVE.store(true, Ordering::Release);
+        true
     } else {
         false
     };
     // in 100 ns units; "finest" is the smallest period the system supports
     let (mut coarsest, mut finest, mut was) = (0u32, 0u32, 0u32);
     if unsafe { NtQueryTimerResolution(&mut coarsest, &mut finest, &mut was) } < 0 || finest == 0 {
-        crate::xlog_warn!("timer: NtQueryTimerResolution failed – Windows' default resolution (above-normal priority: {boosted})");
+        crate::xlog_warn!(
+            "timer: NtQueryTimerResolution failed (winmm 1 ms: {}; above-normal priority: {})",
+            if mm_ok { "yes" } else { "no" },
+            if boosted { "yes" } else { "no" }
+        );
         return;
     }
-    let mut now = 0u32;
-    let status = unsafe { NtSetTimerResolution(finest, 1, &mut now) };
+    let mut now = was;
+    let status = if TIMER_NT_FINEST.load(Ordering::Acquire) == finest {
+        0
+    } else {
+        let s = unsafe { NtSetTimerResolution(finest, 1, &mut now) };
+        if s >= 0 {
+            TIMER_NT_FINEST.store(finest, Ordering::Release);
+        }
+        s
+    };
     crate::xlog_info!(
-        "timer: {} (was {:.2} ms, now {:.2} ms; EcoQoS/timer-throttle off: {}; above-normal priority: {})",
+        "timer: {} (was {:.2} ms, now {:.2} ms; winmm 1 ms: {}; EcoQoS/timer-throttle off: {}; above-normal priority: {})",
         if status >= 0 { "finest resolution for the title" } else { "raising the resolution failed" },
         was as f64 / 10_000.0,
         now as f64 / 10_000.0,
+        if mm_ok { "yes" } else { "no" },
         if kept { "yes" } else { "no" },
         if boosted { "yes" } else { "no" }
     );
+}
+
+/// Release the process's `NtSetTimerResolution` and `timeBeginPeriod(1)` requests on exit.
+/// Idempotent so both normal returns and forced exits can call it safely.
+pub fn restore_fine_timer() {
+    let finest = TIMER_NT_FINEST.swap(0, Ordering::AcqRel);
+    if finest != 0 {
+        let mut now = 0u32;
+        unsafe { NtSetTimerResolution(finest, 0, &mut now) };
+    }
+    if TIMER_MM_ACTIVE.swap(false, Ordering::AcqRel) {
+        unsafe { timeEndPeriod(1) };
+    }
 }
 
 pub unsafe extern "system" fn GetSystemOSVersion(out: *mut SystemOsVersionInfo) {
@@ -2737,6 +2812,39 @@ mod tests {
         }
         let per = t.elapsed() / 20;
         assert!(per < std::time::Duration::from_millis(5), "Sleep(1) took {per:?}: the 15.6 ms tick");
+        // Verify clean, idempotent exit restoration of NtSetTimerResolution + timeBeginPeriod(1).
+        restore_fine_timer();
+        restore_fine_timer();
+        assert!(!TIMER_MM_ACTIVE.load(Ordering::Acquire));
+        assert_eq!(TIMER_NT_FINEST.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn thread_priority_floor_clamps_lowest_and_idle_to_below_normal() {
+        assert_eq!(clamp_thread_priority(thr::THREAD_PRIORITY_IDLE, true), thr::THREAD_PRIORITY_BELOW_NORMAL);
+        assert_eq!(clamp_thread_priority(thr::THREAD_PRIORITY_LOWEST, true), thr::THREAD_PRIORITY_BELOW_NORMAL);
+        assert_eq!(clamp_thread_priority(thr::THREAD_PRIORITY_BELOW_NORMAL, true), thr::THREAD_PRIORITY_BELOW_NORMAL);
+        assert_eq!(clamp_thread_priority(thr::THREAD_PRIORITY_NORMAL, true), thr::THREAD_PRIORITY_NORMAL);
+        assert_eq!(clamp_thread_priority(thr::THREAD_PRIORITY_ABOVE_NORMAL, true), thr::THREAD_PRIORITY_ABOVE_NORMAL);
+        assert_eq!(clamp_thread_priority(thr::THREAD_PRIORITY_HIGHEST, true), thr::THREAD_PRIORITY_HIGHEST);
+        assert_eq!(clamp_thread_priority(thr::THREAD_PRIORITY_TIME_CRITICAL, true), thr::THREAD_PRIORITY_TIME_CRITICAL);
+        assert_eq!(clamp_thread_priority(thr::THREAD_PRIORITY_IDLE, false), thr::THREAD_PRIORITY_IDLE);
+        assert_eq!(clamp_thread_priority(thr::THREAD_PRIORITY_LOWEST, false), thr::THREAD_PRIORITY_LOWEST);
+
+        // Live thread check through the exported guest hook: IDLE/LOWEST floor to BELOW_NORMAL.
+        if priority_boost_enabled() {
+            std::thread::spawn(|| unsafe {
+                let me = thr::GetCurrentThread();
+                assert_ne!(SetThreadPriority(me, thr::THREAD_PRIORITY_IDLE), 0);
+                assert_eq!(thr::GetThreadPriority(me), thr::THREAD_PRIORITY_BELOW_NORMAL);
+                assert_ne!(SetThreadPriority(me, thr::THREAD_PRIORITY_LOWEST), 0);
+                assert_eq!(thr::GetThreadPriority(me), thr::THREAD_PRIORITY_BELOW_NORMAL);
+                assert_ne!(SetThreadPriority(me, thr::THREAD_PRIORITY_NORMAL), 0);
+                assert_eq!(thr::GetThreadPriority(me), thr::THREAD_PRIORITY_NORMAL);
+            })
+            .join()
+            .unwrap();
+        }
     }
 
     #[test]
