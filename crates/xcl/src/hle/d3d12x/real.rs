@@ -6176,10 +6176,10 @@ unsafe fn go_background(
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
     // a big compute program that writes nothing but images: binds can go on without it
-    let image_only = compute && super::pso_async::image_skip() && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
+    let big_image_only = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
+    let image_only = big_image_only && super::pso_async::image_skip();
     let bvh_trav = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::uses_bvh_intersect(b)));
     let heavy_compute = compute
-        && bvh_gate_enabled()
         && super::pso_async::async_heavy_compute()
         && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::compute_code_len(b).is_some_and(|n| n >= crate::gpu::effects::HEAVY_CODE)));
     if compute {
@@ -6208,7 +6208,10 @@ unsafe fn go_background(
     if driver != 0 {
         super::pso_async::shared(*ppv as usize, driver);
     }
-    if image_only {
+    // Only pure image-writing compute shaders (zero buffer/global/GDS writes) or BVH RT traversal
+    // shaders may ever be spared/skipped while building. Heavy producer compute shaders that write
+    // memory are deprioritized onto gated workers (`heavy_compute`) but NEVER skipped.
+    if image_only || (heavy_compute && big_image_only) {
         super::pso_async::image_only(*ppv as usize);
     }
     if bvh_trav && bvh_gate_enabled() {

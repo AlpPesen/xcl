@@ -388,8 +388,89 @@ fn enqueue(p: Arc<Pending>) {
     );
 }
 
+/// Commit-headroom thresholds (`GlobalMemoryStatusEx::ullAvailPageFile`) for throttling background
+/// PSO compilation under memory pressure (`XCL_PSO_MEM_THROTTLE=0`: off).
+const PRELOAD_PAUSE_COMMIT: u64 = 4 << 30;
+const WORKER_CAP_2_COMMIT: u64 = 4 << 30;
+const WORKER_CAP_1_COMMIT: u64 = 2 << 30;
+
+fn mem_throttle_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !cfg!(test) && !std::env::var("XCL_PSO_MEM_THROTTLE").is_ok_and(|v| v.trim() == "0"))
+}
+
+fn avail_commit_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile)
+}
+
+/// Maximum concurrent top-level PSO worker builds allowed for the current available commit bytes:
+/// `< 2 GiB` -> 1 worker (never 0, no deadlock), `< 4 GiB` -> at most 2, otherwise `max_workers`.
+fn worker_cap_for_commit(avail_commit: Option<u64>, max_workers: usize) -> usize {
+    let max_workers = max_workers.max(1);
+    match avail_commit {
+        Some(avail) if avail < WORKER_CAP_1_COMMIT => 1,
+        Some(avail) if avail < WORKER_CAP_2_COMMIT => max_workers.min(2),
+        _ => max_workers,
+    }
+}
+
+/// Pause speculative `xcl-pso-pre-*` preload builds while available commit is below 4 GiB.
+fn should_pause_preload(avail_commit: Option<u64>) -> bool {
+    avail_commit.is_some_and(|avail| avail < PRELOAD_PAUSE_COMMIT)
+}
+
+struct ActiveWorkerGate {
+    active: Mutex<usize>,
+    cv: Condvar,
+}
+
+static ACTIVE_WORKERS: ActiveWorkerGate = ActiveWorkerGate {
+    active: Mutex::new(0),
+    cv: Condvar::new(),
+};
+
+struct ActiveWorkerGuard;
+
+impl Drop for ActiveWorkerGuard {
+    fn drop(&mut self) {
+        let mut n = ACTIVE_WORKERS.active.lock().unwrap();
+        *n = n.saturating_sub(1);
+        ACTIVE_WORKERS.cv.notify_all();
+    }
+}
+
+fn acquire_worker_slot(max_workers: usize) -> ActiveWorkerGuard {
+    let mut n = ACTIVE_WORKERS.active.lock().unwrap();
+    loop {
+        let avail = mem_throttle_enabled().then(avail_commit_bytes).flatten();
+        let cap = worker_cap_for_commit(avail, max_workers);
+        if *n < cap {
+            if cap < max_workers {
+                static LOGGED: std::sync::Once = std::sync::Once::new();
+                LOGGED.call_once(|| {
+                    crate::xlog_info!(
+                        "D3D12.X: throttling PSO workers to {cap} under low commit headroom ({} MiB free)",
+                        avail.unwrap_or(0) >> 20
+                    );
+                });
+            }
+            *n += 1;
+            return ActiveWorkerGuard;
+        }
+        n = ACTIVE_WORKERS.cv.wait_timeout(n, std::time::Duration::from_millis(50)).unwrap().0;
+    }
+}
+
 fn build_queued(p: &Arc<Pending>) {
     // (released by the title meanwhile)
+    if p.orphan.load(Ordering::Acquire) {
+        drop_unstarted_job(p);
+        return;
+    }
+    let _slot = acquire_worker_slot(crate::gpu::recomp::dxc::compile_threads());
     if p.orphan.load(Ordering::Acquire) {
         drop_unstarted_job(p);
         return;
@@ -612,6 +693,24 @@ fn preload() -> Option<&'static Preload> {
                         }
                     };
                     // (released by the title meanwhile)
+                    if p.orphan.load(Ordering::Acquire) {
+                        drop_unstarted_job(&p);
+                        continue;
+                    }
+                    // Pause speculative preload under low commit headroom (< 4 GiB) unless a bind
+                    // actively wants this pipeline; leave `p.job` untouched so binds can take it.
+                    while mem_throttle_enabled()
+                        && !p.orphan.load(Ordering::Acquire)
+                        && !p.demand.lock().unwrap().wanted
+                        && p.job.lock().unwrap().is_some()
+                        && should_pause_preload(avail_commit_bytes())
+                    {
+                        static PAUSED_LOG: std::sync::Once = std::sync::Once::new();
+                        PAUSED_LOG.call_once(|| {
+                            crate::xlog_info!("D3D12.X: pausing speculative PSO preload under low commit headroom (< 4 GiB)");
+                        });
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
                     if p.orphan.load(Ordering::Acquire) {
                         drop_unstarted_job(&p);
                         continue;
@@ -1158,9 +1257,18 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
-    let job = p.job.lock().unwrap().take();
-    if let Some(job) = job {
-        complete(&p, job());
+    if p.deprioritized.load(Ordering::Acquire) && !building_here() {
+        // Heavy non-RT producer compute PSO: compile on an `xcl-pso-*` worker (where `BIG_COMPILES`
+        // gating bounds concurrent driver compiles) and wait until ready so the producer dispatch
+        // is NEVER skipped.
+        if !p.sent.swap(true, Ordering::AcqRel) {
+            enqueue(p.clone());
+        }
+    } else {
+        let job = p.job.lock().unwrap().take();
+        if let Some(job) = job {
+            complete(&p, job());
+        }
     }
     p.want();
     let mut done = p.done.lock().unwrap();
@@ -1242,13 +1350,14 @@ pub fn async_heavy_compute() -> bool {
     *ON.get_or_init(|| !std::env::var("XCL_ASYNC_HEAVY_COMPUTE").is_ok_and(|v| v.trim() == "0"))
 }
 
-/// The compute pipeline behind stand-in `standin` is a heavyweight shader (`>= 512 KiB` DXIL):
-/// never compile it synchronously on title threads — queue it at lower worker priority behind
-/// normal/MS PSOs and return the stand-in until background `BIG_COMPILES` finishes it.
+/// The compute pipeline behind stand-in `standin` is a heavyweight shader (`>= 24 KiB` console
+/// code): never compile it synchronously on title threads — queue it deprioritized behind
+/// normal/MS PSOs so `xcl-pso-*` workers compile it under `BIG_COMPILES` gating. Does NOT mark
+/// `spared`, so non-RT producer compute shaders that write memory are NEVER skipped (call
+/// `image_only` or `bvh_traversal` separately only for pure image-writing or BVH RT shaders).
 pub fn heavy_compute(standin: usize) {
     if let Some(p) = entry(standin) {
         p.deprioritized.store(true, Ordering::Release);
-        p.spared.store(true, Ordering::Release);
     }
 }
 
@@ -1261,9 +1370,9 @@ pub fn bvh_traversal(standin: usize) {
     }
 }
 
-/// `resolve_wait` for a pipeline binds do not wait for (`image_only`): the real one once built,
-/// else the stand-in, with the build sent to the workers. Nobody waits, so the build is not
-/// `wanted`: a big one takes its turn among the driver's compiles and waits for free commit.
+/// `resolve_wait` for a pipeline binds do not wait for (`image_only` or `bvh_traversal`): the real
+/// one once built, else the stand-in, with the build sent to the workers. Nobody waits, so the
+/// build is not `wanted`: a big one takes its turn among the driver's compiles and waits for free commit.
 fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {
@@ -1274,7 +1383,12 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
                 if n < 16 || n.is_power_of_two() {
-                    crate::xlog_info!("D3D12.X: a compute program that writes only images is still being built: its dispatches are left out until it is ({} so far)", n + 1);
+                    let kind = if p.bvh_traversal.load(Ordering::Acquire) {
+                        "a BVH ray-tracing compute program"
+                    } else {
+                        "a compute program that writes only images"
+                    };
+                    crate::xlog_info!("D3D12.X: {kind} is still being built: its dispatches are left out until it is ({} so far)", n + 1);
                 }
             }
             p.stand(pso)
@@ -1392,5 +1506,38 @@ mod pso_queue_tests {
             (q.pop())();
         }
         assert_eq!(*order.lock().unwrap(), ["promoted", "wanted", "bg1", "heavy1", "heavy2"]);
+    }
+
+    #[test]
+    fn heavy_compute_producer_runs_on_worker_and_is_never_skipped() {
+        let standin = 0x7E57_B0C1usize;
+        let (tx, rx) = mpsc::channel();
+        submit_lazy(standin, true, Box::new(move || {
+            let on_worker = std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso-"));
+            let _ = tx.send(on_worker);
+            0x5C5C
+        }), 0);
+        heavy_compute(standin);
+        // Must wait for the worker and return the real PSO (never skip a memory-writing producer).
+        assert_eq!(resolve_wait_for(standin, None), 0x5C5C);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("ran on worker"), "heavy producer must compile on xcl-pso worker");
+        let _ = released(standin);
+    }
+
+    #[test]
+    fn commit_headroom_throttles_workers_and_pauses_preload() {
+        assert_eq!(worker_cap_for_commit(None, 8), 8);
+        assert_eq!(worker_cap_for_commit(Some(6 << 30), 8), 8);
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_2_COMMIT), 8), 8);
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_2_COMMIT - 1), 8), 2);
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_1_COMMIT), 8), 2);
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_1_COMMIT - 1), 8), 1);
+        assert_eq!(worker_cap_for_commit(Some(0), 8), 1, "must never drop to 0 workers");
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_2_COMMIT - 1), 1), 1);
+
+        assert!(!should_pause_preload(None));
+        assert!(!should_pause_preload(Some(PRELOAD_PAUSE_COMMIT)));
+        assert!(should_pause_preload(Some(PRELOAD_PAUSE_COMMIT - 1)));
+        assert!(should_pause_preload(Some(0)));
     }
 }
