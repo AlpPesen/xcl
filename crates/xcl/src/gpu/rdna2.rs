@@ -222,9 +222,14 @@ pub fn decode(code: &[u8], pc: u64) -> Result<Decoded, DecodeError> {
                 && o.field.and_then(|f| field_value(enc, &base_words, f)) == Some(255)
         });
         // VALU: the literal is fetched whenever a source field selects it, even one the
-        // opcode does not read – console compilers hide the shader hash in v_nop literals
+        // opcode does not read – console compilers hide the shader hash in v_nop literals.
+        // Skip fields whose operand definition is a non-source index (e.g. VOP3 v_interp_*
+        // SRC0 = OPR_ATTR, where attr63.w encodes 0xFF == 255).
         if !has_literal && is_valu(enc) {
-            has_literal = ["SRC0", "SRC1", "SRC2"].iter().any(|f| field_value(enc, &base_words, f) == Some(255));
+            has_literal = ["SRC0", "SRC1", "SRC2"].iter().any(|f| {
+                !ienc.operands.iter().any(|o| !o.implicit && o.field == Some(*f) && !is_src_type(o.ty))
+                    && field_value(enc, &base_words, f) == Some(255)
+            });
         }
     }
     if has_literal {
@@ -1290,5 +1295,29 @@ mod tests {
         }
         assert!(total > 2500 && modified > 250, "the SDWA tests are not all there: {total} lines, {modified} with source or output modifiers");
         assert!(wrong.is_empty(), "{} of {total} SDWA lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
+    }
+
+    #[test]
+    fn vop3_interp_attr63_w_does_not_consume_literal() {
+        // VOP3 v_interp_p1ll_f16 / v_interp_p2_f16 encode (high<<8)|(chan<<6)|attr in SRC0.
+        // attr63.w (high=0, chan=3, attr=63) yields SRC0 == 0xFF == 255, which is OPR_ATTR
+        // rather than a 32-bit inline literal.
+        for name in ["V_INTERP_P1LL_F16", "V_INTERP_P2_F16"] {
+            let mut bytes = encode(name, "ENC_VOP3", &[("VDST", 1), ("SRC0", 0xFF), ("SRC1", 256), ("SRC2", 257)], None).unwrap();
+            assert_eq!(bytes.len(), 8);
+            bytes.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+            let d = decode(&bytes, 0).unwrap();
+            assert_eq!(d.inst.name, name);
+            assert_eq!(d.len, 8, "{name} attr63.w must not consume a 32-bit literal");
+            assert_eq!(d.literal, None);
+            let next = decode(&bytes[d.len..], d.len as u64).unwrap();
+            assert_eq!(next.inst.name, "S_ENDPGM");
+        }
+        // Console compilers still hide shader hashes in v_nop with SRC0 == 255.
+        let vnop = encode("V_NOP", "ENC_VOP1", &[("SRC0", 255)], Some(0x1234_5678)).unwrap();
+        let d = decode(&vnop, 0).unwrap();
+        assert_eq!(d.inst.name, "V_NOP");
+        assert_eq!(d.len, 8);
+        assert_eq!(d.literal, Some(0x1234_5678));
     }
 }
