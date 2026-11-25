@@ -4444,6 +4444,16 @@ fn cap_holds_for_cached() -> bool {
     *V.get_or_init(|| std::env::var("XCL_PSO_MAX_CACHED").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// local: records (16 hex digits a line) in the file `XCL_PSO_SKIP_FILE` names
+fn skip_listed(record: u64) -> bool {
+    static L: OnceLock<std::collections::HashSet<u64>> = OnceLock::new();
+    L.get_or_init(|| {
+        let Some(p) = std::env::var_os("XCL_PSO_SKIP_FILE") else { return Default::default() };
+        std::fs::read_to_string(p).unwrap_or_default().lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect()
+    })
+    .contains(&record)
+}
+
 fn over_build_cap(dxil: usize, cap: usize) -> bool {
     cap != 0 && dxil > cap
 }
@@ -4475,6 +4485,14 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     }
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+    }
+    if skip_listed(record) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 3 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: compute PSO of record {record:016x} not built: in the skip list ({} so far)", n + 1);
+        }
+        return (E_OUTOFMEMORY, std::time::Duration::ZERO, false);
     }
     if (cached.is_none() || cap_holds_for_cached()) && over_build_cap(dxil.len(), build_cap_bytes()) {
         crate::xlog_warn!("D3D12.X: compute PSO of record {record:016x} ({} B DXIL) not built: over XCL_PSO_MAX_KB{}", dxil.len(), if cached.is_none() { " and without a saved blob" } else { " (it has a saved blob)" });
