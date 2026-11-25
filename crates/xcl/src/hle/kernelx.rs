@@ -1435,12 +1435,74 @@ unsafe fn release_at(at: usize) {
     mem::VirtualFree(at as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT);
 }
 
+/// Coalesces contiguous 64 KiB sparse-window commits inside `map_pages` / scatter calls so a
+/// multi-gigabyte `XMemMapPhysicalPages` issues one `sparse::committed(start, len)` per run
+/// instead of one `UpdateTileMappings` + `Signal` per page.
+#[derive(Default)]
+struct SparseCommitBatch {
+    run: Option<(usize, usize)>,
+}
+
+impl SparseCommitBatch {
+    fn push_with(&mut self, at: usize, mut emit: impl FnMut(usize, usize)) {
+        if let Some((start, len)) = &mut self.run {
+            if start.checked_add(*len) == Some(at) {
+                *len += PHYS_PAGE;
+                return;
+            }
+        }
+        if let Some((start, len)) = self.run.take() {
+            emit(start, len);
+        }
+        self.run = Some((at, PHYS_PAGE));
+    }
+
+    fn flush_if_contains_with(&mut self, addr: usize, mut emit: impl FnMut(usize, usize)) {
+        if let Some((start, len)) = self.run {
+            if addr >= start && addr < start.saturating_add(len) {
+                self.run = None;
+                emit(start, len);
+            }
+        }
+    }
+
+    fn flush_with(&mut self, mut emit: impl FnMut(usize, usize)) {
+        if let Some((start, len)) = self.run.take() {
+            emit(start, len);
+        }
+    }
+
+    unsafe fn push(&mut self, at: usize) {
+        self.push_with(at, |a, n| crate::hle::d3d12x::sparse::committed(a, n));
+    }
+
+    unsafe fn flush_if_contains(&mut self, addr: usize) {
+        self.flush_if_contains_with(addr, |a, n| crate::hle::d3d12x::sparse::committed(a, n));
+    }
+
+    unsafe fn flush(&mut self) {
+        self.flush_with(|a, n| crate::hle::d3d12x::sparse::committed(a, n));
+    }
+}
+
 /// A page mapped away from home (at `old`) that the title maps at `at`: what `old` holds copied
 /// to `at`, and `old` given up – its home is not used. By way of its home a move was four
 /// commits and decommits, each a tile mapping in a sparse window: a retail game moving pages one
 /// at a time after its first movie spent 20 s in them and its watchdog ended it. False: the page
 /// was never used at `old` (its home holds it, zeros) and is not mapped anywhere now.
+#[cfg(test)]
 unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma: bool) -> Result<bool, ()> {
+    move_away_batched(away, old, at, page, in_uma, None)
+}
+
+unsafe fn move_away_batched(
+    away: &mut Away,
+    old: usize,
+    at: usize,
+    page: usize,
+    in_uma: bool,
+    mut sparse_batch: Option<&mut SparseCommitBatch>,
+) -> Result<bool, ()> {
     if lazy::unmark(old) {
         away.at.remove(&old);
         away.page.remove(&page);
@@ -1454,7 +1516,13 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     away.page.remove(&page);
     std::ptr::copy_nonoverlapping(old as *const u8, at as *mut u8, PHYS_PAGE);
     if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
-        crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
+        match sparse_batch.as_deref_mut() {
+            Some(batch) => batch.push(at),
+            None => crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE),
+        }
+    }
+    if let Some(batch) = sparse_batch {
+        batch.flush_if_contains(old);
     }
     release_at(old);
     away.at.insert(at, page);
@@ -1589,7 +1657,9 @@ pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _
     }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
-    let r = map_pages(away, va, n, arr);
+    let mut sparse_batch = SparseCommitBatch::default();
+    let r = map_pages(away, va, n, arr, &mut sparse_batch);
+    sparse_batch.flush();
     give_back_homes(away);
     r
 }
@@ -1607,8 +1677,9 @@ unsafe fn map_aliased(va: *mut c_void, n: usize, arr: *mut usize) -> *mut c_void
 }
 
 /// `MapTitlePhysicalPages` with `AWAY` held; the homes it moves away are given back by the
-/// caller (`give_back_homes`).
-unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize) -> *mut c_void {
+/// caller (`give_back_homes`), and contiguous sparse-window commits are flushed by the caller
+/// (`sparse_batch.flush()`).
+unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize, sparse_batch: &mut SparseCommitBatch) -> *mut c_void {
     note_mapping_at(va as usize);
     if crate::gpu::uma::get().is_none() || n == 0 || (va.is_null() && arr.is_null()) {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -1659,6 +1730,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         let at = base + i * PHYS_PAGE;
         // what was mapped at `at` goes; the new page is written down once it is in place
         away.title.remove(&at);
+        sparse_batch.flush_if_contains(at);
         if unmap_away(away, at, &(0..0)) {
             (at_run, home_run) = Default::default();
         }
@@ -1668,7 +1740,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         if let Some(&old) = away.page.get(&p) {
             // (a move commits `at` and decommits `old`, which may lie in a run already answered:
             // both runs go – #556)
-            match move_away(away, old, at, p, in_uma(at)) {
+            match move_away_batched(away, old, at, p, in_uma(at), Some(sparse_batch)) {
                 Ok(true) => {
                     (at_run, home_run) = Default::default();
                     away.title.insert(at, p);
@@ -1707,7 +1779,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE); // a page never used: zeros
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
-            crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
+            sparse_batch.push(at);
         }
         away.at.insert(at, p);
         away.page.insert(p, at);
@@ -1748,7 +1820,9 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
-    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, page(i)).is_null());
+    let mut sparse_batch = SparseCommitBatch::default();
+    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, page(i), &mut sparse_batch).is_null());
+    sparse_batch.flush();
     give_back_homes(away);
     ok as BOOL
 }
@@ -3101,6 +3175,30 @@ mod tests {
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
             mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn sparse_commit_batch_coalesces_contiguous_pages_and_flushes_on_overlap() {
+        let mut batch = SparseCommitBatch::default();
+        let mut emitted = Vec::new();
+        let base = 0x1_0000_0000usize;
+        // 4 contiguous 64 KiB pages coalesce into a single 256 KiB run.
+        for i in 0..4 {
+            batch.push_with(base + i * PHYS_PAGE, |a, n| emitted.push((a, n)));
+        }
+        assert!(emitted.is_empty());
+        // Discontiguous page flushes the first run and starts a second.
+        batch.push_with(base + 10 * PHYS_PAGE, |a, n| emitted.push((a, n)));
+        assert_eq!(emitted, vec![(base, 4 * PHYS_PAGE)]);
+        batch.push_with(base + 11 * PHYS_PAGE, |a, n| emitted.push((a, n)));
+        // Unrelated address does not flush; overlapping address flushes immediately.
+        batch.flush_if_contains_with(base + 9 * PHYS_PAGE, |a, n| emitted.push((a, n)));
+        assert_eq!(emitted.len(), 1);
+        batch.flush_if_contains_with(base + 10 * PHYS_PAGE, |a, n| emitted.push((a, n)));
+        assert_eq!(emitted, vec![(base, 4 * PHYS_PAGE), (base + 10 * PHYS_PAGE, 2 * PHYS_PAGE)]);
+        // Trailing flush on empty batch is a no-op.
+        batch.flush_with(|a, n| emitted.push((a, n)));
+        assert_eq!(emitted.len(), 2);
     }
 
     /// Timing (`--ignored --nocapture`; `XCL_SCATTER_PAGES=4096,8192`): pages written at their
