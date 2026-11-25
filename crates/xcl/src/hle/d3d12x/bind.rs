@@ -73,6 +73,15 @@ fn uma_va_in(u: &crate::gpu::uma::Uma, windows: &[u64], p: usize) -> Option<u64>
 }
 
 #[derive(Default)]
+struct ScratchSlot {
+    buf: Option<(ID3D12Resource, u64, usize)>,
+    used: u64,
+    /// D3D12 state on this list (`COMMON` initially, kept in `INDIRECT_ARGUMENT` between uses;
+    /// buffers decay to `COMMON` after `ExecuteCommandLists`).
+    state: D3D12_RESOURCE_STATES,
+}
+
+#[derive(Default)]
 struct State {
     layout: Option<Arc<Layout>>,
     args: Vec<u8>,
@@ -96,15 +105,16 @@ struct State {
     res_retired: Vec<(ID3D12Resource, u64, usize)>,
     /// the recording used the shared record buffer (`shared_record_buffer`)
     shared_records: bool,
-    /// rewritten indirect arguments (`scratch_args`): the block, its bytes in use, and the
-    /// bytes of blocks this recording took
-    scratch: Option<(ID3D12Resource, u64, usize)>,
-    scratch_used: u64,
+    /// rewritten indirect arguments (`scratch_args`): two ping-pong scratch slots so consecutive
+    /// guarded/two-pass ExecuteIndirects avoid false WAR transition stalls on the same buffer,
+    /// plus total bytes of blocks this recording took (`scratch_taken`).
+    scratch: [ScratchSlot; 2],
+    scratch_next: usize,
     scratch_taken: u64,
-    /// D3D12 state of the current `scratch` block on this list (`COMMON` initially, kept in
-    /// `INDIRECT_ARGUMENT` between consecutive argument-rewrite passes; buffers decay to `COMMON`
-    /// after `ExecuteCommandLists`)
-    scratch_state: D3D12_RESOURCE_STATES,
+    /// true after an `INDIRECT_ARGUMENT` transition has ordered prior writes on this list and
+    /// no compute/mesh dispatch has run since (skips redundant `fresh_indirect_arguments` barriers
+    /// across runs of consecutive indirect graphics draws).
+    arg_order_clean: bool,
     /// cached UMA window GPU VAs for this recording (avoids locking `UMA_BUFFER` every draw)
     uma_windows: Option<Vec<u64>>,
     /// reusable zeroed 256-byte `u1` (`res`) slot in this recording's UMA arena
@@ -204,8 +214,10 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.heaps = [0; 2];
         s.shared_records = false;
         // (the scratch blocks are in `res_retired` already)
-        (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
-        s.scratch_state = D3D12_RESOURCE_STATE_COMMON;
+        s.scratch = Default::default();
+        s.scratch_next = 0;
+        s.scratch_taken = 0;
+        s.arg_order_clean = false;
         s.uma_windows = None;
         s.dummy_res_va = 0;
         s.pc_abi_gfx = AbiBound::default();
@@ -268,8 +280,10 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.rs_cs = rs_cs;
         s.pso = pso;
         s.heaps = heaps;
-        (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
-        s.scratch_state = D3D12_RESOURCE_STATE_COMMON;
+        s.scratch = Default::default();
+        s.scratch_next = 0;
+        s.scratch_taken = 0;
+        s.arg_order_clean = false;
         s.uma_windows = None;
         s.dummy_res_va = 0;
         s.pc_abi_gfx = AbiBound::default();
@@ -952,14 +966,13 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     super::real::uma_window_buffer(src, 12).ok_or("the indirect arguments are not in one memory window")?;
     let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
     let (src_base, src_off) = align_root_uav(src_va)?;
-    let (dst, dst_off) = scratch_args(this, &dev, 256)?;
+    let (dst, dst_off, slot, prev_state) = scratch_args_pingpong(this, &dev, 256)?;
     let lim_off = (crate::gpu::recomp::IO_GROUP_LIMIT * 4) as u32;
     let consts = [src_off, most_groups(), 0, lim_off];
     let p = with(this, |s| s.arena.take(u, std::mem::size_of_val(&consts), 256, &mut s.uma)).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr().cast::<u8>(), p, std::mem::size_of_val(&consts));
     let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
     // the title's writes of the arguments before this (`fresh_indirect_arguments`)
-    let prev_state = with(this, |s| s.scratch_state);
     emit_uav_and_transition(list, &dst, prev_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list.SetComputeRootSignature(&rs);
     list.SetPipelineState(&pso);
@@ -971,8 +984,9 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     // Transition scratch to INDIRECT_ARGUMENT and flush the `IO_GROUP_LIMIT` store in `dispatch_io_va`.
     emit_transition_and_uav(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     with(this, |s| {
-        s.scratch_state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        s.scratch[slot].state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
         s.pc_abi_cs = AbiBound::default();
+        s.arg_order_clean = true;
     });
     Ok((dst, dst_off))
 }
@@ -1043,15 +1057,17 @@ unsafe fn args_pipeline(dev: &ID3D12Device, hlsl: &str, label: &str, with_count:
     Ok((rs, pso))
 }
 
-/// `bytes` of this recording's scratch blocks (COMMON between uses): the block and the offset.
-/// Past `SCRATCH_CAP` a recording gets no more.
-unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, u64), String> {
+/// `bytes` of this recording's scratch slot `slot` (COMMON initially, kept in INDIRECT_ARGUMENT
+/// between uses): the block, byte offset, and its prior D3D12 state. Past `SCRATCH_CAP` across
+/// all slots a recording gets no more.
+unsafe fn scratch_args_in(this: *mut c_void, dev: &ID3D12Device, bytes: u64, slot: usize) -> Result<(ID3D12Resource, u64, D3D12_RESOURCE_STATES), String> {
     let bytes = bytes.next_multiple_of(256);
     if let Some(r) = with(this, |s| {
-        let (b, cap, _) = s.scratch.as_ref()?;
-        (s.scratch_used + bytes <= *cap).then(|| {
-            s.scratch_used += bytes;
-            (b.clone(), s.scratch_used - bytes)
+        let sl = &mut s.scratch[slot];
+        let (b, cap, _) = sl.buf.as_ref()?;
+        (sl.used + bytes <= *cap).then(|| {
+            sl.used += bytes;
+            (b.clone(), sl.used - bytes, sl.state)
         })
     }) {
         return Ok(r);
@@ -1073,12 +1089,51 @@ unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Res
     let b = block.0.clone();
     with(this, |s| {
         s.scratch_taken += block.1;
-        s.scratch_used = bytes;
-        s.scratch = Some(block.clone());
-        s.scratch_state = D3D12_RESOURCE_STATE_COMMON;
+        s.scratch[slot] = ScratchSlot {
+            buf: Some(block.clone()),
+            used: bytes,
+            state: D3D12_RESOURCE_STATE_COMMON,
+        };
         s.res_retired.push(block);
     });
-    Ok((b, 0))
+    Ok((b, 0, D3D12_RESOURCE_STATE_COMMON))
+}
+
+#[cfg(test)]
+unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, u64), String> {
+    let (b, off, _) = scratch_args_in(this, dev, bytes, 0)?;
+    Ok((b, off))
+}
+
+/// Choose between the two ping-pong scratch slots (`preferred` vs `preferred ^ 1`): prefer
+/// alternating so back-to-back indirect passes avoid WAR stalls on the same buffer, falling
+/// back to the other slot when `preferred` would require a new block past `SCRATCH_CAP`.
+fn pick_pingpong_slot(preferred: usize, fits: [bool; 2], can_alloc: bool) -> usize {
+    if fits[preferred] || can_alloc {
+        preferred
+    } else if fits[preferred ^ 1] {
+        preferred ^ 1
+    } else {
+        preferred
+    }
+}
+
+unsafe fn scratch_args_pingpong(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, u64, usize, D3D12_RESOURCE_STATES), String> {
+    let aligned = bytes.next_multiple_of(256);
+    let size = aligned.max(SCRATCH_BLOCK);
+    let slot = with(this, |s| {
+        let preferred = s.scratch_next;
+        let fits = [
+            s.scratch[0].buf.as_ref().is_some_and(|(_, cap, _)| s.scratch[0].used + aligned <= *cap),
+            s.scratch[1].buf.as_ref().is_some_and(|(_, cap, _)| s.scratch[1].used + aligned <= *cap),
+        ];
+        let can_alloc = SCRATCH_CAP.saturating_sub(s.scratch_taken) >= size;
+        let chosen = pick_pingpong_slot(preferred, fits, can_alloc);
+        s.scratch_next = chosen ^ 1;
+        chosen
+    });
+    let (buf, off, prev_state) = scratch_args_in(this, dev, aligned, slot)?;
+    Ok((buf, off, slot, prev_state))
 }
 
 /// The arguments of `max` commands at UMA address `src`, rewritten for the two passes
@@ -1111,19 +1166,15 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
         }
         None => None,
     };
-    let (dst, dst_off) = scratch_args(this, &dev, commands.saturating_mul(2))?;
-    let consts: Vec<u8> = [max, stride, mesh_offset, split, cap, src_off, 0, count_bound.is_some() as u32, count_bound.map_or(0, |(_, off)| off)]
-        .iter()
-        .flat_map(|w| w.to_le_bytes())
-        .collect();
-    let p = with(this, |s| s.arena.take(u, consts.len(), 256, &mut s.uma)).ok_or("unified memory is full")?;
-    std::ptr::copy_nonoverlapping(consts.as_ptr(), p, consts.len());
+    let (dst, dst_off, slot, prev_state) = scratch_args_pingpong(this, &dev, commands.saturating_mul(2))?;
+    let consts = [max, stride, mesh_offset, split, cap, src_off, 0, count_bound.is_some() as u32, count_bound.map_or(0, |(_, off)| off)];
+    let p = with(this, |s| s.arena.take(u, std::mem::size_of_val(&consts), 256, &mut s.uma)).ok_or("unified memory is full")?;
+    std::ptr::copy_nonoverlapping(consts.as_ptr().cast::<u8>(), p, std::mem::size_of_val(&consts));
     let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
     // Bind u4 unconditionally (to `consts_va` when no count buffer is supplied) because
     // `SCALE_ARGS_HLSL` statically references `cnt : register(u4)`.
     let cnt_base = count_bound.map_or(consts_va, |(base, _)| base);
     // the title's writes of the arguments before this (`fresh_indirect_arguments`)
-    let prev_state = with(this, |s| s.scratch_state);
     emit_uav_and_transition(list, &dst, prev_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list.SetComputeRootSignature(&rs);
     list.SetPipelineState(&pso);
@@ -1134,8 +1185,9 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     list.Dispatch(max.div_ceil(64), 1, 1);
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     with(this, |s| {
-        s.scratch_state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        s.scratch[slot].state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
         s.pc_abi_cs = AbiBound::default();
+        s.arg_order_clean = true;
     });
     Ok((dst, dst_off))
 }
@@ -1186,6 +1238,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
             super::culprit::after_dispatch(list, m2);
             emit_uav_barrier(list, Some(&res_buf));
+            with(this, |s| s.arg_order_clean = false);
             Ok(())
         })();
         match run {
@@ -1279,6 +1332,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     super::culprit::after_dispatch(list, mark);
                     emit_uav_barrier(list, Some(&res_buf));
                 }
+                with(this, |s| s.arg_order_clean = false);
                 Ok(())
             })();
             match run {
@@ -1431,6 +1485,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
             }
             super::culprit::after_dispatch(list, mark);
+            if compute {
+                with(this, |s| s.arg_order_clean = false);
+            }
         }
         Err(e) => {
             if guarded.is_some() {
@@ -1465,11 +1522,15 @@ static ARGUMENT_ORDER: Mutex<Option<(usize, ID3D12Resource)>> = Mutex::new(None)
 /// INDIRECT_ARGUMENT before and back after. Only on a list XCL made (`list_x::on_create`) and
 /// not a bundle, which cannot hold barriers; its type comes from XCL's state, not a call to it.
 unsafe fn fresh_indirect_arguments(list: *mut c_void, op: impl FnOnce()) {
+    if with(list, |s| s.arg_order_clean) {
+        return op();
+    }
     let tracked = super::list_x::tracked_list_type(list).is_some_and(|t| t != D3D12_COMMAND_LIST_TYPE_BUNDLE);
     let buffer = if tracked { ID3D12GraphicsCommandList::from_raw_borrowed(&list).and_then(|l| argument_order_buffer(l)) } else { None };
     let Some(buffer) = buffer else { return op() };
     let b = buffer.as_raw() as usize;
     super::list_x::transition(list, b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    with(list, |s| s.arg_order_clean = true);
     op();
     super::list_x::transition(list, b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
 }
@@ -2109,6 +2170,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
     let r = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
     super::culprit::after_dispatch(list, mark);
+    with(this, |s| s.arg_order_clean = false);
     r
 }
 
@@ -3674,7 +3736,8 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             s.io_cache_gfx = Some((s.args_gen_gfx, 0x5555_0000));
             s.pc_abi_gfx = AbiBound { rs: 0xAAAA, uavs: [1, 2, 3, 4, 5, 6] };
             s.pc_abi_cs = AbiBound { rs: 0xBBBB, uavs: [7, 8, 9, 10, 11, 12] };
-            s.scratch_state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            s.scratch[0].state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            s.arg_order_clean = true;
             s.args_gen_gfx
         });
         // Writing the exact same value leaves generation and cached io intact.
@@ -3695,10 +3758,24 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             assert_eq!(s.pc_abi_gfx, AbiBound::default());
             assert_eq!(s.pc_abi_cs, AbiBound::default());
         });
-        // reset resets scratch_state back to COMMON.
+        // reset resets scratch slots back to COMMON and clears arg_order_clean.
         reset(list, 0x7600_0200, 0);
-        with(list, |s| assert_eq!(s.scratch_state, D3D12_RESOURCE_STATE_COMMON));
+        with(list, |s| {
+            assert_eq!(s.scratch[0].state, D3D12_RESOURCE_STATE_COMMON);
+            assert_eq!(s.scratch[1].state, D3D12_RESOURCE_STATE_COMMON);
+            assert!(!s.arg_order_clean);
+        });
         forget(list);
+    }
+
+    #[test]
+    fn pingpong_scratch_alternates_slots_and_falls_back_under_cap() {
+        assert_eq!(pick_pingpong_slot(0, [true, true], false), 0);
+        assert_eq!(pick_pingpong_slot(1, [true, true], false), 1);
+        assert_eq!(pick_pingpong_slot(1, [true, false], true), 1);
+        // Under SCRATCH_CAP (cannot allocate a new block for slot 1), fall back to slot 0 if it fits.
+        assert_eq!(pick_pingpong_slot(1, [true, false], false), 0);
+        assert_eq!(pick_pingpong_slot(0, [false, true], false), 1);
     }
 
     #[test]
