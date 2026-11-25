@@ -875,9 +875,9 @@ unsafe fn bind_two_pass_stage(
         let first = windows[0];
         let win_vas = [
             first,
-            windows.get(1).copied().unwrap_or(first),
-            windows.get(2).copied().unwrap_or(first),
-            windows.get(3).copied().unwrap_or(first),
+            windows.get(1).copied().filter(|&v| v != 0).unwrap_or(first),
+            windows.get(2).copied().filter(|&v| v != 0).unwrap_or(first),
+            windows.get(3).copied().filter(|&v| v != 0).unwrap_or(first),
         ];
 
         let cached_io = if compute_pass {
@@ -1304,7 +1304,12 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
             }
             let w = s.uma_windows.as_deref().unwrap();
             let first = w[0];
-            Ok([first, w.get(1).copied().unwrap_or(first), w.get(2).copied().unwrap_or(first), w.get(3).copied().unwrap_or(first)])
+            Ok([
+                first,
+                w.get(1).copied().filter(|&v| v != 0).unwrap_or(first),
+                w.get(2).copied().filter(|&v| v != 0).unwrap_or(first),
+                w.get(3).copied().filter(|&v| v != 0).unwrap_or(first),
+            ])
         })?;
 
         let dev_key = dev.as_raw() as usize;
@@ -2900,9 +2905,9 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         let first = windows[0];
         let win_vas = [
             first,
-            windows.get(1).copied().unwrap_or(first),
-            windows.get(2).copied().unwrap_or(first),
-            windows.get(3).copied().unwrap_or(first),
+            windows.get(1).copied().filter(|&v| v != 0).unwrap_or(first),
+            windows.get(2).copied().filter(|&v| v != 0).unwrap_or(first),
+            windows.get(3).copied().filter(|&v| v != 0).unwrap_or(first),
         ];
 
         // Runtime VS/PS/CS shaders never write to `u1` (`res`), so one zeroed 256-byte slot
