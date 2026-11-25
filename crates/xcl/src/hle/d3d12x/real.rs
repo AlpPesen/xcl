@@ -4433,10 +4433,20 @@ fn gate_note(huge_size: bool, gated: bool, waited: std::time::Duration) -> Strin
     }
 }
 
-/// A cached-blob attempt should be quick and must not take a cold-compile slot. Its retry
-/// without the rejected blob is a cold compile and does take one.
-fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
-    !has_cached_blob
+/// Minimum `GetCachedBlob` size (4 KiB) to treat a cached PSO blob as containing compiled
+/// driver ISA rather than a tiny metadata stub header (some drivers emit <= 1 KiB stub blobs
+/// that still trigger a full cold compile on reload).
+const MIN_ISA_CACHED_BLOB_BYTES: usize = 4096;
+
+fn cached_blob_has_isa(blob: Option<&[u8]>) -> bool {
+    blob.is_some_and(|b| b.len() >= MIN_ISA_CACHED_BLOB_BYTES)
+}
+
+/// A cached-blob attempt with compiled driver ISA should be quick and must not take a
+/// cold-compile slot. Tiny stub blobs (`< MIN_ISA_CACHED_BLOB_BYTES`) and retries without
+/// a rejected blob are cold compiles and do take one.
+fn gate_compute_driver_compile(has_isa_cached_blob: bool) -> bool {
+    !has_isa_cached_blob
 }
 
 /// Before a big driver compile in the background: its turn – unwanted builds wait for both
@@ -4630,6 +4640,13 @@ mod big_compile_tests {
     fn only_a_cold_compute_compile_takes_a_slot() {
         assert!(!gate_compute_driver_compile(true), "the cached-blob attempt bypasses the gate");
         assert!(gate_compute_driver_compile(false), "a cold attempt, including a retry, is gated");
+        assert!(!cached_blob_has_isa(None), "missing blob has no compiled ISA");
+        assert!(!cached_blob_has_isa(Some(&[])), "empty blob has no compiled ISA");
+        assert!(!cached_blob_has_isa(Some(&[0u8; 930])), "tiny driver stub header must stay gated as cold compile");
+        assert!(!cached_blob_has_isa(Some(&[0u8; MIN_ISA_CACHED_BLOB_BYTES - 1])), "sub-4 KiB blob must stay gated");
+        assert!(cached_blob_has_isa(Some(&[0u8; MIN_ISA_CACHED_BLOB_BYTES])), ">= 4 KiB blob counts as compiled ISA");
+        assert!(gate_compute_driver_compile(cached_blob_has_isa(Some(&[0u8; 930]))));
+        assert!(!gate_compute_driver_compile(cached_blob_has_isa(Some(&[0u8; MIN_ISA_CACHED_BLOB_BYTES]))));
     }
 
     #[test]
@@ -4851,10 +4868,17 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let disk = driver_cache::path_for(dxil, copy.Flags.0, chained);
     let from_disk = cached.is_none();
     if from_disk {
-        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+        cached = disk
+            .as_deref()
+            .and_then(driver_cache::load)
+            .filter(|b| cached_blob_has_isa(Some(b)))
+            .map(std::sync::Arc::new);
     }
-    if let Some(b) = &cached {
-        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+    let has_isa_blob = cached_blob_has_isa(cached.as_deref().map(Vec::as_slice));
+    if has_isa_blob {
+        if let Some(b) = &cached {
+            copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+        }
     }
     if skip_listed(record) {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -4864,19 +4888,19 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         }
         return (E_OUTOFMEMORY, std::time::Duration::ZERO, false);
     }
-    if (cached.is_none() || cap_holds_for_cached()) && over_build_cap(dxil.len(), build_cap_bytes()) {
-        crate::xlog_warn!("D3D12.X: compute PSO of record {record:016x} ({} B DXIL) not built: over XCL_PSO_MAX_KB{}", dxil.len(), if cached.is_none() { " and without a saved blob" } else { " (it has a saved blob)" });
+    if (!has_isa_blob || cap_holds_for_cached()) && over_build_cap(dxil.len(), build_cap_bytes()) {
+        crate::xlog_warn!("D3D12.X: compute PSO of record {record:016x} ({} B DXIL) not built: over XCL_PSO_MAX_KB{}", dxil.len(), if !has_isa_blob { " and without a saved blob" } else { " (it has a saved blob)" });
         return (E_OUTOFMEMORY, std::time::Duration::ZERO, false);
     }
     // in the background, a few at a time and within the commit headroom the program asks for
     let (mut hr, mut in_driver) = driver_compile_identified(
         "compute",
         dxil.len(),
-        gate_compute_driver_compile(cached.is_some()),
-        Some((record, cached.is_some())),
+        gate_compute_driver_compile(has_isa_blob),
+        Some((record, has_isa_blob)),
         || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
     );
-    if hr < 0 && cached.is_some() {
+    if hr < 0 && has_isa_blob {
         // a blob the driver does not take (another root signature at the same address…): compiled
         if driver_cache::refused(hr) {
             forget_compute_blob(key);
@@ -5200,11 +5224,12 @@ unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
     } else {
         let p = ID3D12PipelineState::from_raw_borrowed(&pso)?;
         let blob = p.GetCachedBlob().ok()?;
-        return Some(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec());
+        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec();
+        return cached_blob_has_isa(Some(&bytes)).then_some(bytes);
     };
     let blob = ID3DBlob::from_raw(raw);
     let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec();
-    (!bytes.is_empty()).then_some(bytes)
+    cached_blob_has_isa(Some(&bytes)).then_some(bytes)
 }
 
 /// The driver's blob of the PSO just built (works on both adopted title PSOs and raw PC compute
@@ -5691,11 +5716,16 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     let disk = driver_cache::graphics_path(gkey.0, gkey.1);
     let from_disk = cached.is_none();
     if from_disk {
-        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+        cached = disk
+            .as_deref()
+            .and_then(driver_cache::load)
+            .filter(|b| cached_blob_has_isa(Some(b)))
+            .map(std::sync::Arc::new);
     }
+    let has_isa_blob = cached_blob_has_isa(cached.as_deref().map(Vec::as_slice));
     let build = create_graphics_pso_cached(
         &mut copy,
-        cached.as_deref().map(Vec::as_slice),
+        has_isa_blob.then(|| cached.as_deref().map(Vec::as_slice)).flatten(),
         rect_gs.is_some(),
         || {
             forget_graphics_blob(gkey);
@@ -5703,7 +5733,10 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
                 driver_cache::note(false, disk.as_deref());
             }
         },
-        |label, has_cached, f| driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached)), f),
+        |label, has_cached, f| {
+            let gated_cached = has_cached && has_isa_blob;
+            driver_compile_identified(label, bytes, gate_compute_driver_compile(gated_cached), Some((ps_hash, gated_cached)), f)
+        },
         |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv),
     );
     let hr = build.hr;
@@ -6474,10 +6507,17 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let cdisk = driver_cache::path(&tp.cs, 0);
     let cfrom_disk = ccached.is_none();
     if cfrom_disk {
-        ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+        ccached = cdisk
+            .as_deref()
+            .and_then(driver_cache::load)
+            .filter(|b| cached_blob_has_isa(Some(b)))
+            .map(std::sync::Arc::new);
     }
-    if let Some(b) = &ccached {
-        cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+    let chas_isa_blob = cached_blob_has_isa(ccached.as_deref().map(Vec::as_slice));
+    if chas_isa_blob {
+        if let Some(b) = &ccached {
+            cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+        }
     }
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
