@@ -117,7 +117,7 @@ impl Pending {
 }
 
 /// stand-in handed to the title → its real pipeline
-static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
+static PENDING: std::sync::RwLock<Option<HashMap<usize, Arc<Pending>>>> = std::sync::RwLock::new(None);
 
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
@@ -390,7 +390,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         bvh_traversal: Default::default(),
         demand: Default::default(),
     });
-    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    PENDING.write().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
@@ -986,7 +986,7 @@ mod used_tests {
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
-    PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
+    PENDING.read().unwrap().as_ref()?.get(&pso).cloned()
 }
 
 impl Pending {
@@ -1171,7 +1171,7 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// another object) and return its real pipeline to release (0: none, or still being built –
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
-    let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    let Some(p) = PENDING.write().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
     {
         let done = p.done.lock().unwrap();
         if *done {
@@ -1191,6 +1191,6 @@ pub fn is_pending(pso: usize) -> bool {
 
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
-    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
+    let pending = PENDING.read().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
 }

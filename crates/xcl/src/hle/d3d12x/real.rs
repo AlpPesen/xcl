@@ -172,22 +172,22 @@ pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
 /// Each UMA window as one D3D12 buffer (placed in a heap opened over the process memory):
 /// `mem`, `mem1`.. of recompiled shaders. (buffer, GPU VA) per window, kept for the process
 /// lifetime.
-static UMA_BUFFER: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+static UMA_BUFFER: std::sync::RwLock<Vec<(usize, u64)>> = std::sync::RwLock::new(Vec::new());
 /// the committed UMA windows opened as D3D12 heaps (indexed by window `k`; `None` for sparse windows)
 static UMA_HEAPS: Mutex<Vec<Option<usize>>> = Mutex::new(Vec::new());
 /// console buffers placed in unified memory: resource → (address, bytes)
 /// address, bytes, whether XCL allocated the memory (not: the title's own, CreatePlacedResourceX)
 type UmaBuffer = (usize, usize, bool);
-static UMA_BUFFERS: Mutex<Option<HashMap<usize, UmaBuffer>>> = Mutex::new(None);
+static UMA_BUFFERS: std::sync::RwLock<Option<HashMap<usize, UmaBuffer>>> = std::sync::RwLock::new(None);
 
 /// Where a console-created buffer lives in unified memory (its console GPU address).
 pub fn console_buffer(res: usize) -> Option<(usize, usize)> {
-    UMA_BUFFERS.lock().unwrap().as_ref()?.get(&res).map(|&(p, n, _)| (p, n))
+    UMA_BUFFERS.read().unwrap().as_ref()?.get(&res).map(|&(p, n, _)| (p, n))
 }
 
 /// Number of live console buffers in unified memory.
 pub fn console_buffers() -> usize {
-    UMA_BUFFERS.lock().unwrap().as_ref().map_or(0, |m| m.len())
+    UMA_BUFFERS.read().unwrap().as_ref().map_or(0, |m| m.len())
 }
 static UMA_ERROR: Mutex<String> = Mutex::new(String::new());
 
@@ -198,7 +198,7 @@ pub fn uma_gpu_va() -> u64 {
 
 /// GPU virtual addresses of the UMA window buffers (`u2`, `u3`.. of the shader ABI).
 pub fn uma_window_vas() -> Vec<u64> {
-    UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).collect()).unwrap_or_default()
+    UMA_BUFFER.read().map(|g| g.iter().map(|b| b.1).collect()).unwrap_or_default()
 }
 
 /// The window buffer holding `len` bytes at UMA address `p`, and their offset in it.
@@ -209,7 +209,7 @@ pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
     if p - base + len > size {
         return None;
     }
-    Some((UMA_BUFFER.lock().ok()?.get(k)?.0, (p - base) as u64))
+    Some((UMA_BUFFER.read().ok()?.get(k)?.0, (p - base) as u64))
 }
 
 /// GPU virtual address of a UMA address (None: not in UMA or not open on the GPU).
@@ -377,7 +377,7 @@ unsafe fn open_uma(device: &ID3D12Device) {
             crate::xlog_info!("D3D12.X: memory windows from the shared descriptor heap (no per-access switch)");
         }
     }
-    *UMA_BUFFER.lock().unwrap() = bufs;
+    *UMA_BUFFER.write().unwrap() = bufs;
 }
 
 pub fn stats() -> D3d12Stats {
@@ -666,7 +666,7 @@ struct Class {
 }
 
 static CLASSES: Mutex<Vec<Class>> = Mutex::new(Vec::new());
-static EXTS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static EXTS: std::sync::RwLock<Option<HashSet<usize>>> = std::sync::RwLock::new(None);
 
 unsafe fn vt(obj: *mut c_void) -> *const usize {
     *(obj as *const *const usize)
@@ -724,7 +724,7 @@ pub(super) unsafe fn this_first(a: *mut c_void, b: *mut c_void) -> bool {
 }
 
 fn is_ext(v: usize) -> bool {
-    EXTS.lock().map(|g| g.as_ref().map(|s| s.contains(&v)).unwrap_or(false)).unwrap_or(false)
+    EXTS.read().map(|g| g.as_ref().map(|s| s.contains(&v)).unwrap_or(false)).unwrap_or(false)
 }
 
 fn kind_of(ext: usize) -> Option<Kind> {
@@ -879,7 +879,7 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     }
     let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
     let ext = leaked.as_ptr() as usize + 8;
-    EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(ext);
+    EXTS.write().unwrap().get_or_insert_with(HashSet::new).insert(ext);
     crate::xlog_info!(
         "D3D12.X: {} – {public} PC methods, {} internal slots under the guard, +{EXTRA_SLOTS} stubs ({kind:?}, PC vtable {})",
         iface.name,
@@ -1443,7 +1443,7 @@ unsafe fn place_console_texture(this: *mut c_void, desc: usize, state: usize, cl
         u.free(p);
         return None;
     }
-    UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, size as usize, true));
+    UMA_BUFFERS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, size as usize, true));
     Some(hr)
 }
 
@@ -1499,9 +1499,9 @@ fn is_cpu_readback_buffer(props: &D3D12_HEAP_PROPERTIES, state: u32, flags: D3D1
 unsafe fn place_console_buffer_sparse(this: *mut c_void, d: &D3D12_RESOURCE_DESC, bytes: usize, state: u32, readback_on_null_map: bool, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     let (p, _) = super::sparse::alloc(bytes, 0x1_0000)?;
     if let Some((hr, delta)) = super::sparse::place_buffer(this, p, d, state, riid, ppv) {
-        UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes, true));
+        UMA_BUFFERS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes, true));
         if delta != 0 {
-            BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
+            BUFFER_DELTA.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
         }
         if readback_on_null_map {
             note_sparse_readback(*ppv as usize);
@@ -1524,7 +1524,7 @@ fn sanitize_coherent_buffer(desc: &D3D12_RESOURCE_DESC, state: usize) -> (D3D12_
 
 unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     let u = crate::gpu::uma::get()?;
-    if UMA_BUFFER.lock().unwrap().is_empty() || ppv.is_null() {
+    if UMA_BUFFER.read().unwrap().is_empty() || ppv.is_null() {
         return None;
     }
     let d: D3D12_RESOURCE_DESC = std::ptr::read(desc as *const D3D12_RESOURCE_DESC);
@@ -1565,7 +1565,7 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
         }
         return None;
     }
-    UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes, true));
+    UMA_BUFFERS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes, true));
     // Map must hand out the same memory the shaders read (checked once)
     static CHECKED: AtomicU64 = AtomicU64::new(0);
     if CHECKED.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -1604,9 +1604,9 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
     // the title's own memory (a sparse window): a resource over its video-memory tiles
     if u.is_sparse(va) {
         let (hr, delta) = super::sparse::place_buffer(this, va, &d, state, riid, ppv)?;
-        UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
+        UMA_BUFFERS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
         if delta != 0 {
-            BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
+            BUFFER_DELTA.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
         }
         return Some(hr);
     }
@@ -1619,24 +1619,24 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
     if hr < 0 || (*ppv).is_null() {
         return None;
     }
-    UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
+    UMA_BUFFERS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
     if delta != 0 {
-        BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
+        BUFFER_DELTA.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
     }
     Some(hr)
 }
 
 /// buffers placed below their console address: resource → bytes before it
-static BUFFER_DELTA: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+static BUFFER_DELTA: std::sync::RwLock<Option<HashMap<usize, u64>>> = std::sync::RwLock::new(None);
 
 /// Where offset 0 of a console buffer is in its PC resource (0 for most).
 pub fn buffer_delta(res: usize) -> u64 {
-    BUFFER_DELTA.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()).unwrap_or(0)
+    BUFFER_DELTA.read().unwrap().as_ref().and_then(|m| m.get(&res).copied()).unwrap_or(0)
 }
 
 #[cfg(test)]
 pub(super) fn set_test_buffer_delta(res: usize, delta: Option<u64>) {
-    let mut g = BUFFER_DELTA.lock().unwrap();
+    let mut g = BUFFER_DELTA.write().unwrap();
     match delta {
         Some(d) => {
             g.get_or_insert_with(HashMap::new).insert(res, d);
@@ -1711,7 +1711,7 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     if hr >= 0 {
         return hr;
     }
-    match super::title_textures::address(this as usize).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied())) {
+    match super::title_textures::address(this as usize).or_else(|| TITLE_ADDRESS.read().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied())) {
         Some(p) => {
             if !data.is_null() {
                 *data = p as *mut c_void;
@@ -1753,15 +1753,15 @@ unsafe extern "system" fn res_write_to_subresource(this: *mut c_void, sub: u32, 
 
 /// resources the title placed at its own address that got a PC resource of their own: on the
 /// console Map gives that address (the CPU's view of the resource)
-static TITLE_ADDRESS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+static TITLE_ADDRESS: std::sync::RwLock<Option<HashMap<usize, usize>>> = std::sync::RwLock::new(None);
 
 /// The title address a resource stands for (buffers in unified memory, placed resources).
 pub(super) fn title_address(res: usize) -> Option<usize> {
-    console_buffer(res).map(|b| b.0).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()))
+    console_buffer(res).map(|b| b.0).or_else(|| TITLE_ADDRESS.read().unwrap().as_ref().and_then(|m| m.get(&res).copied()))
 }
 
 pub(super) fn note_title_address(res: usize, va: usize) {
-    TITLE_ADDRESS.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, va);
+    TITLE_ADDRESS.write().unwrap().get_or_insert_with(HashMap::new).insert(res, va);
 }
 
 /// resources whose Map gave their unified-memory address (no PC mapping to undo)
@@ -1804,10 +1804,10 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         if let Some(s) = RESERVED.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
-        if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
+        if let Some(m) = BUFFER_DELTA.write().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
-        if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
+        if let Some(m) = TITLE_ADDRESS.write().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
         super::sparse::forget_buffer(this as usize);
@@ -1815,7 +1815,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::title_textures::forget(this as usize);
         super::depth_uav::forget(this as usize);
         super::format_alias::forget(this as usize);
-        let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
+        let gone = UMA_BUFFERS.write().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
                 super::sparse::free(p);
@@ -2064,7 +2064,7 @@ fn forget_pso(pso: usize) {
     }
     super::device_x::forget_base(pso);
     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
-    let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
+    let gone = TWO_PASS.write().unwrap().as_mut().and_then(|m| m.remove(&pso));
     drop(gone);
 }
 
@@ -2079,7 +2079,7 @@ unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
     // through it: with 0 it wrote 256 KB at address 0): the title's address it was placed at
     match f(this) {
         0 => {
-            let placed = TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied());
+            let placed = TITLE_ADDRESS.read().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied());
             placed.or_else(|| texture_memory(this)).unwrap_or(0) as u64
         }
         va => va,
@@ -2096,7 +2096,7 @@ unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESERVE, PAGE_READWRITE};
     static LOCK: Mutex<()> = Mutex::new(());
     let _g = LOCK.lock().unwrap();
-    if let Some(p) = TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(res as usize)).copied()) {
+    if let Some(p) = TITLE_ADDRESS.read().unwrap().as_ref().and_then(|m| m.get(&(res as usize)).copied()) {
         return Some(p);
     }
     let d = ID3D12Resource::from_raw_borrowed(&res)?.GetDesc();
@@ -3720,7 +3720,7 @@ unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
         return;
     }
     let d: D3D12_HEAP_DESC = std::ptr::read_unaligned(desc as *const D3D12_HEAP_DESC);
-    if d.Flags.0 & DENY_BUFFERS != 0 || d.SizeInBytes == 0 || UMA_BUFFER.lock().unwrap().is_empty() {
+    if d.Flags.0 & DENY_BUFFERS != 0 || d.SizeInBytes == 0 || UMA_BUFFER.read().unwrap().is_empty() {
         return;
     }
     let size = d.SizeInBytes as usize;
@@ -6120,22 +6120,22 @@ impl Drop for TwoPassPso {
     }
 }
 
-static TWO_PASS: Mutex<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = Mutex::new(None);
+static TWO_PASS: std::sync::RwLock<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = std::sync::RwLock::new(None);
 
 /// The compute pass of a pipeline state XCL built from console MS / GS code.
 pub fn two_pass_of(pso: usize) -> Option<std::sync::Arc<TwoPassPso>> {
     let pso = super::pso_async::resolve(pso);
-    TWO_PASS.lock().unwrap().as_ref()?.get(&pso).cloned()
+    TWO_PASS.read().unwrap().as_ref()?.get(&pso).cloned()
 }
 
 pub fn two_pass_count() -> usize {
-    TWO_PASS.lock().unwrap().as_ref().map_or(0, |m| m.len())
+    TWO_PASS.read().unwrap().as_ref().map_or(0, |m| m.len())
 }
 
 #[cfg(test)]
 pub(super) fn register_two_pass_for_test(pso: usize, kind: &'static str) {
     if pso != 0 {
-        TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+        TWO_PASS.write().unwrap().get_or_insert_with(HashMap::new).insert(
             pso,
             std::sync::Arc::new(TwoPassPso {
                 compute: 0,
@@ -6388,7 +6388,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         return E_INVALIDARG;
     }
     note_pso_rs(mesh_pso, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(mesh_pso as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    TWO_PASS.write().unwrap().get_or_insert_with(HashMap::new).insert(mesh_pso as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
         crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
@@ -8135,7 +8135,7 @@ mod this_first_tests {
         let pc = [0usize; 32];
         let ext = [pc.as_ptr() as usize, 0];
         let vtbl = ext.as_ptr() as usize + 8;
-        EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(vtbl);
+        EXTS.write().unwrap().get_or_insert_with(HashSet::new).insert(vtbl);
         let plain = 0x1234_5678usize;
         let p = &plain as *const usize as *mut c_void;
         // an object off the stack (as a real device is), and a stack buffer holding a stale copy
@@ -8163,7 +8163,7 @@ mod this_first_tests {
             assert!(this_first(b, s) && this_first(s, b));
             drop(Box::from_raw(obj as *mut [usize; 1]));
         }
-        if let Some(g) = EXTS.lock().unwrap().as_mut() {
+        if let Some(g) = EXTS.write().unwrap().as_mut() {
             g.remove(&vtbl);
         }
     }

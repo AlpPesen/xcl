@@ -328,7 +328,7 @@ struct Base {
 unsafe impl Send for Base {}
 unsafe impl Sync for Base {}
 
-static BASES: Mutex<Option<HashMap<usize, Arc<Base>>>> = Mutex::new(None);
+static BASES: std::sync::RwLock<Option<HashMap<usize, Arc<Base>>>> = std::sync::RwLock::new(None);
 /// Cached derived PSOs for `RSSetDepthBiasX`: (base PSO, override) → owned derived PSO.
 /// Released when the base PSO is released in `forget_base`.
 static DEPTH_BIAS_PSOS: Mutex<Option<HashMap<(usize, DepthBias), usize>>> = Mutex::new(None);
@@ -387,7 +387,7 @@ unsafe fn note_base(pso: *mut c_void, desc: *const c_void, dynamic_depth_bias: b
     d.0[INPUT_LAYOUT..INPUT_LAYOUT + 8].copy_from_slice(&at.to_le_bytes());
     d.0[CACHED_PSO..CACHED_PSO + 16].fill(0);
     let base = Arc::new(Base { desc: d, shaders, dynamic_depth_bias, static_bias, _elems: elems, _names: names });
-    BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, base);
+    BASES.write().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, base);
 }
 
 /// Depth-bias metadata for a tracked graphics PSO: `(created_with_dynamic_depth_bias, static_bias)`.
@@ -395,7 +395,7 @@ pub(super) fn base_depth_bias_info(pso: usize) -> Option<(bool, DepthBias)> {
     if pso == 0 {
         return None;
     }
-    BASES.lock().unwrap().as_ref()?.get(&pso).map(|b| (b.dynamic_depth_bias, b.static_bias))
+    BASES.read().unwrap().as_ref()?.get(&pso).map(|b| (b.dynamic_depth_bias, b.static_bias))
 }
 
 #[cfg(test)]
@@ -413,12 +413,12 @@ pub(super) fn register_test_base(pso: usize, dynamic_depth_bias: bool, static_bi
         _elems: Vec::new(),
         _names: Vec::new(),
     });
-    BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, base);
+    BASES.write().unwrap().get_or_insert_with(HashMap::new).insert(pso, base);
 }
 
 /// A pipeline released for good is no longer a base; its cached depth-bias variants go with it.
 pub(super) fn forget_base(pso: usize) {
-    if let Some(m) = BASES.lock().unwrap().as_mut() {
+    if let Some(m) = BASES.write().unwrap().as_mut() {
         m.remove(&pso);
     }
     let gone: Vec<usize> = {
@@ -456,7 +456,7 @@ pub(super) unsafe fn depth_bias_pso(dev: *mut c_void, base: usize, bias: DepthBi
     if let Some(&cached) = DEPTH_BIAS_PSOS.lock().unwrap().as_ref().and_then(|m| m.get(&(base, bias))) {
         return Some(cached);
     }
-    let b = BASES.lock().unwrap().as_ref().and_then(|m| m.get(&base).cloned())?;
+    let b = BASES.read().unwrap().as_ref().and_then(|m| m.get(&base).cloned())?;
     if stage_hashes(&b.desc.0) != Some(b.shaders) {
         if once(&N, 4) {
             crate::xlog_warn!("D3D12.X: RSSetDepthBiasX – shaders of base pipeline {base:#x} are gone");
@@ -478,7 +478,7 @@ pub(super) unsafe fn depth_bias_pso(dev: *mut c_void, base: usize, bias: DepthBi
     let mut release_extra = 0usize;
     let result = {
         // re-check base liveness so we never leak a derived PSO for a concurrently released base
-        let alive = BASES.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&base));
+        let alive = BASES.read().unwrap().as_ref().is_some_and(|m| m.contains_key(&base));
         let mut g = DEPTH_BIAS_PSOS.lock().unwrap();
         let map = g.get_or_insert_with(HashMap::new);
         if !alive {
@@ -530,7 +530,7 @@ pub(super) unsafe extern "system" fn create_derived_pso_x(this: *mut c_void, bas
         return E_INVALIDARG;
     }
     *ppv = std::ptr::null_mut();
-    let found = BASES.lock().unwrap().as_ref().and_then(|m| m.get(&(base as usize)).cloned());
+    let found = BASES.read().unwrap().as_ref().and_then(|m| m.get(&(base as usize)).cloned());
     let Some(b) = found else {
         if once(&N, 4) {
             crate::xlog_warn!("D3D12.X: CreateDerivedPipelineStateX – base pipeline {base:?} unknown (its creation failed, or it has stream output)");
