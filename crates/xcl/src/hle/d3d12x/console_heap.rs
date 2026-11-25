@@ -25,6 +25,7 @@
 //! Without the shared heap (it could not be made) a heap keeps its own PC heap: SRV at 2k,
 //! UAV at 2k + 1.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use windows::core::Interface;
@@ -74,6 +75,76 @@ impl Heap {
 
 static HEAPS: Mutex<Vec<Heap>> = Mutex::new(Vec::new());
 
+/// Released descriptor range in `GLOBAL` or `GLOBAL_SAMPLER` awaiting active GPU queues before
+/// being returned to `free` (prevents overwriting shader-visible descriptors still read in flight).
+struct RetiredRange<F> {
+    first: u32,
+    count: u32,
+    /// Fence marks across all live queues on the device (`None` = signal failed, keep held).
+    marks: Option<Vec<(F, u64)>>,
+}
+
+fn drain_retired_ranges<F>(
+    retired: &mut VecDeque<RetiredRange<F>>,
+    free: &mut Vec<(u32, u32)>,
+    mut completed: impl FnMut(&F) -> u64,
+) {
+    while retired
+        .front()
+        .is_some_and(|r| r.marks.as_ref().is_some_and(|m| m.iter().all(|(f, v)| completed(f) >= *v)))
+    {
+        if let Some(r) = retired.pop_front() {
+            merge_release(free, r.first, r.count);
+        }
+    }
+}
+
+struct QueueFences(HashMap<usize, (ID3D12Fence, u64)>);
+
+// D3D12 fences are free-threaded; accessed only under HEAP_FENCES lock.
+unsafe impl Send for QueueFences {}
+
+static HEAP_FENCES: Mutex<Option<QueueFences>> = Mutex::new(None);
+
+/// Signal every known live title queue belonging to `dev` (called outside `GLOBAL`/`GLOBAL_SAMPLER`
+/// and `HEAPS`). Returns `Some(vec![])` when no live queues exist for `dev`, or `None` if fence
+/// creation or signaling fails so released descriptor ranges stay safely quarantined.
+unsafe fn signal_live_queues_for(dev: &ID3D12Device) -> Option<Vec<(ID3D12Fence, u64)>> {
+    let dev_raw = dev.as_raw();
+    let mut queues: Vec<(usize, ID3D12CommandQueue)> = Vec::new();
+    for raw in super::present::known_queues() {
+        let ptr = raw as *mut std::ffi::c_void;
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&ptr) {
+            let mut qdev: Option<ID3D12Device> = None;
+            if q.GetDevice(&mut qdev).is_ok() && qdev.as_ref().is_some_and(|d| d.as_raw() == dev_raw) {
+                queues.push((raw, q.clone()));
+            }
+        }
+    }
+    if queues.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut guard = HEAP_FENCES.lock().unwrap();
+    let map = &mut guard.get_or_insert_with(|| QueueFences(HashMap::new())).0;
+    let mut marks = Vec::with_capacity(queues.len());
+    for (key, q) in queues {
+        let (fence, val) = match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                e.insert((f, 0))
+            }
+        };
+        let next = *val + 1;
+        if q.Signal(&*fence, next).is_err() {
+            return None;
+        }
+        *val = next;
+        marks.push((fence.clone(), next));
+    }
+    Some(marks)
+}
+
 /// The shader-visible PC heap of all console view heaps.
 struct Global {
     dev: ID3D12Device,
@@ -83,8 +154,10 @@ struct Global {
     inc: u32,
     cap: u32,
     next: u32,
-    /// released ranges (first, count)
+    /// released ranges (first, count) proven GPU-idle
     free: Vec<(u32, u32)>,
+    /// released ranges awaiting live GPU queue completion before entering `free`
+    retired: VecDeque<RetiredRange<ID3D12Fence>>,
 }
 
 // D3D12 descriptor heaps and devices are free-threaded
@@ -189,6 +262,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             // come first
             next: crate::gpu::recomp::MEM_HEAP_NULL + 1,
             free: Vec::new(),
+            retired: VecDeque::new(),
         });
     }
     true
@@ -282,6 +356,7 @@ unsafe fn set_window_views_checked(dev: &ID3D12Device, windows: &[(usize, usize)
 fn reserve_global(count: u32) -> Option<u32> {
     let mut g = GLOBAL.lock().unwrap();
     let s = g.as_mut()?;
+    unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) };
     let (cap, mut next) = (s.cap, s.next);
     let r = take_range(&mut s.free, &mut next, cap, count);
     s.next = next;
@@ -307,13 +382,22 @@ fn page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
     Some((first, p as u32 * PAGE_SLOTS))
 }
 
-/// The shared range starting at `first` (`count` descriptors) is free again.
+/// The shared range starting at `first` (`count` descriptors) is quarantined behind active GPU
+/// queues before returning to `free`, preventing overwrites of live shader-visible descriptors.
 pub fn release_global(first: u32, count: u32) {
     if count == 0 {
         return;
     }
+    let dev = GLOBAL.lock().unwrap().as_ref().map(|s| s.dev.clone());
+    let Some(dev) = dev else { return };
+    let marks = unsafe { signal_live_queues_for(&dev) };
     if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
-        merge_release(&mut s.free, first, count);
+        if marks.as_ref().is_some_and(Vec::is_empty) {
+            merge_release(&mut s.free, first, count);
+        } else {
+            s.retired.push_back(RetiredRange { first, count, marks });
+        }
+        unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) };
     }
 }
 
@@ -700,6 +784,7 @@ struct GlobalSampler {
     cap: u32,
     next: u32,
     free: Vec<(u32, u32)>,
+    retired: VecDeque<RetiredRange<ID3D12Fence>>,
 }
 
 unsafe impl Send for GlobalSampler {}
@@ -763,6 +848,7 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
             // Reserve slot 0 as the immutable point-wrap zero sampler for empty/zeroed S# entries.
             next: 1,
             free: Vec::new(),
+            retired: VecDeque::new(),
         });
     }
     true
@@ -771,6 +857,7 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
 fn reserve_global_sampler(count: u32) -> Option<u32> {
     let mut g = GLOBAL_SAMPLER.lock().unwrap();
     let s = g.as_mut()?;
+    unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) };
     let (cap, mut next) = (s.cap, s.next);
     let r = take_range(&mut s.free, &mut next, cap, count);
     s.next = next;
@@ -797,8 +884,16 @@ fn release_global_sampler(first: u32, count: u32) {
     if count == 0 {
         return;
     }
+    let dev = GLOBAL_SAMPLER.lock().unwrap().as_ref().map(|s| s.dev.clone());
+    let Some(dev) = dev else { return };
+    let marks = unsafe { signal_live_queues_for(&dev) };
     if let Some(s) = GLOBAL_SAMPLER.lock().unwrap().as_mut() {
-        merge_release(&mut s.free, first, count);
+        if marks.as_ref().is_some_and(Vec::is_empty) {
+            merge_release(&mut s.free, first, count);
+        } else {
+            s.retired.push_back(RetiredRange { first, count, marks });
+        }
+        unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) };
     }
 }
 
@@ -907,7 +1002,7 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
-                next: crate::gpu::recomp::MEM_HEAP_NULL + 1, free: Vec::new(),
+                next: crate::gpu::recomp::MEM_HEAP_NULL + 1, free: Vec::new(), retired: VecDeque::new(),
             });
             let window = (&mut resource as *mut _ as usize, 0x10000);
             assert!(set_window_views_checked(&dev, &[window], true));
@@ -1102,7 +1197,7 @@ mod tests {
             *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
                 dev: ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
-                cpu: 0x1000, inc: 32, cap: 17, next: 1, free: Vec::new(),
+                cpu: 0x1000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(),
             });
             assert_eq!(reserve_global_sampler(4), Some(1));
             assert_eq!(reserve_global_sampler(4), Some(5));
@@ -1161,12 +1256,12 @@ mod tests {
             *GLOBAL.lock().unwrap() = Some(Global {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut view_heap as *mut _ as *mut c_void),
-                cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024, next: 64, free: Vec::new(),
+                cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024, next: 64, free: Vec::new(), retired: VecDeque::new(),
             });
             *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
                 dev,
                 heap: ID3D12DescriptorHeap::from_raw(&mut sampler_heap as *mut _ as *mut c_void),
-                cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(),
+                cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(),
             });
             if crate::gpu::uma::get().is_some() {
                 assert!(register(0xC100, 16, 0x9000, 0, 16, true, true, true));
@@ -1226,5 +1321,34 @@ mod tests {
         // Unhosted heaps (no shared heap) keep their own local 2 * k layout.
         assert_eq!(view_unmapped_index(false, 0), 0);
         assert_eq!(view_unmapped_index(false, 42), 84);
+    }
+
+    #[test]
+    fn retired_descriptor_ranges_stay_quarantined_until_all_queues_complete() {
+        use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+        let f1 = Arc::new(AtomicU64::new(0));
+        let f2 = Arc::new(AtomicU64::new(0));
+        let mut retired: VecDeque<RetiredRange<Arc<AtomicU64>>> = VecDeque::new();
+        let mut free: Vec<(u32, u32)> = Vec::new();
+        retired.push_back(RetiredRange { first: 64, count: 16, marks: Some(vec![(f1.clone(), 1), (f2.clone(), 1)]) });
+        retired.push_back(RetiredRange { first: 80, count: 16, marks: Some(vec![(f1.clone(), 2), (f2.clone(), 1)]) });
+        retired.push_back(RetiredRange { first: 96, count: 16, marks: None });
+
+        // While f2 is still pending, neither range may re-enter `free`.
+        f1.store(1, Ordering::SeqCst);
+        drain_retired_ranges(&mut retired, &mut free, |f| f.load(Ordering::SeqCst));
+        assert!(free.is_empty() && retired.len() == 3);
+
+        // Once both queues pass mark 1, only range 1 returns; range 2 waits for f1 == 2.
+        f2.store(1, Ordering::SeqCst);
+        drain_retired_ranges(&mut retired, &mut free, |f| f.load(Ordering::SeqCst));
+        assert_eq!(free, vec![(64, 16)]);
+        assert_eq!(retired.len(), 2);
+
+        // Passing mark 2 coalesces [80, 96) with [64, 80); failed-signal range stays quarantined.
+        f1.store(2, Ordering::SeqCst);
+        drain_retired_ranges(&mut retired, &mut free, |f| f.load(Ordering::SeqCst));
+        assert_eq!(free, vec![(64, 32)]);
+        assert_eq!(retired.len(), 1);
     }
 }
