@@ -210,7 +210,7 @@ unsafe fn release(p: usize) {
 }
 
 pub unsafe fn note_rtv(handle: usize, res: *mut c_void) {
-    if !enabled() {
+    if !enabled() || IN_PRESENT.with(|c| c.get()) {
         return;
     }
     let mut g = RTVS.lock().unwrap();
@@ -272,7 +272,7 @@ pub fn rt0_resource(list: usize) -> Option<usize> {
 }
 
 pub fn note_rt0(list: usize, handle: usize) {
-    if !enabled() {
+    if !enabled() || IN_PRESENT.with(|c| c.get()) {
         return;
     }
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(list, handle);
@@ -1999,5 +1999,19 @@ mod frame_dump_tests {
             release(retained);
             assert_eq!(obj.refs.load(Ordering::Acquire), 1);
         }
+    }
+
+    #[test]
+    fn note_rtv_and_rt0_ignore_internal_present_calls() {
+        let handle = 0x7900_2456usize;
+        let list = 0x7900_2457usize;
+        let prev = IN_PRESENT.with(|c| c.replace(true));
+        unsafe {
+            note_rtv(handle, 0x1000 as *mut c_void);
+            note_rt0(list, handle);
+        }
+        IN_PRESENT.with(|c| c.set(prev));
+        assert_eq!(rtv_resource(handle), None, "internal present RTV must not be recorded");
+        assert_eq!(rt0_resource(list), None, "internal present RT0 must not be recorded");
     }
 }

@@ -517,6 +517,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         clone_resources(&unmap_ptrs)
     };
     for r in &to_unmap {
+        LAST_CONTENT.lock().unwrap().remove(&(r.as_raw() as usize));
         super::vram::unmap_superseded(r);
     }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
@@ -658,6 +659,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
         (retired, clone_resources(&unmap_ptrs))
     };
     for r in &to_unmap {
+        LAST_CONTENT.lock().unwrap().remove(&(r.as_raw() as usize));
         super::vram::unmap_superseded(r);
     }
     if retired > 0 {
@@ -678,10 +680,12 @@ pub fn forget(res: usize) -> Option<D3D12_RESOURCE_STATES> {
         (removed, unsafe { clone_resources(&remap_ptrs) }, state)
     };
     for r in &to_remap {
+        let key = r.as_raw() as usize;
+        LAST_CONTENT.lock().unwrap().remove(&key);
         unsafe {
             super::vram::remap_if_unmapped(r);
             // (lazy levels: one the GPU wrote is not uploaded again, so all of it has pages)
-            if super::vram::level_pages() && TEXTURES.lock().unwrap().by_res.get(&(r.as_raw() as usize)).is_some_and(|e| e.gpu_written) {
+            if super::vram::level_pages() && TEXTURES.lock().unwrap().by_res.get(&key).is_some_and(|e| e.gpu_written) {
                 super::vram::map_levels(r, None);
             }
         }
