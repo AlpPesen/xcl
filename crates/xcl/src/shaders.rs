@@ -1269,7 +1269,8 @@ impl Pipelines {
             ..Default::default()
         };
         use crate::hle::d3d12x::real::driver_cache;
-        let path = path_override.or_else(|| driver_cache::path(dxil, desc.Flags.0));
+        // (a chain's blobs are kept apart: `real::compute_container`)
+        let path = path_override.or_else(|| driver_cache::path(dxil, desc.Flags.0).map(|p| if split { p.with_extension("chain.pso") } else { p }));
         let cached = path.as_deref().and_then(driver_cache::load);
         let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes

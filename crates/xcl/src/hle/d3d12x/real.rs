@@ -4364,6 +4364,27 @@ pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
 
 /// `chained`: built with the dispatch chain's root signature (`dispatch_chain`), whose driver blobs
 /// are kept apart on disk from the same DXIL's under the title's.
+/// `XCL_PSO_MAX_KB`: a compute program of more KiB of DXIL that no earlier run left a driver blob
+/// for is refused at once, as a driver that runs out of memory on it would after minutes (its
+/// dispatches are skipped). 0 or unset: off.
+fn build_cap_bytes() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_PSO_MAX_KB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0usize).saturating_mul(1024))
+}
+
+fn over_build_cap(dxil: usize, cap: usize) -> bool {
+    cap != 0 && dxil > cap
+}
+
+#[cfg(test)]
+mod build_cap_tests {
+    #[test]
+    fn only_a_program_over_a_set_cap_is_refused() {
+        assert!(!super::over_build_cap(usize::MAX, 0), "off");
+        assert!(!super::over_build_cap(2048, 2048) && super::over_build_cap(2049, 2048));
+    }
+}
+
 unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
     dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, chained: bool) -> (HRESULT, std::time::Duration, bool) {
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
@@ -4382,6 +4403,10 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     }
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+    }
+    if cached.is_none() && over_build_cap(dxil.len(), build_cap_bytes()) {
+        crate::xlog_warn!("D3D12.X: compute PSO of record {record:016x} ({} B DXIL) not built: over XCL_PSO_MAX_KB and without a saved blob", dxil.len());
+        return (E_OUTOFMEMORY, std::time::Duration::ZERO, false);
     }
     // in the background, a few at a time and within the commit headroom the program asks for
     let (mut hr, mut in_driver) = driver_compile_identified(
