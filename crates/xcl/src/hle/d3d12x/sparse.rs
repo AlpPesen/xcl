@@ -1510,6 +1510,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     let mut idx = 0usize;
     let mut sub_off = 0usize;
     let mut pending: Vec<(usize, usize, usize)> = Vec::new();
+    let mut job_idle = true;
     while idx < spans.len() {
         let mut used = 0usize;
         pending.clear();
@@ -1553,6 +1554,8 @@ pub unsafe fn readback_now(va: usize, len: usize) {
                     wait_target.1,
                     wait_target.0.GetCompletedValue()
                 );
+                job_idle = false;
+                break;
             }
         }
         // 3. Copy only still-committed non-hole bytes into host memory and sync `sent` hashes.
@@ -1578,7 +1581,9 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         }
         s.reclaim_ring();
     }
-    return_readback_job(job);
+    if job_idle {
+        return_readback_job(job);
+    }
 }
 
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
