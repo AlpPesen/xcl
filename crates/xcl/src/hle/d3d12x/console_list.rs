@@ -224,17 +224,17 @@ fn sgprs(first: usize, inline: u32, args: &[u8], table_at: u64) -> Vec<u32> {
     s
 }
 
-static LAYOUTS: Mutex<Option<HashMap<usize, Arc<Layout>>>> = Mutex::new(None);
+static LAYOUTS: std::sync::RwLock<Option<HashMap<usize, Arc<Layout>>>> = std::sync::RwLock::new(None);
 
 /// A root signature was created from `blob`: remember its argument layout.
 pub fn note_root_signature(rs: usize, blob: &[u8]) {
     if let Some(l) = layout_from_blob(blob) {
-        LAYOUTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(rs, Arc::new(l));
+        LAYOUTS.write().unwrap().get_or_insert_with(HashMap::new).insert(rs, Arc::new(l));
     }
 }
 
 pub(super) fn layout_of(rs: usize) -> Option<Arc<Layout>> {
-    LAYOUTS.lock().unwrap().as_ref()?.get(&rs).cloned()
+    LAYOUTS.read().unwrap().as_ref()?.get(&rs).cloned()
 }
 
 /// Both are the layout of the same root signature object (not merely of one at the same

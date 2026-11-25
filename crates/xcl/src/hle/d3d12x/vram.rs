@@ -124,11 +124,11 @@ static MADE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 pub fn arena_bytes() -> (usize, usize) {
     (ARENAS.lock().unwrap().bytes(), MADE_BYTES.load(std::sync::atomic::Ordering::Relaxed))
 }
-static PLACED_TEXTURES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static PLACED_TEXTURES: std::sync::RwLock<Option<HashSet<usize>>> = std::sync::RwLock::new(None);
 
 /// A texture backed by one of the aliasable D3D12 heaps.
 pub(super) fn is_placed_texture(resource: usize) -> bool {
-    PLACED_TEXTURES.lock().unwrap().as_ref().is_some_and(|textures| textures.contains(&resource))
+    PLACED_TEXTURES.read().unwrap().as_ref().is_some_and(|textures| textures.contains(&resource))
 }
 
 /// Maximum idle reserved sampled textures kept per device for reuse (#1268).
@@ -252,7 +252,7 @@ unsafe fn release_raw_com(raw: usize) {
 }
 
 pub(super) fn forget_for_recycle(resource: usize, held: bool) -> Option<RecycleInfo> {
-    let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
+    let placed = PLACED_TEXTURES.write().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if !placed {
         return None;
     }
@@ -1819,7 +1819,7 @@ unsafe fn place_on_pages(
         *ppv = std::ptr::null_mut();
         return None;
     }
-    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
+    PLACED_TEXTURES.write().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     Some(hr)
 }
 
@@ -2351,7 +2351,7 @@ pub unsafe fn place_pages(
     let aliases_live = va % PAGE == 0 && has_live_page(dev.as_raw() as usize, canonical_va(va));
     if !aliases_live {
         if let Some(hr) = super::vram_small::place(dev, this, va, desc, state, clear, console_bytes, riid, ppv) {
-            PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+            PLACED_TEXTURES.write().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
             return Some(hr);
         }
     }
@@ -2476,7 +2476,7 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
         ARENAS.lock().unwrap().release(id, now);
         return None;
     }
-    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    PLACED_TEXTURES.write().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     ARENA_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(*ppv as usize, id);
     Some(hr)
 }

@@ -2107,7 +2107,7 @@ unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
 /// A pipeline state is gone: drop what XCL keeps by its address (a later pipeline may get the
 /// same address and must not inherit its root signature or compute pass).
 /// compute pipelines that run a translated console shader
-static TRANSLATED_COMPUTE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static TRANSLATED_COMPUTE: std::sync::RwLock<Option<HashSet<usize>>> = std::sync::RwLock::new(None);
 
 /// graphics pipelines built from translated console shaders
 static TRANSLATED_GRAPHICS: std::sync::RwLock<Option<HashSet<usize>>> = std::sync::RwLock::new(None);
@@ -2151,9 +2151,9 @@ fn note_rect_list_gs(pso: usize, copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect
 
 /// Thread-group dimensions `[x, y, z]` of console compute PSOs (stand-in and real) for
 /// `DispatchX` with `USE_THREAD_DIMENSIONS` (`0x20`).
-static PSO_COMPUTE_THREADS: Mutex<Option<HashMap<usize, [u32; 3]>>> = Mutex::new(None);
+static PSO_COMPUTE_THREADS: std::sync::RwLock<Option<HashMap<usize, [u32; 3]>>> = std::sync::RwLock::new(None);
 /// Compute PSOs (stand-in and real) that issue `image_bvh*_intersect_ray`.
-static BVH_TRAVERSAL_PSOS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static BVH_TRAVERSAL_PSOS: std::sync::RwLock<Option<HashSet<usize>>> = std::sync::RwLock::new(None);
 /// At least one `DispatchX(..., 0x20)` BVH builder pass succeeded with no failed builder PSOs.
 static BVH_BUILD_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// At least one `DispatchX(..., 0x20)` BVH builder PSO failed or stayed pending: gate stays closed.
@@ -2224,13 +2224,13 @@ pub(super) fn pso_compute_threads(pso: usize) -> Option<[u32; 3]> {
     if pso == 0 {
         return None;
     }
-    PSO_COMPUTE_THREADS.lock().unwrap().as_ref()?.get(&pso).copied()
+    PSO_COMPUTE_THREADS.read().unwrap().as_ref()?.get(&pso).copied()
 }
 
 fn note_compute_threads(pso: usize, cs: &[u8]) {
     if pso != 0 {
         if let Some(t) = crate::gpu::recomp::pso::compute_threads(cs) {
-            PSO_COMPUTE_THREADS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, t);
+            PSO_COMPUTE_THREADS.write().unwrap().get_or_insert_with(HashMap::new).insert(pso, t);
         }
     }
 }
@@ -2284,17 +2284,17 @@ pub(crate) fn rt_gated_compute_held(cs: &[u8]) -> bool {
 
 fn note_bvh_traversal(pso: usize, cs: &[u8]) {
     if pso != 0 && is_rt_gated_cs(cs) {
-        BVH_TRAVERSAL_PSOS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+        BVH_TRAVERSAL_PSOS.write().unwrap().get_or_insert_with(HashSet::new).insert(pso);
     }
 }
 
 fn is_bvh_traversal_pso(pso: usize) -> bool {
-    pso != 0 && BVH_TRAVERSAL_PSOS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+    pso != 0 && BVH_TRAVERSAL_PSOS.read().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
 /// Raw check without BVH traversal hold-back (used by `DispatchX` builder passes).
 pub(super) fn is_translated_compute_raw(pso: usize) -> bool {
-    pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+    pso != 0 && TRANSLATED_COMPUTE.read().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
 /// Whether `pso` runs a translated console compute shader (holding back BVH traversal shaders
@@ -2339,7 +2339,7 @@ pub(super) fn register_console_compute_for_test(pso: usize) {
 #[cfg(test)]
 pub(super) fn register_translated_compute_for_test(pso: usize) {
     if pso != 0 {
-        TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+        TRANSLATED_COMPUTE.write().unwrap().get_or_insert_with(HashSet::new).insert(pso);
     }
 }
 
@@ -2365,7 +2365,7 @@ pub(super) fn forget_pso_for_test(pso: usize) {
 fn forget_pso(pso: usize) {
     dispatch_chain::forget(pso);
     super::dred::forget_pso(pso);
-    if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
+    if let Some(s) = TRANSLATED_COMPUTE.write().unwrap().as_mut() {
         s.remove(&pso);
     }
     if let Some(s) = CONSOLE_COMPUTE.write().unwrap().as_mut() {
@@ -2380,13 +2380,13 @@ fn forget_pso(pso: usize) {
     if let Some(m) = PSO_RS.write().unwrap().as_mut() {
         m.remove(&pso);
     }
-    if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
+    if let Some(m) = PSO_USER_SGPRS.write().unwrap().as_mut() {
         m.remove(&pso);
     }
-    if let Some(m) = PSO_COMPUTE_THREADS.lock().unwrap().as_mut() {
+    if let Some(m) = PSO_COMPUTE_THREADS.write().unwrap().as_mut() {
         m.remove(&pso);
     }
-    if let Some(s) = BVH_TRAVERSAL_PSOS.lock().unwrap().as_mut() {
+    if let Some(s) = BVH_TRAVERSAL_PSOS.write().unwrap().as_mut() {
         s.remove(&pso);
     }
     super::device_x::forget_base(pso);
@@ -4563,13 +4563,13 @@ fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
 }
 
 /// user SGPRs of the console CS of a translated compute pipeline
-static PSO_USER_SGPRS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+static PSO_USER_SGPRS: std::sync::RwLock<Option<HashMap<usize, u32>>> = std::sync::RwLock::new(None);
 
 /// How many user SGPRs the console compute shader of a translated pipeline has (None: not
 /// known). What is above the driver's four holds root arguments (`console_list::inline_for`).
 pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
     let pso = super::pso_async::resolve(pso);
-    PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).copied()
+    PSO_USER_SGPRS.read().unwrap().as_ref()?.get(&pso).copied()
 }
 
 /// The root signature a translated pipeline state was created with.
@@ -5255,7 +5255,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             note_pso_rs(*ppv, rs as *mut c_void);
             super::dred::label_text(*ppv as usize, || format!("cs {record:016x} piece 0"));
             if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
-                PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+                PSO_USER_SGPRS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
             }
             note_compute_threads(*ppv as usize, cs);
             note_bvh_traversal(*ppv as usize, cs);
@@ -5277,7 +5277,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         note_pso_rs(*ppv, rs);
         super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
         if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
-            PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+            PSO_USER_SGPRS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
         }
         note_compute_threads(*ppv as usize, cs);
         note_bvh_traversal(*ppv as usize, cs);
@@ -5309,7 +5309,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
-        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+        PSO_USER_SGPRS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_compute_threads(*ppv as usize, cs);
     note_bvh_traversal(*ppv as usize, cs);
@@ -6693,7 +6693,7 @@ unsafe fn go_background(
             }
         }
         if bvh_trav {
-            BVH_TRAVERSAL_PSOS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+            BVH_TRAVERSAL_PSOS.write().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
         }
     }
     let job: super::pso_async::Job = Box::new(move || {
@@ -6785,7 +6785,7 @@ unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID
 
 unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-        TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+        TRANSLATED_COMPUTE.write().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     }
 }
 
