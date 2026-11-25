@@ -837,10 +837,15 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
                 }
             }
             bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
+            let m1 = super::culprit::before_dispatch(list, raw_pso, pso, [n, 1, 1]);
             list.Dispatch(n, 1, 1);
+            super::culprit::after_dispatch(list, m1);
             emit_uav_barrier(list, Some(&res_buf));
             bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
+            // (the mesh pass: what the marker says is its groups; 0x3e2 marks a mesh draw in the log)
+            let m2 = super::culprit::before_dispatch(list, raw_pso, pso, [n * tp.mesh_groups_per_record, 0x3e2, 1]);
             pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
+            super::culprit::after_dispatch(list, m2);
             emit_uav_barrier(list, Some(&res_buf));
             Ok(())
         })();
@@ -921,7 +926,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     for (k, compute) in two_pass_steps(max) {
                         bind_two_pass_stage(this, list, pso, &tp, res_va, compute)?;
                         let (s, first) = if compute { (msig.companion_dispatch, at) } else { (sig, at + commands as u64) };
+                        let mark = super::culprit::before_dispatch(list, raw_pso, pso, [0, 0, if compute { 1 } else { 0x3e2 }]);
                         pc(this, s, 1, scaled.as_raw() as usize, first + k as u64 * msig.byte_stride as u64, 0, 0);
+                        super::culprit::after_dispatch(list, mark);
                         emit_uav_barrier(list, Some(&res_buf));
                     }
                     Ok(())
