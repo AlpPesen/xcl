@@ -16,34 +16,42 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use windows::core::Interface;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32_FLOAT};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32_FLOAT};
 use windows_sys::Win32::System::Threading as th;
 
 use crate::hle::xg;
 
-/// `XCL_WATER_READBACK=0`: disable GPU->UMA readback of 256×256 `R32_FLOAT` / `R32G32_FLOAT`
-/// placed ocean height/displacement textures.
+/// `XCL_WATER_READBACK=0`: disable GPU->UMA readback of placed ocean height/displacement/buoyancy
+/// textures (`256×256` `R32_FLOAT`/`R32G32_FLOAT`, `64×64` `R32G32_FLOAT`, `128×128` `R16G16_UINT`).
 pub(super) fn water_readback_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_WATER_READBACK").map_or(true, |v| v.trim() != "0"))
 }
 
-/// Whether `desc` is a 256×256 single-mip 2D `R32_FLOAT` or `R32G32_FLOAT` texture (ocean
-/// heightmap / displacement readback target used by CPU boat/water physics).
+/// Whether `desc` matches one of the 4 verified single-mip 2D ocean height/displacement/buoyancy
+/// readback textures used by CPU water/boat physics:
+/// - `256×256` `R32_FLOAT` (`41`) or `R32G32_FLOAT` (`16`)
+/// - `64×64` `R32G32_FLOAT` (`16`)
+/// - `128×128` `R16G16_UINT` (`36`)
 pub(super) fn is_water_readback_desc(desc: &D3D12_RESOURCE_DESC) -> bool {
     desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
-        && desc.Width == 256
-        && desc.Height == 256
         && desc.DepthOrArraySize == 1
         && desc.MipLevels == 1
         && desc.SampleDesc.Count <= 1
-        && matches!(desc.Format, DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R32G32_FLOAT)
+        && matches!(
+            (desc.Width, desc.Height, desc.Format),
+            (256, 256, DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R32G32_FLOAT)
+                | (64, 64, DXGI_FORMAT_R32G32_FLOAT)
+                | (128, 128, DXGI_FORMAT_R16G16_UINT)
+        )
 }
 
 #[derive(Clone)]
 pub(super) struct WaterTarget {
     pub va: usize,
     pub format: DXGI_FORMAT,
+    pub width: u32,
+    pub height: u32,
     pub row_pitch: u32,
     pub tex: Arc<xg::Texture>,
 }
@@ -55,18 +63,21 @@ pub(super) fn has_water_readback() -> bool {
     HAS_WATER_TARGETS.load(Ordering::Acquire)
 }
 
-pub(super) fn register_water_readback(res: usize, va: usize, format: DXGI_FORMAT, tex: Arc<xg::Texture>) {
+pub(super) fn register_water_readback(res: usize, va: usize, format: DXGI_FORMAT, width: u32, height: u32, tex: Arc<xg::Texture>) {
     if !water_readback_enabled() || res == 0 || va == 0 {
         return;
     }
-    let row_pitch = match format {
-        DXGI_FORMAT_R32_FLOAT => 256 * 4,
-        DXGI_FORMAT_R32G32_FLOAT => 256 * 8,
+    let bpe: u32 = match format {
+        DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R16G16_UINT => 4,
+        DXGI_FORMAT_R32G32_FLOAT => 8,
         _ => return,
     };
+    let Some(row_bytes) = width.checked_mul(bpe) else { return };
+    // Align to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256 B); all 4 verified formats are exact multiples.
+    let row_pitch = row_bytes.next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
     WATER_TARGETS.lock().unwrap().get_or_insert_with(HashMap::new).insert(
         res,
-        WaterTarget { va, format, row_pitch, tex },
+        WaterTarget { va, format, width, height, row_pitch, tex },
     );
     HAS_WATER_TARGETS.store(true, Ordering::Release);
 }
@@ -369,7 +380,8 @@ unsafe fn write_texture_now(dst_va: usize, format: DXGI_FORMAT, row_pitch: u32, 
         static COUNT: AtomicU64 = AtomicU64::new(0);
         let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 || (n.is_power_of_two() && n >= 64) {
-            crate::xlog_info!("D3D12.X: water heightmap readback #{n} (256x256 fmt {}, -> {target_va:#x}, {dst_bytes} B)", format.0);
+            let (w, h) = surface.chain.levels.first().map_or((0, 0), |l| (l.width, l.height));
+            crate::xlog_info!("D3D12.X: water heightmap readback #{n} ({w}x{h} fmt {}, -> {target_va:#x}, {dst_bytes} B)", format.0);
         }
     }
 }
@@ -507,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn water_readback_desc_matches_256_float_heightmaps_only() {
+    fn water_readback_desc_matches_verified_water_textures_only() {
         let base = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Width: 256,
@@ -520,6 +532,10 @@ mod tests {
         };
         assert!(is_water_readback_desc(&base));
         assert!(is_water_readback_desc(&D3D12_RESOURCE_DESC { Format: DXGI_FORMAT_R32G32_FLOAT, ..base }));
+        assert!(is_water_readback_desc(&D3D12_RESOURCE_DESC { Width: 64, Height: 64, Format: DXGI_FORMAT_R32G32_FLOAT, ..base }));
+        assert!(is_water_readback_desc(&D3D12_RESOURCE_DESC { Width: 128, Height: 128, Format: DXGI_FORMAT_R16G16_UINT, ..base }));
+        assert!(!is_water_readback_desc(&D3D12_RESOURCE_DESC { Width: 64, Height: 64, Format: DXGI_FORMAT_R32_FLOAT, ..base }));
+        assert!(!is_water_readback_desc(&D3D12_RESOURCE_DESC { Width: 256, Height: 256, Format: DXGI_FORMAT_R16G16_UINT, ..base }));
         assert!(!is_water_readback_desc(&D3D12_RESOURCE_DESC { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM, ..base }));
         assert!(!is_water_readback_desc(&D3D12_RESOURCE_DESC { Width: 512, ..base }));
         assert!(!is_water_readback_desc(&D3D12_RESOURCE_DESC { MipLevels: 2, ..base }));
@@ -528,22 +544,28 @@ mod tests {
     }
 
     #[test]
-    fn tile_readback_roundtrips_256_r32_and_r32g32_heightmaps() {
-        for (fmt, bpe) in [(DXGI_FORMAT_R32_FLOAT.0 as u32, 4usize), (DXGI_FORMAT_R32G32_FLOAT.0 as u32, 8usize)] {
+    fn tile_readback_roundtrips_all_verified_water_textures() {
+        for (dim, fmt, bpe) in [
+            (256u32, DXGI_FORMAT_R32_FLOAT.0 as u32, 4usize),
+            (256u32, DXGI_FORMAT_R32G32_FLOAT.0 as u32, 8usize),
+            (64u32, DXGI_FORMAT_R32G32_FLOAT.0 as u32, 8usize),
+            (128u32, DXGI_FORMAT_R16G16_UINT.0 as u32, 4usize),
+        ] {
             let mut x = [0u8; 0x38];
             x[0..4].copy_from_slice(&(D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32).to_le_bytes());
-            x[0x10..0x18].copy_from_slice(&256u64.to_le_bytes());
-            x[0x18..0x1C].copy_from_slice(&256u32.to_le_bytes());
+            x[0x10..0x18].copy_from_slice(&(dim as u64).to_le_bytes());
+            x[0x18..0x1C].copy_from_slice(&dim.to_le_bytes());
             x[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
             x[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
             x[0x20..0x24].copy_from_slice(&fmt.to_le_bytes());
             x[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             x[0x2C..0x30].copy_from_slice(&0x11Bu32.to_le_bytes()); // console swizzle 64KB_R_X (0x100 | 27)
-            let tex = xg::Texture::new(&x).expect("256x256 console texture layout");
+            let tex = xg::Texture::new(&x).expect("console water texture layout");
             let (_, surface) = main_surface(&tex).expect("main color surface");
-            let linear: Vec<u8> = (0..(256 * 256 * bpe)).map(|i| ((i * 31 + 17) & 0xFF) as u8).collect();
+            let n = dim as usize;
+            let linear: Vec<u8> = (0..(n * n * bpe)).map(|i| ((i * 31 + 17) & 0xFF) as u8).collect();
             let mut tiled = vec![0u8; surface.chain.slice_bytes];
-            assert!(tile_readback_into_slice(&mut tiled, &linear, (256 * bpe) as u32, &tex));
+            assert!(tile_readback_into_slice(&mut tiled, &linear, (n * bpe) as u32, &tex));
             assert_eq!(surface.chain.detile_level(&tiled, 0, 0), linear);
         }
     }

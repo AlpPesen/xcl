@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::Interface;
@@ -387,16 +387,114 @@ impl PendingWait {
     }
 }
 
-/// Recorded `OMSetRenderTargets` state for `KickoffX` restoration and `XCL_TRACE_FRAME`.
+/// Number of per-list `(8 RTV + 1 DSV)` shadow slots per allocated CPU descriptor heap chunk.
+const RT_SHADOW_CHUNK_SLOTS: u32 = 256;
+
+fn rt_snapshot_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_RT_SNAPSHOT").map(|v| v != "0").unwrap_or(true))
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct RtShadowEntry {
+    rtv_base: usize,
+    rtv_inc: usize,
+    dsv_handle: usize,
+}
+
+struct RtShadowPool {
+    /// Private CPU-only RTV/DSV descriptor heaps kept alive for the device's lifetime so copied
+    /// handles remain valid across mid-recording splits and `KickoffX` resets.
+    _heaps: Vec<(ID3D12DescriptorHeap, ID3D12DescriptorHeap)>,
+    free: Vec<RtShadowEntry>,
+}
+
+static RT_SHADOW_POOLS: Mutex<Option<HashMap<usize, RtShadowPool>>> = Mutex::new(None);
+
+/// Owned slot in a device's private CPU-only RTV/DSV shadow heaps.
+///
+/// D3D12 consumes CPU RTV/DSV descriptors synchronously when `OMSetRenderTargets` is recorded,
+/// so recycling the slot on `Drop` (once every `Bindings` clone referencing it is gone) needs no
+/// GPU fence wait.
+#[derive(Debug, PartialEq, Eq)]
+struct RtShadowSlot {
+    dev_key: usize,
+    entry: RtShadowEntry,
+}
+
+impl Drop for RtShadowSlot {
+    fn drop(&mut self) {
+        let mut g = RT_SHADOW_POOLS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pool) = g.as_mut().and_then(|m| m.get_mut(&self.dev_key)) {
+            pool.free.push(self.entry);
+        }
+    }
+}
+
+unsafe fn alloc_rt_shadow_slot(dev: &ID3D12Device) -> Option<Arc<RtShadowSlot>> {
+    let dev_key = dev.as_raw() as usize;
+    {
+        let mut g = RT_SHADOW_POOLS.lock().unwrap();
+        if let Some(entry) = g.as_mut().and_then(|m| m.get_mut(&dev_key)).and_then(|p| p.free.pop()) {
+            return Some(Arc::new(RtShadowSlot { dev_key, entry }));
+        }
+    }
+    let rtv_desc = D3D12_DESCRIPTOR_HEAP_DESC {
+        Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+        NumDescriptors: RT_SHADOW_CHUNK_SLOTS * D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT,
+        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+        NodeMask: 0,
+    };
+    let dsv_desc = D3D12_DESCRIPTOR_HEAP_DESC {
+        Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+        NumDescriptors: RT_SHADOW_CHUNK_SLOTS,
+        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+        NodeMask: 0,
+    };
+    let rtv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&rtv_desc).ok()?;
+    let dsv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&dsv_desc).ok()?;
+    let rtv_start = rtv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
+    let dsv_start = dsv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
+    let rtv_inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
+    let dsv_inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV) as usize;
+    if rtv_start == 0 || dsv_start == 0 || rtv_inc == 0 || dsv_inc == 0 {
+        return None;
+    }
+    let slots_per_rtv = D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize;
+    let mut new_entries = Vec::with_capacity(RT_SHADOW_CHUNK_SLOTS as usize);
+    for i in 0..RT_SHADOW_CHUNK_SLOTS as usize {
+        new_entries.push(RtShadowEntry {
+            rtv_base: rtv_start + i * slots_per_rtv * rtv_inc,
+            rtv_inc,
+            dsv_handle: dsv_start + i * dsv_inc,
+        });
+    }
+    let entry = new_entries.pop()?;
+    let mut g = RT_SHADOW_POOLS.lock().unwrap();
+    let pool = g.get_or_insert_with(HashMap::new).entry(dev_key).or_insert_with(|| RtShadowPool {
+        _heaps: Vec::new(),
+        free: Vec::new(),
+    });
+    pool._heaps.push((rtv_heap, dsv_heap));
+    pool.free.extend(new_entries);
+    Some(Arc::new(RtShadowSlot { dev_key, entry }))
+}
+
+/// Recorded `OMSetRenderTargets` state for `KickoffX` / split restoration and `XCL_TRACE_FRAME`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RenderTargets {
     /// Requested `NumRenderTargetDescriptors` (clamped to D3D12 max 8; 0 if `handles` is empty).
     num_targets: u32,
-    /// Saved descriptor handles: 1 base handle when `single != 0` and `num_targets > 0`,
+    /// Saved guest descriptor handles: 1 base handle when `single != 0` and `num_targets > 0`,
     /// otherwise `num_targets` handles.
     handles: Vec<usize>,
     single: i32,
     dsv: Option<usize>,
+    /// Private CPU-descriptor snapshot taken at bind time so later mid-list splits and
+    /// `KickoffX` resets never replay a guest RTV/DSV slot the title already overwrote.
+    shadow: Option<Arc<RtShadowSlot>>,
+    shadow_has_rtvs: bool,
+    shadow_has_dsv: bool,
 }
 
 /// What console code set on a list that a PC Reset clears: `KickoffX` closes, submits and
@@ -651,7 +749,97 @@ pub(super) unsafe fn note_render_targets(this: *mut c_void, n: u32, rtvs: *const
     // handle when `RTsSingleHandleToDescriptorRange != 0` or `num_targets` handles otherwise.
     let handles = if read_count == 0 { Vec::new() } else { std::slice::from_raw_parts(rtvs, read_count).to_vec() };
     let d = dsv.as_ref().copied();
-    with_bindings(this, |b| b.render_targets = Some(RenderTargets { num_targets, handles, single, dsv: d }));
+
+    let want_rtv = num_targets > 0 && !handles.is_empty() && handles.iter().all(|&h| h != 0);
+    let want_dsv = d.is_some_and(|dh| dh != 0);
+
+    // Check whether `this` is a tracked real D3D12 command list (fake test lists never call
+    // `on_create`, so `list_type` is `None` and we must not invoke COM `GetDevice` on them).
+    // When this list already owns an unshared shadow slot (`strong_count == 1`), detach it for
+    // lock-free in-place reuse outside `LISTS`.
+    let (is_real_list, prev_slot) = if rt_snapshot_enabled() && (want_rtv || want_dsv) {
+        let mut g = LISTS.lock().unwrap();
+        if let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+            let real_list = s.list_type.is_some();
+            let reuse = if real_list {
+                s.bindings
+                    .render_targets
+                    .as_mut()
+                    .and_then(|rt| {
+                        if rt.shadow.as_ref().is_some_and(|a| Arc::strong_count(a) == 1) {
+                            rt.shadow.take()
+                        } else {
+                            None
+                        }
+                    })
+            } else {
+                None
+            };
+            (real_list, reuse)
+        } else {
+            (false, None)
+        }
+    } else {
+        (false, None)
+    };
+
+    let mut shadow: Option<Arc<RtShadowSlot>> = None;
+    let mut shadow_has_rtvs = false;
+    let mut shadow_has_dsv = false;
+
+    if is_real_list {
+        if let Some(dev) = device_of(this) {
+            let dev_key = dev.as_raw() as usize;
+            let slot = match prev_slot {
+                Some(existing) if existing.dev_key == dev_key => Some(existing),
+                _ => alloc_rt_shadow_slot(&dev),
+            };
+            if let Some(slot) = slot {
+                if want_rtv {
+                    if single != 0 {
+                        dev.CopyDescriptorsSimple(
+                            num_targets,
+                            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: slot.entry.rtv_base },
+                            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: handles[0] },
+                            D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                        );
+                    } else {
+                        for (i, &h) in handles.iter().enumerate() {
+                            dev.CopyDescriptorsSimple(
+                                1,
+                                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: slot.entry.rtv_base + i * slot.entry.rtv_inc },
+                                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: h },
+                                D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                            );
+                        }
+                    }
+                    shadow_has_rtvs = true;
+                }
+                if let Some(dh) = d.filter(|&dh| dh != 0) {
+                    dev.CopyDescriptorsSimple(
+                        1,
+                        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: slot.entry.dsv_handle },
+                        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dh },
+                        D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                    );
+                    shadow_has_dsv = true;
+                }
+                shadow = Some(slot);
+            }
+        }
+    }
+
+    with_bindings(this, |b| {
+        b.render_targets = Some(RenderTargets {
+            num_targets,
+            handles,
+            single,
+            dsv: d,
+            shadow,
+            shadow_has_rtvs,
+            shadow_has_dsv,
+        });
+    });
 }
 
 /// Set again what `b` holds (after KickoffX's Reset or a deferred mid-list split).
@@ -684,14 +872,26 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings, ty: D3D12_COMMAND_LI
         pc::<unsafe extern "system" fn(*mut c_void, u32, u32, *const D3D12_VERTEX_BUFFER_VIEW)>(this, PC_IA_SET_VERTEX_BUFFERS)(this, slot, 1, v);
     }
     if let Some(rt) = &b.render_targets {
-        let d = rt.dsv.unwrap_or(0);
-        let (n, rts_ptr) = if rt.handles.is_empty() { (0, std::ptr::null()) } else { (rt.num_targets, rt.handles.as_ptr()) };
+        let rtv_shadow_base = rt.shadow.as_ref().map_or(0, |slot| slot.entry.rtv_base);
+        let (n, rts_ptr, single) = if rt.shadow.is_some() && rt.shadow_has_rtvs && rt.num_targets > 0 {
+            (rt.num_targets, &rtv_shadow_base as *const usize, 1)
+        } else if rt.handles.is_empty() {
+            (0, std::ptr::null(), rt.single)
+        } else {
+            (rt.num_targets, rt.handles.as_ptr(), rt.single)
+        };
+        let dsv_opt = if let Some(slot) = rt.shadow.as_ref().filter(|_| rt.shadow_has_dsv) {
+            Some(slot.entry.dsv_handle)
+        } else {
+            rt.dsv
+        };
+        let d = dsv_opt.unwrap_or(0);
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize)>(this, PC_OM_SET_RENDER_TARGETS)(
             this,
             n,
             rts_ptr,
-            rt.single,
-            if rt.dsv.is_some() { &d } else { std::ptr::null() },
+            single,
+            if dsv_opt.is_some() { &d } else { std::ptr::null() },
         );
     }
 }
@@ -2839,7 +3039,7 @@ const WANTED_AT_ONCE: usize = 4;
 /// Records the deferred dispatches of `wrapper`'s recording, waiting for their pipelines as a bind did.
 pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
     let mut segs = Vec::new();
-    super::title_list::push_segments(wrapper, &mut segs);
+    super::title_list::raw_segments(wrapper, &mut segs);
     let Some(&first) = segs.first() else { return };
     segs.retain(|&seg| seg == first || LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(seg as usize))).is_some_and(|s| s.deferred.is_some()));
     let mut last: Option<*mut c_void> = None;
@@ -2870,6 +3070,7 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
             super::bind::dispatch_dropped();
             continue;
         }
+        super::bind::rebind_allocator(seg, own as usize);
         reset_copy_scratch(seg);
         super::dred::reset(seg);
         if !heaps.is_empty() {
@@ -3144,7 +3345,7 @@ pub(super) unsafe fn split_for_prelude(list: *mut c_void) -> Option<*mut c_void>
 unsafe fn deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE) -> Option<*mut c_void> {
     let dev = device_of(list)?;
     let mut segs = Vec::new();
-    super::title_list::push_segments(wrapper, &mut segs);
+    super::title_list::raw_segments(wrapper, &mut segs);
     let first = *segs.first()? as usize;
     let own = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&first)?.own_alloc.clone());
     let own = match own {
@@ -3433,16 +3634,20 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
     }
 }
 
-/// Clear active predication state when `ID3D12GraphicsCommandList::Reset` resets a recording.
+/// Clear active predication and snapshotted render-target state when
+/// `ID3D12GraphicsCommandList::Reset` resets a recording.
 pub(super) fn on_pc_reset(list: *mut c_void) {
     reset_copy_scratch(list);
     super::format_alias::list_reset(list as usize);
-    if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
+    if list.is_null() {
         return;
     }
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
-        s.predication = None;
-        s.pred_in_state = false;
+        s.bindings.render_targets = None;
+        if PREDICATION_USED.load(Ordering::Acquire) {
+            s.predication = None;
+            s.pred_in_state = false;
+        }
     }
 }
 
@@ -3695,6 +3900,10 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
+    // `alloc_pool::reset_list` can rotate `target` onto a fresh PC backing allocator because
+    // the pre-kickoff submit is now in flight; sync `bind`'s allocator so subsequent VRAM `io`
+    // slabs and prelude lists stay pinned to the new backing allocator rather than the old one.
+    super::bind::rebind_allocator(target, alloc);
     reset_copy_scratch(target);
     // `KickoffX` calls PC `Reset` directly (bypassing `real::cl_reset`), so rotate DRED markers here.
     super::dred::reset(target);
@@ -5037,16 +5246,17 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode)
 }
 
-/// If `dst` is a tracked 256×256 `R32_FLOAT` / `R32G32_FLOAT` placed ocean height/displacement
-/// texture, copy subresource 0 into a pooled `READBACK` buffer and queue asynchronous XOR-swizzled
-/// writeback into console memory on `xcl-cpu-writes` after this submission's GPU fence completes.
+/// If `dst` is a tracked placed ocean height/displacement/buoyancy texture (`256×256`
+/// `R32_FLOAT`/`R32G32_FLOAT`, `64×64` `R32G32_FLOAT`, or `128×128` `R16G16_UINT`), copy
+/// subresource 0 into a pooled `READBACK` buffer and queue asynchronous XOR-swizzled writeback
+/// into console memory on `xcl-cpu-writes` after this submission's GPU fence completes.
 unsafe fn maybe_enqueue_water_readback(this: *mut c_void, dst: usize) {
     let Some(target) = super::cpu_writes::water_readback_target(dst) else { return };
     if list_type(this) == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return;
     }
     let Some(dev) = device_of(this) else { return };
-    let total_bytes = u64::from(target.row_pitch) * 256;
+    let total_bytes = u64::from(target.row_pitch) * u64::from(target.height);
     let Some(rb) = super::cpu_writes::take_water_readback_buf(&dev, total_bytes) else { return };
     let Some(rb_res) = rb.buf.as_ref() else { return };
     let src_loc = D3D12_TEXTURE_COPY_LOCATION {
@@ -5062,8 +5272,8 @@ unsafe fn maybe_enqueue_water_readback(this: *mut c_void, dst: usize) {
                 Offset: 0,
                 Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                     Format: target.format,
-                    Width: 256,
-                    Height: 256,
+                    Width: target.width,
+                    Height: target.height,
                     Depth: 1,
                     RowPitch: target.row_pitch,
                 },
@@ -8332,5 +8542,156 @@ mod tests {
         real::dispatch_chain::seed_shared_for_test(list, alloc);
         on_release(list);
         assert!(!real::dispatch_chain::has_shared_for_test(list));
+    }
+
+    #[test]
+    fn render_target_snapshot_survives_guest_slot_overwrite_and_recycles() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory4};
+
+        unsafe {
+            let Ok(fac) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                return;
+            };
+            let Ok(warp) = fac.EnumWarpAdapter::<IDXGIAdapter>() else {
+                return;
+            };
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+                return;
+            }
+            let dev = dev.unwrap();
+            let dev_key = dev.as_raw() as usize;
+
+            let tex_desc = |format, flags| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 16,
+                Height: 16,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: flags,
+                ..Default::default()
+            };
+            let make_tex = |format, flags, state| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &tex_desc(format, flags),
+                    state,
+                    None,
+                    &mut r,
+                )
+                .unwrap();
+                r.unwrap()
+            };
+            let rt_a = make_tex(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            let rt_b = make_tex(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            let ds_a = make_tex(DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            let ds_b = make_tex(DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+
+            let rtv_heap: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 2,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let dsv_heap: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let rtv_inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
+            let rtv0 = rtv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            let rtv1 = rtv0 + rtv_inc;
+            let dsv0 = dsv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            dev.CreateRenderTargetView(&rt_a, None, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: rtv0 });
+            dev.CreateRenderTargetView(&rt_b, None, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: rtv1 });
+            dev.CreateDepthStencilView(&ds_a, None, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dsv0 });
+
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let raw = list.as_raw();
+            real::adopt(raw, real::Kind::CommandList);
+            on_create(raw, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+            // 1. Separate-handle MRT + DSV bind creates a private shadow snapshot.
+            let handles = [rtv0, rtv1];
+            note_render_targets(raw, 2, handles.as_ptr(), 0, &dsv0);
+            let split_clone = LISTS.lock().unwrap().as_ref().unwrap().get(&(raw as usize)).unwrap().bindings.clone();
+            let rt_snap = split_clone.render_targets.as_ref().expect("render_targets recorded");
+            assert!(rt_snap.shadow_has_rtvs && rt_snap.shadow_has_dsv);
+            let first_entry = rt_snap.shadow.as_ref().expect("shadow slot allocated").entry;
+            assert_ne!(first_entry.rtv_base, rtv0);
+            assert_ne!(first_entry.dsv_handle, dsv0);
+
+            // Overwrite the guest RTV/DSV slots with different resources, then restore the split clone.
+            dev.CreateRenderTargetView(&rt_b, None, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: rtv0 });
+            dev.CreateDepthStencilView(&ds_b, None, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dsv0 });
+            restore_bindings(raw, &split_clone, D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+            // 2. While `split_clone` holds a reference (`strong_count == 2`), rebinding on `raw`
+            //    must allocate a distinct shadow slot rather than overwriting `split_clone`'s snapshot.
+            note_render_targets(raw, 1, &rtv0, 1, std::ptr::null());
+            let second_entry = LISTS
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get(&(raw as usize))
+                .unwrap()
+                .bindings
+                .render_targets
+                .as_ref()
+                .and_then(|rt| rt.shadow.as_ref())
+                .expect("second shadow slot allocated")
+                .entry;
+            assert_ne!(second_entry.rtv_base, first_entry.rtv_base, "shared split snapshot must not be clobbered");
+
+            // 3. Rebinding again with `strong_count == 1` reuses the same shadow slot in place.
+            note_render_targets(raw, 0, std::ptr::null(), 0, &dsv0);
+            let reused = LISTS
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get(&(raw as usize))
+                .unwrap()
+                .bindings
+                .render_targets
+                .clone()
+                .expect("depth-only recorded");
+            assert!(!reused.shadow_has_rtvs && reused.shadow_has_dsv);
+            assert_eq!(reused.shadow.as_ref().unwrap().entry, second_entry, "unshared shadow slot should be reused in place");
+            drop(reused);
+
+            // 4. Restoring and closing the PC command list succeeds cleanly, and dropping all
+            //    references recycles every shadow slot back to the pool.
+            let b_depth = LISTS.lock().unwrap().as_ref().unwrap().get(&(raw as usize)).unwrap().bindings.clone();
+            restore_bindings(raw, &b_depth, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            drop(b_depth);
+            drop(split_clone);
+            on_release(raw as usize);
+
+            let ext = *(raw as *const *const usize);
+            *(raw as *mut usize) = *ext.sub(1);
+            list.Close().unwrap();
+
+            let free_count = RT_SHADOW_POOLS
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&dev_key))
+                .map_or(0, |p| p.free.len());
+            assert_eq!(free_count, RT_SHADOW_CHUNK_SLOTS as usize, "all shadow slots must recycle on release");
+        }
     }
 }

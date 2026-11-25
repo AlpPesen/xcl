@@ -534,15 +534,49 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
     });
 }
 
+/// Update `list`'s tracked backing allocator after `alloc_pool::reset_list` rotates `list` onto a
+/// fresh PC command allocator (e.g., `KickoffX` or `record_deferred`), retiring any prior
+/// recording buffers on the old allocator first.
+pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
+    let backing = backing_allocator(list, allocator);
+    let (old, blocks, res_bufs, io_blocks, prelude) = with(list, |s| {
+        if s.allocator == backing {
+            return (0, Vec::new(), Vec::new(), Vec::new(), None);
+        }
+        let old = std::mem::replace(&mut s.allocator, backing);
+        s.arena = Default::default();
+        s.scratch = Default::default();
+        s.scratch_next = 0;
+        s.scratch_taken = 0;
+        s.prelude_scratch = Default::default();
+        s.prelude_bufs.clear();
+        s.prelude_guards.clear();
+        s.prelude_scales.clear();
+        let prelude = s.prelude_owned.take();
+        s.prelude_built = None;
+        s.dummy_res_va = 0;
+        s.io_cache_gfx = None;
+        s.io_cache_cs = None;
+        s.io_cache_tp_cs = None;
+        s.io_cache_tp_ms = None;
+        let mut res_bufs = std::mem::take(&mut s.res_retired);
+        if let Some(b) = s.res_buf.take() {
+            res_bufs.push(b);
+        }
+        let io_blocks = std::mem::take(&mut s.io_blocks);
+        (old, std::mem::take(&mut s.uma), res_bufs, io_blocks, prelude)
+    });
+    console_list::hold_until_reset(old, blocks);
+    hold_res_until_reset(old, res_bufs);
+    hold_io_until_reset(old, io_blocks);
+    hold_prelude_until_reset(old, prelude);
+}
+
 /// Carry bound pipeline and root-signature / root-argument state from `from` to `to` across a
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
-    let backing = if allocator != 0 && super::alloc_pool::enabled() {
-        super::alloc_pool::current(allocator)
-    } else {
-        allocator
-    };
+    let backing = backing_allocator(to, allocator);
     let (layout, args, layout_gfx, args_gfx, rs_gfx, rs_cs, pso, heaps) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.rs_cs, s.pso, s.heaps)
     });
@@ -1809,7 +1843,9 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
             }
             None => {
                 let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).map_err(|e| format!("prelude allocator create: {e}"))?;
+                let _ = a.SetName(windows::core::w!("xcl prelude alloc"));
                 let l: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &a, None).map_err(|e| format!("prelude list create: {e}"))?;
+                let _ = l.SetName(windows::core::w!("xcl prelude"));
                 (a, l)
             }
         };

@@ -1128,7 +1128,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
     let mut placed_hr = None;
     let mut pc_tex_desc: Option<D3D12_RESOURCE_DESC> = None;
-    let mut water_tex: Option<(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, crate::hle::xg::Texture)> = None;
+    let mut water_tex: Option<(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, u32, u32, crate::hle::xg::Texture)> = None;
     if !buffer {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
         pc_tex_desc = Some(pc);
@@ -1137,7 +1137,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         let console_bytes = xg_tex.as_ref().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
         if console_bytes.is_some() && super::cpu_writes::is_water_readback_desc(&pc) {
             if let Some(t) = xg_tex {
-                water_tex = Some((pc.Format, t));
+                water_tex = Some((pc.Format, pc.Width as u32, pc.Height, t));
             }
         }
         drop(timer);
@@ -1150,8 +1150,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                     real::note_title_address(*ppv as usize, va as usize);
                     super::depth_uav::register_if_depth_uav(this, *ppv, &x, state, console_state);
                     super::format_alias::register_title_texture(this as usize, *ppv as usize, va as usize, &pc, flags, state);
-                    if let Some((fmt, t)) = water_tex {
-                        super::cpu_writes::register_water_readback(*ppv as usize, va as usize, fmt, std::sync::Arc::new(t));
+                    if let Some((fmt, w, h, t)) = water_tex {
+                        super::cpu_writes::register_water_readback(*ppv as usize, va as usize, fmt, w, h, std::sync::Arc::new(t));
                     } else if super::cpu_writes::has_water_readback() {
                         super::cpu_writes::unregister_water_readback(*ppv as usize);
                     }
@@ -1170,8 +1170,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         }
     };
     if hr >= 0 && !buffer && !(*ppv).is_null() {
-        if let Some((fmt, t)) = water_tex {
-            super::cpu_writes::register_water_readback(*ppv as usize, va as usize, fmt, std::sync::Arc::new(t));
+        if let Some((fmt, w, h, t)) = water_tex {
+            super::cpu_writes::register_water_readback(*ppv as usize, va as usize, fmt, w, h, std::sync::Arc::new(t));
         } else if super::cpu_writes::has_water_readback() {
             super::cpu_writes::unregister_water_readback(*ppv as usize);
         }

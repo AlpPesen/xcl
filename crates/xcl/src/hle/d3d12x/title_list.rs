@@ -287,10 +287,11 @@ pub fn backing(list: *mut c_void) -> Option<*mut c_void> {
     unsafe { (*(list as *const usize) == vtable()).then(|| *((list as usize + F_PRIMARY) as *const *mut c_void)) }
 }
 
-/// Expand a console list object into all of its recorded PC command list segments (in exact
-/// recording order), inserting any hoisted indirect-argument prelude list right before the
-/// segment that consumes it. Returns `false` if `list` is not a `title_list` wrapper.
-pub fn push_segments(list: *mut c_void, out: &mut Vec<*mut c_void>) -> bool {
+/// Expand a console list object into its raw recorded PC command list segments (in exact
+/// recording order) WITHOUT building or inserting prelude command lists. Use this for
+/// read-only inspection (`deferred_segment`, `record_deferred`) so mid-recording queries never
+/// freeze `prelude_list_for` early or mistake a prelude list for `wrapper`'s first segment.
+pub fn raw_segments(list: *mut c_void, out: &mut Vec<*mut c_void>) -> bool {
     let Some(primary) = backing(list) else {
         return false;
     };
@@ -301,15 +302,24 @@ pub fn push_segments(list: *mut c_void, out: &mut Vec<*mut c_void>) -> bool {
         let extras: Vec<*mut c_void> = book.map_or_else(Vec::new, |b| b.extra_active.iter().map(|&s| s as *mut c_void).collect());
         (first, extras)
     };
-    let push_with_prelude = |seg: *mut c_void, out: &mut Vec<*mut c_void>| {
+    out.push(first);
+    out.extend(extras);
+    true
+}
+
+/// Expand a console list object into all of its recorded PC command list segments (in exact
+/// recording order), inserting any hoisted indirect-argument / VRAM-io prelude list right before
+/// the segment that consumes it. Returns `false` if `list` is not a `title_list` wrapper.
+pub fn push_segments(list: *mut c_void, out: &mut Vec<*mut c_void>) -> bool {
+    let mut raw = Vec::new();
+    if !raw_segments(list, &mut raw) {
+        return false;
+    }
+    for seg in raw {
         if let Some(prelude) = unsafe { super::bind::prelude_list_for(seg) } {
             out.push(prelude);
         }
         out.push(seg);
-    };
-    push_with_prelude(first, out);
-    for seg in extras {
-        push_with_prelude(seg, out);
     }
     true
 }
