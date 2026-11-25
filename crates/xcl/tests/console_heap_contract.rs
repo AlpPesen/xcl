@@ -5,13 +5,22 @@
 
 use xcl::hle::d3d12x::console_heap::{self, Slot};
 
+/// The unified memory, or a counted skip.
+fn uma() -> Option<&'static xcl::gpu::uma::Uma> {
+    let u = xcl::gpu::uma::get();
+    if u.is_none() {
+        xcl::gpu::recomp::runner::skip_test("no unified memory");
+    }
+    u
+}
+
 fn rel(u: &xcl::gpu::uma::Uma, p: u64) -> u32 {
     (p as usize - u.base()) as u32
 }
 
 #[test]
 fn view_heap_slots_window_zero_and_release() {
-    let Some(u) = xcl::gpu::uma::get() else { return };
+    let Some(u) = uma() else { return };
     assert!(console_heap::register(0xC001, 4, 0x2000, 0x5000, 32, false, false, true));
     let v = console_heap::start(0xC001).unwrap();
     assert_eq!(u.window_of(v as usize), Some(0), "view heap must live in window 0 (32-bit table addressing)");
@@ -42,7 +51,7 @@ fn view_heap_slots_window_zero_and_release() {
 
 #[test]
 fn view_heap_indexing_is_per_page_slot_number() {
-    let Some(u) = xcl::gpu::uma::get() else { return };
+    let Some(u) = uma() else { return };
     assert!(console_heap::register(0xC002, 4, 0x3000, 0x6000, 32, false, false, true));
     let v = console_heap::start(0xC002).unwrap();
     // 4 slots: 0..3, each 32 bytes apart, k = (addr - base) / 32
@@ -61,7 +70,7 @@ fn view_heap_indexing_is_per_page_slot_number() {
 
 #[test]
 fn sampler_heap_slots_and_copy() {
-    let Some(u) = xcl::gpu::uma::get() else { return };
+    let Some(u) = uma() else { return };
     assert!(console_heap::register(0xC003, 2, 0x9000, 0, 16, true, false, true));
     let sm = console_heap::start(0xC003).unwrap();
     assert_eq!(u.window_of(sm as usize), Some(0), "sampler heap must live in window 0");
@@ -91,7 +100,7 @@ fn sampler_heap_slots_and_copy() {
 
 #[test]
 fn image_copy_renumbers_word_0_and_buffer_copy_keeps_address() {
-    let Some(u) = xcl::gpu::uma::get() else { return };
+    let Some(u) = uma() else { return };
     assert!(console_heap::register(0xC004, 4, 0x1000, 0x5000, 32, false, false, true));
     let v = console_heap::start(0xC004).unwrap();
     let s1 = console_heap::slot(v + 32).unwrap();
@@ -121,7 +130,7 @@ fn image_copy_renumbers_word_0_and_buffer_copy_keeps_address() {
 
 #[test]
 fn words_at_reads_the_console_address_space() {
-    let Some(u) = xcl::gpu::uma::get() else { return };
+    let Some(u) = uma() else { return };
     assert!(console_heap::register(0xC005, 2, 0x4000, 0x7000, 32, false, false, true));
     let v = console_heap::start(0xC005).unwrap();
     let s0 = console_heap::slot(v).unwrap();
@@ -142,7 +151,7 @@ fn words_at_reads_the_console_address_space() {
 fn heap_not_window_zero_is_still_registered_but_reported_elsewhere() {
     // a heap registered here is in window 0 by construction; the release path is what this
     // pins: after unregister, words_at reports None and the heap is forgotten
-    let Some(u) = xcl::gpu::uma::get() else { return };
+    let Some(u) = uma() else { return };
     assert!(console_heap::register(0xC006, 1, 0x5000, 0x8000, 32, false, false, true));
     let v = console_heap::start(0xC006).unwrap();
     assert!(console_heap::words_at(rel(u, v)).is_some());
@@ -153,7 +162,7 @@ fn heap_not_window_zero_is_still_registered_but_reported_elsewhere() {
 
 #[test]
 fn non_shader_visible_heap_reports_no_gpu_uav() {
-    let Some(u) = xcl::gpu::uma::get() else { return };
+    let Some(u) = uma() else { return };
     // pc_gpu = 0: the title made the heap CPU-only; slots report pc_gpu_uav == 0
     assert!(console_heap::register(0xC007, 2, 0x6000, 0, 32, false, false, false));
     let v = console_heap::start(0xC007).unwrap();
@@ -169,7 +178,7 @@ fn non_shader_visible_heap_reports_no_gpu_uav() {
 fn copy_words_of_a_view_to_a_buffer_slot_does_not_crash_on_short_words() {
     // copy_words reads exactly the source's word count and writes exactly 8 (a view slot);
     // a source slot written with only 4 words must not be read past the slot
-    let Some(u) = xcl::gpu::uma::get() else { return };
+    let Some(u) = uma() else { return };
     assert!(console_heap::register(0xC008, 2, 0x7000, 0x9000, 32, false, false, true));
     let v = console_heap::start(0xC008).unwrap();
     let s0 = console_heap::slot(v).unwrap();
@@ -187,7 +196,7 @@ fn copy_words_of_a_view_to_a_buffer_slot_does_not_crash_on_short_words() {
 
 #[test]
 fn start_is_stable_across_slot_calls() {
-    let Some(u) = xcl::gpu::uma::get() else { return };
+    let Some(u) = uma() else { return };
     assert!(console_heap::register(0xC009, 2, 0x8100, 0x9100, 32, false, false, true));
     let v = console_heap::start(0xC009).unwrap();
     let _s = console_heap::slot(v).unwrap();

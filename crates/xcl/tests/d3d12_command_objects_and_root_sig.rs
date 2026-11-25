@@ -67,8 +67,13 @@ fn create_command_queue_and_allocator_match_host_driver() {
             let (mut p_hook, mut p_host) = (std::ptr::null_mut(), std::ptr::null_mut());
             let hr_hook = q_hook(dev, &bad, &q_iid, &mut p_hook);
             let hr_host = q_host(dev, &bad, &q_iid, &mut p_host);
-            assert!(hr_hook < 0 && hr_host < 0, "expected queue failure: hook={hr_hook:#x}, host={hr_host:#x}");
-            assert!(p_hook.is_null() && p_host.is_null());
+            assert_eq!(hr_hook, hr_host, "HRESULT mismatch for {bad:?}");
+            assert_eq!((p_hook.is_null(), p_host.is_null()), (hr_hook < 0, hr_host < 0), "output for {bad:?}");
+            // The PC runtime refuses these; vkd3d-proton (under Wine) accepts some of them.
+            assert!(hr_host < 0 || xcl::util::under_wine(), "expected queue failure: host={hr_host:#x}");
+            for p in [p_hook, p_host].into_iter().filter(|p| !p.is_null()) {
+                drop(ID3D12CommandQueue::from_raw(p));
+            }
         }
 
         let q_console_iid = GUID::from_u128(0x11223344_5566_7788_99aa_bbccddeeff06);

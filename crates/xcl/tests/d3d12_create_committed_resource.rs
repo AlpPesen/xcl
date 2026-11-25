@@ -167,8 +167,13 @@ fn committed_resources_match_host_driver_desc_and_status() {
             let (mut p_host, mut p_hook) = (std::ptr::null_mut(), std::ptr::null_mut());
             let hr_host = host(dev, &props, D3D12_HEAP_FLAG_NONE, &desc.pc, D3D12_RESOURCE_STATE_COMMON, std::ptr::null(), riid, &mut p_host);
             let hr_hook = hooked(dev, &props, D3D12_HEAP_FLAG_NONE, &desc.pc, D3D12_RESOURCE_STATE_COMMON, std::ptr::null(), riid, &mut p_hook);
-            assert!(hr_host < 0 && p_host.is_null(), "{label}: expected host failure, got {hr_host:#x}");
-            assert!(hr_hook < 0 && p_hook.is_null(), "{label}: expected hooked failure, got {hr_hook:#x}");
+            assert_eq!(hr_hook < 0, hr_host < 0, "{label}: hooked {hr_hook:#x}, host {hr_host:#x}");
+            assert_eq!((p_hook.is_null(), p_host.is_null()), (hr_hook < 0, hr_host < 0), "{label}: output");
+            // The PC runtime refuses these; vkd3d-proton (under Wine) accepts some of them.
+            assert!(hr_host < 0 || xcl::util::under_wine(), "{label}: expected host failure, got {hr_host:#x}");
+            for p in [p_hook, p_host].into_iter().filter(|p| !p.is_null()) {
+                drop(ID3D12Resource::from_raw(p));
+            }
         }
     }
 }
