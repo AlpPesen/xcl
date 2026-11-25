@@ -1255,14 +1255,69 @@ fn resource_dim_to_view(r: &D3D12_RESOURCE_DESC) -> i32 {
 }
 
 static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
+static GPU_VIEW_BUFFER_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Resolve a console GPU virtual address range `[va, va + len)` to a shader-readable UMA address.
+/// Fast path: addresses already inside UMA return as-is.
+/// Fallback: consults `kernelx::mirrors::mapped_source` (and paired CPU view `mirrors::source`),
+/// verifying every 64 KiB page across `len` maps contiguously into UMA so direct zero-copy
+/// SRV/CBV/UAV access never aliases scattered physical pages.
+pub(super) fn resolve_uma_va(va: u64, len: usize) -> Option<u64> {
+    if va == 0 {
+        return None;
+    }
+    let u = crate::gpu::uma::get()?;
+    let start = va as usize;
+    if u.contains(start) {
+        if len == 0 || start.checked_add(len - 1).is_some_and(|e| u.contains(e)) {
+            return Some(va);
+        }
+        return None;
+    }
+    const MAX_CHECK: usize = 256 << 20;
+    if len > MAX_CHECK {
+        return None;
+    }
+    let resolve_byte = |addr: usize| -> Option<usize> {
+        match crate::hle::kernelx::mirrors::mapped_source(addr) {
+            Some(Some(backing)) => Some(backing),
+            Some(None) => None,
+            None => crate::hle::kernelx::mirrors::source(addr),
+        }
+    };
+    let resolved = resolve_byte(start)?;
+    if !u.contains(resolved) {
+        return None;
+    }
+    if len > 0 {
+        let end = start.checked_add(len - 1)?;
+        let resolved_end = resolved.checked_add(len - 1)?;
+        if !u.contains(resolved_end) {
+            return None;
+        }
+        const PAGE: usize = crate::hle::kernelx::mirrors::PAGE;
+        let mut page = (start & !(PAGE - 1)).checked_add(PAGE);
+        while let Some(p) = page {
+            if p > end {
+                break;
+            }
+            let expected = resolved.checked_add(p - start)?;
+            if resolve_byte(p) != Some(expected) {
+                return None;
+            }
+            page = p.checked_add(PAGE);
+        }
+    }
+    let n = GPU_VIEW_BUFFER_HITS.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: resolved GPU-view buffer/root VA {va:#x} -> UMA {resolved:#x} ({len} B, {} resolved)", n + 1);
+    }
+    Some(resolved as u64)
+}
 
 /// V# of a buffer view (raw: 4-byte elements, num_records in bytes; structured / typed:
 /// stride = element size, num_records in elements); empty when the buffer is not in UMA.
-fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
-    let Some((at, bytes)) = console_buffer(res) else {
-        note_buffer_view();
-        return [0; 4];
-    };
+fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool, read_only: bool) -> [u32; 4] {
     let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
     let (stride, elem) = if raw {
         (0, 4)
@@ -1272,10 +1327,30 @@ fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_
         let e = crate::gpu::desc::format_bytes(fmt);
         (e, e)
     };
-    let base = at as u64 + first * elem as u64;
-    let room = (bytes as u64).saturating_sub(first * elem as u64);
-    let records = if stride == 0 { (n as u64 * 4).min(room) } else { (n as u64).min(room / stride as u64) };
-    crate::gpu::desc::buffer_words(base, stride, records as u32, fmt)
+    if let Some((at, bytes)) = console_buffer(res) {
+        let base = at as u64 + first * elem as u64;
+        let room = (bytes as u64).saturating_sub(first * elem as u64);
+        let records = if stride == 0 { (n as u64 * 4).min(room) } else { (n as u64).min(room / stride as u64) };
+        return crate::gpu::desc::buffer_words(base, stride, records as u32, fmt);
+    }
+    if let Some((ta, width)) = title_address(res).and_then(|ta| {
+        let raw_ptr = res as *mut c_void;
+        let w = unsafe { ID3D12Resource::from_raw_borrowed(&raw_ptr) }.map(|r| unsafe { r.GetDesc().Width as usize })?;
+        Some((ta, w))
+    }) {
+        let off = first.saturating_mul(elem as u64);
+        let room = (width as u64).saturating_sub(off);
+        let records = if stride == 0 { (n as u64 * 4).min(room) } else { (n as u64).min(room / stride as u64) };
+        let view_bytes = if stride == 0 { records } else { records.saturating_mul(stride as u64) } as usize;
+        let target = (ta as u64).saturating_add(off);
+        let resolved = resolve_uma_va(target, view_bytes)
+            .or_else(|| read_only.then(|| super::sparse::gpu_view::base_for(target as usize, view_bytes).map(|b| b as u64)).flatten());
+        if let Some(base) = resolved {
+            return crate::gpu::desc::buffer_words(base, stride, records as u32, fmt);
+        }
+    }
+    note_buffer_view();
+    [0; 4]
 }
 
 /// Console buffer → a placed resource in the unified memory heap, so its console address is
@@ -1933,15 +2008,14 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
         return f(this, desc, cpu);
     };
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
-    let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
-    let mirrored = if in_uma { None } else { super::sparse::gpu_view::base_for(va as usize, size as usize) };
-    if !in_uma && mirrored.is_none() {
-        note_buffer_view();
-    }
-    let (va, size) = match mirrored {
-        Some(b) => (b as u64, size),
-        None if in_uma => (va, size),
-        None => (0, 0),
+    let resolved = resolve_uma_va(va, size as usize)
+        .or_else(|| super::sparse::gpu_view::base_for(va as usize, size as usize).map(|b| b as u64));
+    let (va, size) = match resolved {
+        Some(b) => (b, size),
+        None => {
+            note_buffer_view();
+            (0, 0)
+        }
     };
     super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
 }
@@ -2320,7 +2394,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, true));
     }
     let rdesc = r.GetDesc();
     match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
@@ -2403,13 +2477,11 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
         (false, s) => (s, s),
     };
     let records = if stride == 0 { n.saturating_mul(4) } else { n };
-    let mut base = va + first * elem as u64;
-    if read_only {
-        let len = (n as u64).saturating_mul(elem as u64);
-        if let Some(b) = super::sparse::gpu_view::base_for(base as usize, len as usize) {
-            base = b as u64;
-        }
-    }
+    let target = va.saturating_add(first.saturating_mul(elem as u64));
+    let len = (n as u64).saturating_mul(elem as u64) as usize;
+    let base = resolve_uma_va(target, len)
+        .or_else(|| read_only.then(|| super::sparse::gpu_view::base_for(target as usize, len).map(|b| b as u64)).flatten())
+        .unwrap_or(target);
     crate::gpu::desc::buffer_words(base, stride, records, fmt)
 }
 
@@ -2678,7 +2750,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     if let Some(v) = uav_desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, false));
     }
     // UAV dimensions: 1 buffer, 2 tex1d, 3 tex1d array, 4 tex2d, 5 tex2d array, 8 tex3d
     let (format, dim, array, mip) = match uav_desc.as_ref() {
