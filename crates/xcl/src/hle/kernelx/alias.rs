@@ -300,6 +300,45 @@ pub fn physical_page_at(va: usize) -> bool {
     with(|s| s.views.contains_key(&at) || s.away_at.contains_key(&at))
 }
 
+/// The physical page mapped at the page holding `va` (a view, or a page moved there), or None.
+pub fn page_at(va: usize) -> Option<usize> {
+    let at = va & !(PAGE - 1);
+    with(|s| s.views.get(&at).map(|v| v.0).or_else(|| s.away_at.get(&at).copied()))
+}
+
+/// What one call of the queue's page-mapping method did, in 64 KiB pages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Applied {
+    /// destination pages that show a physical page now
+    pub mapped: u64,
+    /// destination pages unmapped (by the call, or because nothing was mapped at their pool page)
+    pub unmapped: u64,
+    /// of those, pages whose pool page had nothing mapped
+    pub empty_pool: u64,
+}
+
+/// The queue's page-mapping method (`CopyPageMappingsBatchX`, decoded by
+/// `mirrors::decode_batches`): each destination page shows the physical page mapped at its pool
+/// page now – on the console the method copies the pool page's mapping – or nothing.
+pub unsafe fn apply_page_mappings(changes: &[(usize, Option<usize>)]) -> Option<Applied> {
+    let mut out = Applied::default();
+    for &(dest, pool) in changes {
+        let page = pool.and_then(page_at);
+        if !map_one(dest & !(PAGE - 1), page.unwrap_or(0)) {
+            return None;
+        }
+        match (pool, page) {
+            (_, Some(_)) => out.mapped += 1,
+            (Some(_), None) => {
+                out.unmapped += 1;
+                out.empty_pool += 1;
+            }
+            (None, _) => out.unmapped += 1,
+        }
+    }
+    Some(out)
+}
+
 /// Where page `page`'s bytes are now (committing its home if `write`), or None.
 unsafe fn bytes_of(page: usize, write: bool) -> Option<(usize, bool)> {
     let (away, home) = with(|s| (s.away.get(&page).copied(), s.page(page).map(|p| p.2)));
@@ -486,6 +525,39 @@ mod tests {
             assert_eq!(read64(s), 22, "back home with what it held there");
             free_space(s, 0, mem::MEM_RELEASE);
             mem::VirtualFree(out as *mut c_void, 0, mem::MEM_RELEASE);
+            free(&p);
+        }
+    }
+
+    #[test]
+    fn the_queue_page_mapping_method_shows_the_pool_pages_physical_page_in_the_gpu_view() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let p = pages(2);
+        let pool = reserve_space(4 * PAGE).unwrap();
+        let cpu = reserve_space(4 * PAGE).unwrap();
+        let gpu = reserve_space(4 * PAGE).unwrap();
+        unsafe {
+            // a streamed page: in the pool and in the CPU view, written through the CPU view
+            assert!(map(pool + PAGE, &[p[0]]));
+            assert!(map(cpu + 2 * PAGE, &[p[0]]));
+            write64(cpu + 2 * PAGE, 0x5EED);
+            // kind 0 / 1: pool pages at GPU-view pages; pool page 3 holds nothing; kind 2: unmapped
+            let changes = [(gpu, Some(pool + PAGE)), (gpu + PAGE, Some(pool + PAGE)), (gpu + 2 * PAGE, Some(pool + 3 * PAGE)), (gpu + 3 * PAGE, None)];
+            let done = apply_page_mappings(&changes).unwrap();
+            assert_eq!(done, Applied { mapped: 2, unmapped: 2, empty_pool: 1 });
+            assert_eq!(read64(gpu), 0x5EED, "the GPU view shows the page the CPU view wrote");
+            assert_eq!(read64(gpu + PAGE), 0x5EED, "one pool page at two GPU-view pages");
+            assert!(!physical_page_at(gpu + 2 * PAGE) && !physical_page_at(gpu + 3 * PAGE));
+            dirty();
+            write64(gpu + PAGE + 8, 1);
+            assert_eq!(dirty(), vec![pool + PAGE, cpu + 2 * PAGE, gpu, gpu + PAGE], "a write in the GPU view: every view of the page is uploaded");
+            // the pool page is given another physical page later: the GPU view keeps the one it was given
+            assert!(map(pool + PAGE, &[p[1]]));
+            assert_eq!(read64(gpu), 0x5EED);
+            assert_eq!(page_at(gpu), Some(p[0]));
+            for s in [pool, cpu, gpu] {
+                free_space(s, 0, mem::MEM_RELEASE);
+            }
             free(&p);
         }
     }

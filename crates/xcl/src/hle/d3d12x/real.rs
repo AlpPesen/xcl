@@ -6182,6 +6182,29 @@ unsafe fn q_copy_page_mappings(count: u32, batches: usize, pool: usize, pool_pag
     static ELSEWHERE: AtomicU64 = AtomicU64::new(0);
     static PHYSICAL: AtomicU64 = AtomicU64::new(0);
     let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    // physical pages alias (`XCL_PAGE_ALIAS`): the GPU-view pages show the pool pages' physical
+    // pages for real, instead of a record of them
+    if crate::hle::kernelx::alias::enabled() {
+        static EMPTY: AtomicU64 = AtomicU64::new(0);
+        let done = crate::hle::kernelx::mirrors::decode_batches(count, batches, pool, pool_pages).and_then(|changes| {
+            crate::hle::kernelx::note_gpu_view_mapping(changes.first().map_or(0, |c| c.0));
+            crate::hle::kernelx::alias::apply_page_mappings(&changes)
+        });
+        match done {
+            Some(d) => {
+                let add = |total: &AtomicU64, k: u64| total.fetch_add(k, Ordering::Relaxed) + k;
+                let (m, u, e) = (add(&MAPPED, d.mapped), add(&UNMAPPED, d.unmapped), add(&EMPTY, d.empty_pool));
+                if n == 1 || n.is_power_of_two() {
+                    crate::xlog_info!("D3D12.X: queue CopyPageMappingsBatchX: {n} calls; pages mapped so far: {m} showing a physical page, {u} unmapped ({e} of them for a pool page with nothing mapped; pool {pool:#x}, {pool_pages} pages of 64 KiB)");
+                }
+            }
+            None => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::xlog_warn!("D3D12.X: queue CopyPageMappingsBatchX({count}, {batches:#x}, {pool:#x}, {pool_pages}): a batch or range is unreadable or leaves the pool, or a page could not be mapped"));
+            }
+        }
+        return S_OK;
+    }
     match crate::hle::kernelx::mirrors::apply_batches(count, batches, pool, pool_pages) {
         Some(d) => {
             let add = |total: &AtomicU64, k: u64| total.fetch_add(k, Ordering::Relaxed) + k;

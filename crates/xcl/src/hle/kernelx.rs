@@ -1117,6 +1117,12 @@ pub fn gpu_view_map_gen() -> u64 {
     GPU_VIEW_MAP_GEN.load(Ordering::Acquire)
 }
 
+/// The queue's page-mapping method mapped pages at `va`: a GPU view's mappings changed if it
+/// lies in one (textures there look again).
+pub fn note_gpu_view_mapping(va: usize) {
+    note_mapping_at(va);
+}
+
 /// Pages are mapped or unmapped at `va`: a GPU view's mappings changed if it lies in one.
 fn note_mapping_at(va: usize) {
     if mirrors::source(va).is_some() {
