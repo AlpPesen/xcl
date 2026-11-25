@@ -622,6 +622,23 @@ fn signature_dispatches(sig: usize) -> bool {
     DISPATCH_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig))
 }
 
+/// command signatures of one Dispatch argument → their stride (a split program runs them as its
+/// chain, `chained_indirect`)
+static DISPATCH_ONLY: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+
+pub(super) fn note_dispatch_only_signature(sig: usize, stride: Option<u32>) {
+    let mut s = DISPATCH_ONLY.lock().unwrap();
+    let s = s.get_or_insert_with(Default::default);
+    match stride {
+        Some(n) => {
+            s.insert(sig, n);
+        }
+        None => {
+            s.remove(&sig);
+        }
+    }
+}
+
 pub(super) fn note_dispatch_mesh_signature(sig: usize, companion_dispatch: usize, byte_stride: u32, mesh_offset: u32) {
     DISPATCH_MESH_SIGS
         .lock()
@@ -1730,7 +1747,7 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
                         pResource: std::mem::ManuallyDrop::new(Some(b.clone())),
                         Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                         StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        StateAfter: D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        StateAfter: GUARDED_ARGS_STATE,
                     }),
                 },
             });
@@ -1775,6 +1792,12 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
         }
     }
 }
+
+/// State left on guarded indirect argument scratch buffers: valid for both `ExecuteIndirect`
+/// and `pso::record_slicer` SRV reads (pure read-only state that decays cleanly to COMMON).
+const GUARDED_ARGS_STATE: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
+    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0,
+);
 
 /// The groups of an indirect dispatch above which they are not the title's (`GUARD_ARGS_HLSL`):
 /// a 4K target in groups of 2x2 pixels is 2.1 million.
@@ -1882,9 +1905,9 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
             list.SetComputeRootUnorderedAccessView(1, dst_va);
             list.SetComputeRootUnorderedAccessView(2, dispatch_io_va);
             list.Dispatch(1, 1, 1);
-            emit_transition_and_uav(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            emit_transition_and_uav(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, GUARDED_ARGS_STATE);
             with(this, |s| {
-                s.scratch[slot].state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+                s.scratch[slot].state = GUARDED_ARGS_STATE;
                 s.pc_abi_cs = AbiBound::default();
                 s.arg_order_clean = true;
             });
@@ -1907,10 +1930,11 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     list.SetComputeRootUnorderedAccessView(2, dst_va);
     list.SetComputeRootUnorderedAccessView(3, dispatch_io_va);
     list.Dispatch(1, 1, 1);
-    // Transition scratch to INDIRECT_ARGUMENT and flush the `IO_GROUP_LIMIT` store in `dispatch_io_va`.
-    emit_transition_and_uav(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    // Transition scratch to INDIRECT_ARGUMENT | NON_PIXEL_SHADER_RESOURCE and flush the
+    // `IO_GROUP_LIMIT` store in `dispatch_io_va`.
+    emit_transition_and_uav(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, GUARDED_ARGS_STATE);
     with(this, |s| {
-        s.scratch[slot].state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        s.scratch[slot].state = GUARDED_ARGS_STATE;
         s.pc_abi_cs = AbiBound::default();
         s.arg_order_clean = true;
     });
@@ -2359,6 +2383,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         let off = usize::try_from(count_off).ok()?;
         (off.checked_add(4)? <= n).then(|| p.checked_add(off)).flatten()
     });
+    let (args_off_title, count_off_title) = (args_off, count_off);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if let Some(tp) = super::real::two_pass_of(pso) {
         if skip_mesh() {
@@ -2481,33 +2506,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-    // For split compute pipelines, resolve the whole form without stalling the title thread
-    // (kicking off background compilation on first indirect use instead of blocking 15-60s).
-    let whole_pso = if compute {
-        match super::real::dispatch_chain::whole_nonblocking(pso) {
-            super::real::dispatch_chain::WholeStatus::NotSplit => None,
-            super::real::dispatch_chain::WholeStatus::Ready(whole) => Some(whole),
-            super::real::dispatch_chain::WholeStatus::Pending => {
-                count(DISPATCHES_SKIPPED);
-                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if N.fetch_add(1, Ordering::Relaxed) < 8 {
-                    crate::xlog_info!("D3D12.X: ExecuteIndirect of split compute PSO ({pso:#x}) skipped while whole form builds in background");
-                }
-                return;
-            }
-            super::real::dispatch_chain::WholeStatus::Failed => {
-                count(DISPATCHES_SKIPPED);
-                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                    crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO ({pso:#x}) failed – skipped");
-                }
-                return;
-            }
-        }
-    } else {
-        None
-    };
-    // (before the dispatch's own root signature and pipeline are bound)
+    // Guard single-command indirect dispatches before binding or chaining so both `record_slicer`
+    // and the PC `ExecuteIndirect` read clamped, >65535 X-folded arguments from a committed buffer.
     let mut guarded = None;
     let mut preset_io = None;
     if compute && max == 1 && indirect_guard() && signature_dispatches(sig) {
@@ -2536,7 +2536,94 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
         }
     }
-    let (args, args_off) = guarded.as_ref().map_or((args, args_off), |(b, o)| (b.as_raw() as usize, *o));
+    let (exec_args, exec_args_off) = guarded.as_ref().map_or((args, args_off), |(b, o)| (b.as_raw() as usize, *o));
+    if compute && super::real::dispatch_chain::is_split(pso) {
+        // Run split compute ExecuteIndirects through their already-built chain pieces on the GPU
+        // instead of stalling or skipping while the whole form compiles in the background.
+        let ei = || {
+            if guarded.is_some() {
+                pc(this, sig, max, exec_args, exec_args_off, count_buf, count_off);
+            } else {
+                fresh_indirect_arguments(this, || pc(this, sig, max, exec_args, exec_args_off, count_buf, count_off));
+            }
+        };
+        let mark = super::culprit::before_dispatch(list, raw_pso, pso, [0, 0, max]);
+        match chained_indirect(
+            this,
+            list,
+            pso,
+            sig,
+            max,
+            guarded.as_ref(),
+            (args, args_off_title, args_off),
+            (count_buf, count_off_title, count_off),
+            preset_io,
+            ei,
+        ) {
+            Ok(true) => {
+                super::culprit::after_dispatch(list, mark);
+                with(this, |s| {
+                    s.pc_abi_cs = AbiBound::default();
+                    s.arg_order_clean = false;
+                    s.prelude_blocked = true;
+                });
+                return count(DISPATCHES);
+            }
+            Ok(false) => {
+                super::culprit::after_dispatch(list, mark);
+            }
+            Err(e) => {
+                super::culprit::after_dispatch(list, mark);
+                if let Some(real) = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)) {
+                    list.SetPipelineState(real);
+                }
+                with(this, |s| s.pc_abi_cs = AbiBound::default());
+                count(DISPATCHES_SKIPPED);
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::xlog_warn!("D3D12.X: ExecuteIndirect of a split program skipped: {e}");
+                }
+                return;
+            }
+        }
+    }
+    // Non-chainable fallback (bundles, non-dispatch-only signatures, or no scratch): resolve the
+    // whole form without stalling the title thread.
+    let whole_pso = if compute {
+        match super::real::dispatch_chain::whole_nonblocking(pso) {
+            super::real::dispatch_chain::WholeStatus::NotSplit => None,
+            super::real::dispatch_chain::WholeStatus::Ready(whole) => Some(whole),
+            super::real::dispatch_chain::WholeStatus::Pending => {
+                if guarded.is_some() {
+                    if let Some(real) = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)) {
+                        list.SetPipelineState(real);
+                    }
+                }
+                count(DISPATCHES_SKIPPED);
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::xlog_info!("D3D12.X: ExecuteIndirect of split compute PSO ({pso:#x}) skipped while whole form builds in background");
+                }
+                return;
+            }
+            super::real::dispatch_chain::WholeStatus::Failed => {
+                if guarded.is_some() {
+                    if let Some(real) = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)) {
+                        list.SetPipelineState(real);
+                    }
+                }
+                count(DISPATCHES_SKIPPED);
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO ({pso:#x}) failed – skipped");
+                }
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let (args, args_off) = (exec_args, exec_args_off);
     match bind_abi(this, list, pso, gfx, 0, preset_io) {
         Ok(()) => {
             if let Some(whole) = whole_pso {
@@ -2570,6 +2657,97 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
             }
         }
+    }
+}
+
+/// An ExecuteIndirect of split program `pso` with a command signature of one Dispatch, run as its
+/// chain (`dispatch_chain::execute_indirect`); the buffers as (resource, title's offset, PC's).
+/// Ok(false): nothing recorded – fall back to the whole form.
+#[allow(clippy::too_many_arguments)]
+unsafe fn chained_indirect(
+    this: *mut c_void,
+    list: &ID3D12GraphicsCommandList,
+    pso: usize,
+    sig: usize,
+    max: u32,
+    guarded: Option<&(ID3D12Resource, u64)>,
+    (args, args_title, args_pc): (usize, u64, u64),
+    (count_buf, count_title, count_pc): (usize, u64, u64),
+    preset_io: Option<u64>,
+    ei: impl FnOnce(),
+) -> Result<bool, String> {
+    let Some(stride) = DISPATCH_ONLY.lock().unwrap().as_ref().and_then(|m| m.get(&sig).copied()) else {
+        return Ok(false);
+    };
+    let args_va = match guarded {
+        Some((b, off)) => {
+            let va = b.GetGPUVirtualAddress();
+            if va == 0 {
+                return Ok(false);
+            }
+            va + *off
+        }
+        None => match indirect_address(args, args_title, args_pc) {
+            Some(v) => v,
+            None => return Ok(false),
+        },
+    };
+    let count_va = match count_buf {
+        0 => None,
+        c => match indirect_address(c, count_title, count_pc) {
+            Some(v) => Some(v),
+            None => return Ok(false),
+        },
+    };
+    // the arguments there now (the GPU's last ones) size the rounds
+    let read = |res: usize, off: u64, n: usize| -> Option<Vec<u32>> {
+        let (p, size) = super::real::console_buffer(res)?;
+        let off = usize::try_from(off).ok()?;
+        let end = off.checked_add(4 * n)?;
+        let at = p.checked_add(off)?;
+        (end <= size && crate::gpu::shader::readable(at, 4 * n))
+            .then(|| (0..n).map(|i| std::ptr::read_volatile((at as *const u32).add(i))).collect())
+    };
+    let n = if count_buf == 0 {
+        max
+    } else {
+        read(count_buf, count_title, 1).map_or(max, |c| c[0].min(max))
+    };
+    let seen: Vec<[u32; 3]> = (0..n.min(64))
+        .filter_map(|k| read(args, args_title.checked_add(u64::from(k).checked_mul(u64::from(stride))?)?, 3))
+        .map(|v| [v[0], v[1], v[2]])
+        .collect();
+    let predicated = super::list_x::predication_active(this);
+    super::real::dispatch_chain::execute_indirect(
+        list,
+        pso,
+        with(this, |s| s.allocator),
+        args_va,
+        stride,
+        max,
+        count_va,
+        &seen,
+        predicated,
+        || {
+            with(this, |s| s.pc_abi_cs = AbiBound::default());
+            bind_abi(this, list, pso, false, 0, preset_io)
+        },
+        ei,
+    )
+}
+
+/// The GPU address of a title's buffer `res` at its offset `title` (a buffer in unified memory) or
+/// `pc` (another).
+unsafe fn indirect_address(res: usize, title: u64, pc: u64) -> Option<u64> {
+    match super::real::console_buffer(res) {
+        Some((p, n)) => {
+            let off = usize::try_from(title).ok()?;
+            let addr = p.checked_add(off)?;
+            (off < n).then(|| super::real::uma_va_of(addr)).flatten()
+        }
+        None => Some(ID3D12Resource::from_raw_borrowed(&(res as *mut c_void))?.GetGPUVirtualAddress())
+            .filter(|&va| va != 0)
+            .map(|va| va + pc),
     }
 }
 
