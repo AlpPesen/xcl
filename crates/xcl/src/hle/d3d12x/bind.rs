@@ -82,6 +82,42 @@ struct ScratchSlot {
 }
 
 #[derive(Default)]
+struct PreludeScratchSlot {
+    buf: Option<(ID3D12Resource, u64, usize)>,
+    used: u64,
+    buf_idx: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreludeGuardJob {
+    buf_idx: usize,
+    dst_off: u32,
+    src_win: u32,
+    src_off: u32,
+    most: u32,
+    lim_win: u32,
+    lim_off: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreludeScaleJob {
+    buf_idx: usize,
+    dst_off: u32,
+    count: u32,
+    stride: u32,
+    mesh_offset: u32,
+    split: u32,
+    cap: u32,
+    src_win: u32,
+    src_off: u32,
+    has_cnt: u32,
+    cnt_win: u32,
+    cnt_off: u32,
+}
+
+type PreludeEntry = (ID3D12CommandAllocator, ID3D12GraphicsCommandList, usize, i32);
+
+#[derive(Default)]
 struct State {
     layout: Option<Arc<Layout>>,
     args: Vec<u8>,
@@ -111,6 +147,17 @@ struct State {
     scratch: [ScratchSlot; 2],
     scratch_next: usize,
     scratch_taken: u64,
+    /// Hoisted indirect-argument clamps recorded into a single batched prelude command list
+    /// submitted right before this segment (`title_list::push_segments` / `reclaim_for_kickoff`).
+    /// Disabled for the remainder of the segment once any GPU buffer write or cross-queue wait
+    /// is recorded (`prelude_blocked`).
+    prelude_blocked: bool,
+    prelude_scratch: PreludeScratchSlot,
+    prelude_bufs: Vec<ID3D12Resource>,
+    prelude_guards: Vec<PreludeGuardJob>,
+    prelude_scales: Vec<PreludeScaleJob>,
+    prelude_owned: Option<PreludeEntry>,
+    prelude_built: Option<ID3D12GraphicsCommandList>,
     /// true after an `INDIRECT_ARGUMENT` transition has ordered prior writes on this list and
     /// no compute/mesh dispatch has run since (skips redundant `fresh_indirect_arguments` barriers
     /// across runs of consecutive indirect graphics draws).
@@ -138,9 +185,13 @@ const SCRATCH_BLOCK: u64 = 1 << 20;
 const SCRATCH_CAP: u64 = 16 << 20;
 /// Most bytes of buffers kept for reuse (`FREE_RES`)
 const FREE_RES_CAP: u64 = 256 << 20;
+/// Most recycled prelude (allocator, list) pairs kept for reuse (`FREE_PRELUDE`)
+const FREE_PRELUDE_CAP: usize = 64;
 
 static ALLOC_RES: Mutex<Option<HashMap<usize, Vec<(ID3D12Resource, u64, usize)>>>> = Mutex::new(None);
 static FREE_RES: Mutex<Vec<(ID3D12Resource, u64, usize)>> = Mutex::new(Vec::new());
+static ALLOC_PRELUDE: Mutex<Option<HashMap<usize, Vec<PreludeEntry>>>> = Mutex::new(None);
+static FREE_PRELUDE: Mutex<Vec<PreludeEntry>> = Mutex::new(Vec::new());
 
 fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, usize)>) {
     if bufs.is_empty() || allocator == 0 {
@@ -149,13 +200,30 @@ fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, us
     ALLOC_RES.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().append(&mut bufs);
 }
 
+fn hold_prelude_until_reset(allocator: usize, entry: Option<PreludeEntry>) {
+    let Some(entry) = entry else { return };
+    if allocator == 0 {
+        return;
+    }
+    ALLOC_PRELUDE.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().push(entry);
+}
+
 pub(super) fn release_allocator_res(allocator: usize) {
-    let Some(bufs) = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) else { return };
-    let mut free = FREE_RES.lock().unwrap();
-    for b in bufs {
-        let held: u64 = free.iter().map(|f| f.1).sum();
-        if pool_keeps(free.len(), held, b.1) {
-            free.push(b);
+    if let Some(bufs) = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
+        let mut free = FREE_RES.lock().unwrap();
+        for b in bufs {
+            let held: u64 = free.iter().map(|f| f.1).sum();
+            if pool_keeps(free.len(), held, b.1) {
+                free.push(b);
+            }
+        }
+    }
+    if let Some(entries) = ALLOC_PRELUDE.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
+        let mut free = FREE_PRELUDE.lock().unwrap();
+        for e in entries {
+            if free.len() < FREE_PRELUDE_CAP {
+                free.push(e);
+            }
         }
     }
 }
@@ -198,11 +266,21 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
 
+/// Note that the active recording segment issued a GPU buffer write or cross-queue fence wait:
+/// subsequent indirect argument clamps must execute inline instead of hoisting into the prelude,
+/// and indirect argument ordering is no longer clean.
+pub(super) fn note_gpu_write(list: *mut c_void) {
+    with(list, |s| {
+        s.prelude_blocked = true;
+        s.arg_order_clean = false;
+    });
+}
+
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
-    let (old, blocks, res_bufs) = with(list, |s| {
+    let (old, blocks, res_bufs, prelude) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.pso = initial_pso;
@@ -217,6 +295,13 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.scratch = Default::default();
         s.scratch_next = 0;
         s.scratch_taken = 0;
+        s.prelude_blocked = false;
+        s.prelude_scratch = Default::default();
+        s.prelude_bufs.clear();
+        s.prelude_guards.clear();
+        s.prelude_scales.clear();
+        let prelude = s.prelude_owned.take();
+        s.prelude_built = None;
         s.arg_order_clean = false;
         s.uma_windows = None;
         s.dummy_res_va = 0;
@@ -233,10 +318,11 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
             res_bufs.push(b);
         }
         s.rs_cs = 0;
-        (old, std::mem::take(&mut s.uma), res_bufs)
+        (old, std::mem::take(&mut s.uma), res_bufs, prelude)
     });
     console_list::hold_until_reset(old, blocks);
     hold_res_until_reset(old, res_bufs);
+    hold_prelude_until_reset(old, prelude);
 }
 
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
@@ -269,7 +355,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     let (layout, args, layout_gfx, args_gfx, rs_gfx, rs_cs, pso, heaps) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.rs_cs, s.pso, s.heaps)
     });
-    let (old, blocks) = with(to, |s| {
+    let (old, blocks, res_bufs, prelude) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.layout = layout;
@@ -283,6 +369,16 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.scratch = Default::default();
         s.scratch_next = 0;
         s.scratch_taken = 0;
+        // A continuation segment (`from != to`) begins after a mid-list Wait32/64 split, so never
+        // hoist clamps ahead of that segment's head fence wait. A KickoffX non-split (`from == to`)
+        // starts a fresh post-kickoff segment and may hoist again.
+        s.prelude_blocked = from != to;
+        s.prelude_scratch = Default::default();
+        s.prelude_bufs.clear();
+        s.prelude_guards.clear();
+        s.prelude_scales.clear();
+        let prelude = s.prelude_owned.take();
+        s.prelude_built = None;
         s.arg_order_clean = false;
         s.uma_windows = None;
         s.dummy_res_va = 0;
@@ -294,9 +390,11 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.io_cache_cs = None;
         s.io_cache_tp_cs = None;
         s.io_cache_tp_ms = None;
-        (old, std::mem::take(&mut s.uma))
+        (old, std::mem::take(&mut s.uma), std::mem::take(&mut s.res_retired), prelude)
     });
     console_list::hold_until_reset(old, blocks);
+    hold_res_until_reset(old, res_bufs);
+    hold_prelude_until_reset(old, prelude);
 }
 
 /// The list is gone.
@@ -307,6 +405,7 @@ pub(super) fn forget(list: *mut c_void) {
             s.res_retired.push(b);
         }
         hold_res_until_reset(s.allocator, s.res_retired);
+        hold_prelude_until_reset(s.allocator, s.prelude_owned.take());
     }
 }
 
@@ -900,6 +999,481 @@ void main() {
 
 const GUARD_ARGS_DRED_LABEL: &str = "xcl guard_dispatch_args";
 const SCALE_ARGS_DRED_LABEL: &str = "xcl make_scaled_args_buffer";
+const PRELUDE_GUARD_DRED_LABEL: &str = "xcl prelude_guard_dispatch_args";
+const PRELUDE_SCALE_DRED_LABEL: &str = "xcl prelude_scale_mesh_args";
+
+/// Batched prelude pass clamping & >65,535-folding all hoisted indirect compute dispatches of a
+/// command list in a single Dispatch(ceil(N / 64), 1, 1) before the list runs.
+/// `jobs` (u0): `[total, 0, 0, 0]` followed by `total` 32-byte records
+/// `[src_win, src_off, most, dst_off, lim_win, lim_off, 0, 0]`.
+pub(super) const PRELUDE_GUARD_HLSL: &str = r#"RWByteAddressBuffer jobs : register(u0);
+RWByteAddressBuffer dst  : register(u1);
+RWByteAddressBuffer w0   : register(u2);
+RWByteAddressBuffer w1   : register(u3);
+RWByteAddressBuffer w2   : register(u4);
+RWByteAddressBuffer w3   : register(u5);
+uint3 load_u32x3(uint win, uint off) {
+    if (win == 0u) return w0.Load3(off);
+    if (win == 1u) return w1.Load3(off);
+    if (win == 2u) return w2.Load3(off);
+    return w3.Load3(off);
+}
+void store_u32(uint win, uint off, uint v) {
+    if (win == 0u) w0.Store(off, v);
+    else if (win == 1u) w1.Store(off, v);
+    else if (win == 2u) w2.Store(off, v);
+    else w3.Store(off, v);
+}
+[numthreads(64, 1, 1)]
+void main(uint tid : SV_DispatchThreadID) {
+    uint total = jobs.Load(0);
+    if (tid >= total) return;
+    uint b = 16u + tid * 32u;
+    uint src_win = jobs.Load(b);
+    uint src_off = jobs.Load(b + 4u);
+    uint most    = jobs.Load(b + 8u);
+    uint dst_off = jobs.Load(b + 12u);
+    uint lim_win = jobs.Load(b + 16u);
+    uint lim_off = jobs.Load(b + 20u);
+    uint3 g = load_u32x3(src_win, src_off);
+    uint3 out_g = uint3(0u, 0u, 0u);
+    uint limit = 0u;
+    if (g.x != 0u && g.y != 0u && g.z != 0u && all(g <= most)) {
+        if (g.x <= most / g.y) {
+            if (g.x * g.y <= most / g.z) {
+                if (g.x > 65535u && g.y == 1u && g.z <= 65535u) {
+                    uint rows = (g.x - 1u) / 65535u + 1u;
+                    if (rows <= 65535u) {
+                        out_g = uint3(65535u, rows, g.z);
+                        limit = g.x;
+                    } else {
+                        out_g = min(g, 65535u.xxx);
+                    }
+                } else {
+                    out_g = min(g, 65535u.xxx);
+                }
+            }
+        }
+    }
+    dst.Store3(dst_off, out_g);
+    if (lim_off != 0xFFFFFFFFu) {
+        store_u32(lim_win, lim_off, limit);
+    }
+}
+"#;
+
+/// Batched prelude pass scaling all hoisted two-pass ExecuteIndirect(DispatchMesh) draws of a
+/// command list in a single Dispatch(num_jobs, 1, 1) before the list runs (one 64-lane group per
+/// job, looping over `count` commands). `jobs` (u0): 48-byte records
+/// `[count, stride, offset, split, cap, src_win, src_off, dst_off, has_cnt, cnt_win, cnt_off, 0]`.
+pub(super) const PRELUDE_SCALE_HLSL: &str = r#"RWByteAddressBuffer jobs : register(u0);
+RWByteAddressBuffer dst  : register(u1);
+RWByteAddressBuffer w0   : register(u2);
+RWByteAddressBuffer w1   : register(u3);
+RWByteAddressBuffer w2   : register(u4);
+RWByteAddressBuffer w3   : register(u5);
+uint load_u32(uint win, uint off) {
+    if (win == 0u) return w0.Load(off);
+    if (win == 1u) return w1.Load(off);
+    if (win == 2u) return w2.Load(off);
+    return w3.Load(off);
+}
+uint3 load_u32x3(uint win, uint off) {
+    if (win == 0u) return w0.Load3(off);
+    if (win == 1u) return w1.Load3(off);
+    if (win == 2u) return w2.Load3(off);
+    return w3.Load3(off);
+}
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint b = gid.x * 48u;
+    uint count   = jobs.Load(b);
+    uint stride  = jobs.Load(b + 4u);
+    uint offset  = jobs.Load(b + 8u);
+    uint split   = jobs.Load(b + 12u);
+    uint cap     = jobs.Load(b + 16u);
+    uint src_win = jobs.Load(b + 20u);
+    uint src_off = jobs.Load(b + 24u);
+    uint dst_off = jobs.Load(b + 28u);
+    uint has_cnt = jobs.Load(b + 32u);
+    uint cnt_win = jobs.Load(b + 36u);
+    uint cnt_off = jobs.Load(b + 40u);
+    uint live = count;
+    if (has_cnt != 0u) {
+        live = min(count, load_u32(cnt_win, cnt_off));
+    }
+    for (uint tid = gtid.x; tid < count; tid += 64u) {
+        uint s = src_off + tid * stride;
+        uint d = dst_off + tid * stride;
+        uint m = d + count * stride;
+        for (uint i = 0u; i < stride; i += 4u) {
+            uint w = load_u32(src_win, s + i);
+            dst.Store(d + i, w);
+            dst.Store(m + i, w);
+        }
+        uint3 g = load_u32x3(src_win, s + offset);
+        uint n = 0u;
+        if (tid < live && g.x != 0u && g.y != 0u && g.z != 0u) {
+            n = min(g.x, cap);
+            n = g.y > cap / n ? cap : n * g.y;
+            n = g.z > cap / n ? cap : n * g.z;
+        }
+        dst.Store3(d + offset, uint3(n, 1u, 1u));
+        dst.Store3(m + offset, uint3(n * split, 1u, 1u));
+    }
+}
+"#;
+
+/// `XCL_INDIRECT_PRELUDE=0`: run indirect argument clamp/scale passes inline instead of hoisting
+/// them into a batched prelude command list submitted right before the recording.
+fn indirect_prelude_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_INDIRECT_PRELUDE").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Map a 4-byte-aligned UMA host address + byte span to `(window_index, byte_offset)` within
+/// the 4 UMA windows (`u2..u5`), ensuring `byte_offset + span` fits in 32-bit HLSL byte offsets.
+fn uma_win_off(u: &crate::gpu::uma::Uma, p: usize, span: usize) -> Option<(u32, u32)> {
+    if p % 4 != 0 || span == 0 {
+        return None;
+    }
+    let k = u.window_of(p)?;
+    if k >= 4 {
+        return None;
+    }
+    let (base, size) = u.window(k);
+    let off = p.checked_sub(base)?;
+    let end = off.checked_add(span)?;
+    if end > size || end > u32::MAX as usize {
+        return None;
+    }
+    Some((k as u32, off as u32))
+}
+
+fn can_hoist_prelude(this: *mut c_void) -> bool {
+    indirect_prelude_on()
+        && super::title_list::wrapper_of(this).is_some()
+        && matches!(
+            super::list_x::tracked_list_type(this),
+            Some(D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE)
+        )
+        && with(this, |s| !s.prelude_blocked && s.allocator != 0 && s.prelude_built.is_none())
+}
+
+unsafe fn prelude_root_signature(dev: &ID3D12Device) -> Result<ID3D12RootSignature, String> {
+    let params: [D3D12_ROOT_PARAMETER1; 6] = std::array::from_fn(|reg| D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: reg as u32,
+                RegisterSpace: 0,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    });
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: 0,
+                pStaticSamplers: std::ptr::null(),
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            },
+        },
+    };
+    let mut blob: Option<windows::Win32::Graphics::Direct3D::ID3DBlob> = None;
+    D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).map_err(|e| format!("prelude root signature serialize: {e}"))?;
+    let blob = blob.ok_or("prelude root signature blob")?;
+    dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()))
+        .map_err(|e| format!("prelude root signature create: {e}"))
+}
+
+unsafe fn prelude_pipeline(dev: &ID3D12Device, hlsl: &str, label: &str, cache: &'static ArgsPipelines) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    let key = dev.as_raw() as usize;
+    if let Some(pair) = cache.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
+        return Ok(pair);
+    }
+    let dxil = crate::gpu::recomp::dxc::compile_cached(hlsl, "main", "cs_6_6")?.0;
+    let rs = prelude_root_signature(dev)?;
+    let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const c_void, BytecodeLength: dxil.len() },
+        ..Default::default()
+    };
+    let res_pso: Result<ID3D12PipelineState, _> = dev.CreateComputePipelineState(&cdesc);
+    std::mem::ManuallyDrop::drop(&mut cdesc.pRootSignature);
+    let pso = res_pso.map_err(|e| format!("{label} pso create: {e}"))?;
+    let _ = pso.SetName(&windows::core::HSTRING::from(label));
+    super::dred::label_text(pso.as_raw() as usize, || label.to_string());
+    cache.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, (rs.clone(), pso.clone()));
+    Ok((rs, pso))
+}
+
+unsafe fn prelude_guard_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: ArgsPipelines = Mutex::new(None);
+    prelude_pipeline(dev, PRELUDE_GUARD_HLSL, PRELUDE_GUARD_DRED_LABEL, &CACHE)
+}
+
+unsafe fn prelude_scale_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: ArgsPipelines = Mutex::new(None);
+    prelude_pipeline(dev, PRELUDE_SCALE_HLSL, PRELUDE_SCALE_DRED_LABEL, &CACHE)
+}
+
+/// Allocate `bytes` in `State::prelude_scratch` (disjoint from inline ping-pong scratch so the
+/// prelude leaves these buffers in `INDIRECT_ARGUMENT` for the entire main segment).
+unsafe fn alloc_prelude_scratch(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, u64, usize), String> {
+    let bytes = bytes.next_multiple_of(256);
+    if let Some(r) = with(this, |s| {
+        let sl = &mut s.prelude_scratch;
+        let (b, cap, _) = sl.buf.as_ref()?;
+        (sl.used + bytes <= *cap).then(|| {
+            sl.used += bytes;
+            (b.clone(), sl.used - bytes, sl.buf_idx)
+        })
+    }) {
+        return Ok(r);
+    }
+    let size = bytes.max(SCRATCH_BLOCK);
+    let remaining = SCRATCH_CAP.saturating_sub(with(this, |s| s.scratch_taken));
+    if size > remaining {
+        return Err(format!("its rewritten arguments are past {} MiB this recording", SCRATCH_CAP >> 20));
+    }
+    let dev_key = dev.as_raw() as usize;
+    let picked = {
+        let mut free = FREE_RES.lock().unwrap();
+        free.iter().position(|(_, cap, d)| *d == dev_key && *cap >= size && *cap <= remaining).map(|i| free.swap_remove(i))
+    };
+    let block = match picked {
+        Some(e) => e,
+        None => (default_uav_buffer(dev, size, "prelude indirect argument scratch")?, size, dev_key),
+    };
+    let b = block.0.clone();
+    let buf_idx = with(this, |s| {
+        let idx = s.prelude_bufs.len();
+        s.scratch_taken += block.1;
+        s.prelude_bufs.push(b.clone());
+        s.prelude_scratch = PreludeScratchSlot {
+            buf: Some(block.clone()),
+            used: bytes,
+            buf_idx: idx,
+        };
+        s.res_retired.push(block);
+        idx
+    });
+    Ok((b, 0, buf_idx))
+}
+
+/// Build (once per recording) and return the closed PC prelude command list that runs all hoisted
+/// indirect-argument clamp/scale jobs for `seg` before `seg` executes on the queue.
+pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
+    let (already, bufs, guards, scales) = with(seg, |s| {
+        if let Some(ref built) = s.prelude_built {
+            return (Some(built.as_raw()), Vec::new(), Vec::new(), Vec::new());
+        }
+        if s.prelude_guards.is_empty() && s.prelude_scales.is_empty() {
+            return (None, Vec::new(), Vec::new(), Vec::new());
+        }
+        (None, s.prelude_bufs.clone(), s.prelude_guards.clone(), s.prelude_scales.clone())
+    });
+    if let Some(p) = already {
+        return Some(p);
+    }
+    if guards.is_empty() && scales.is_empty() {
+        return None;
+    }
+    let run = (|| -> Result<ID3D12GraphicsCommandList, String> {
+        let dev = super::real::list_device(seg).ok_or("no device for prelude list")?;
+        let ty = super::list_x::tracked_list_type(seg).ok_or("no list type for prelude list")?;
+        if ty != D3D12_COMMAND_LIST_TYPE_DIRECT && ty != D3D12_COMMAND_LIST_TYPE_COMPUTE {
+            return Err("unsupported list type for prelude".into());
+        }
+        let u = crate::gpu::uma::get().ok_or("no unified memory")?;
+        let win_vas = with(seg, |s| -> Result<[u64; 4], String> {
+            if s.uma_windows.as_ref().is_none_or(Vec::is_empty) {
+                let w = super::real::uma_window_vas();
+                if w.is_empty() {
+                    return Err("unified memory is not open on the GPU".into());
+                }
+                s.uma_windows = Some(w);
+            }
+            let w = s.uma_windows.as_deref().unwrap();
+            let first = w[0];
+            Ok([first, w.get(1).copied().unwrap_or(first), w.get(2).copied().unwrap_or(first), w.get(3).copied().unwrap_or(first)])
+        })?;
+
+        let dev_key = dev.as_raw() as usize;
+        let reused = {
+            let mut free = FREE_PRELUDE.lock().unwrap();
+            free.iter().position(|e| e.2 == dev_key && e.3 == ty.0).map(|i| free.swap_remove(i))
+        };
+        let (alloc, list) = match reused {
+            Some((a, l, _, _)) => {
+                a.Reset().map_err(|e| format!("prelude allocator reset: {e}"))?;
+                l.Reset(&a, None).map_err(|e| format!("prelude list reset: {e}"))?;
+                (a, l)
+            }
+            None => {
+                let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).map_err(|e| format!("prelude allocator create: {e}"))?;
+                let l: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &a, None).map_err(|e| format!("prelude list create: {e}"))?;
+                (a, l)
+            }
+        };
+
+        // 1. Order prior queue writes into UMA and transition all prelude scratch buffers COMMON -> UAV.
+        let mut pre_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(1 + bufs.len());
+        pre_barriers.push(D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            },
+        });
+        for b in &bufs {
+            pre_barriers.push(D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(Some(b.clone())),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: D3D12_RESOURCE_STATE_COMMON,
+                        StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    }),
+                },
+            });
+        }
+        list.ResourceBarrier(&pre_barriers);
+        for b in pre_barriers.iter_mut().skip(1) {
+            std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
+        }
+
+        // Helper to upload a packed `u32` job slice into `seg`'s UMA arena.
+        let upload_words = |words: &[u32]| -> Result<u64, String> {
+            let bytes = std::mem::size_of_val(words);
+            let p = with(seg, |s| s.arena.take(u, bytes.max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), p, bytes);
+            super::real::uma_va_of(p as usize).ok_or_else(|| "unified memory is not open on the GPU".into())
+        };
+
+        let bind_windows = |list: &ID3D12GraphicsCommandList| {
+            for (k, &va) in win_vas.iter().enumerate() {
+                list.SetComputeRootUnorderedAccessView((2 + k) as u32, va);
+            }
+        };
+
+        // 2. Emit batched guard dispatches grouped by prelude scratch buffer.
+        if !guards.is_empty() {
+            let (rs, pso) = prelude_guard_pipeline(&dev)?;
+            list.SetComputeRootSignature(&rs);
+            bind_windows(&list);
+            list.SetPipelineState(&pso);
+            for (buf_idx, buf) in bufs.iter().enumerate() {
+                let batch: Vec<&PreludeGuardJob> = guards.iter().filter(|j| j.buf_idx == buf_idx).collect();
+                if batch.is_empty() {
+                    continue;
+                }
+                let dst_va = buf.GetGPUVirtualAddress();
+                list.SetComputeRootUnorderedAccessView(1, dst_va);
+                for chunk in batch.chunks(65_535 * 64) {
+                    let mut words = Vec::with_capacity(4 + chunk.len() * 8);
+                    words.extend_from_slice(&[chunk.len() as u32, 0, 0, 0]);
+                    for j in chunk {
+                        words.extend_from_slice(&[j.src_win, j.src_off, j.most, j.dst_off, j.lim_win, j.lim_off, 0, 0]);
+                    }
+                    let jobs_va = upload_words(&words)?;
+                    list.SetComputeRootUnorderedAccessView(0, jobs_va);
+                    list.Dispatch((chunk.len() as u32).div_ceil(64), 1, 1);
+                }
+            }
+        }
+
+        // 3. Emit batched scale dispatches grouped by prelude scratch buffer.
+        if !scales.is_empty() {
+            let (rs, pso) = prelude_scale_pipeline(&dev)?;
+            list.SetComputeRootSignature(&rs);
+            bind_windows(&list);
+            list.SetPipelineState(&pso);
+            for (buf_idx, buf) in bufs.iter().enumerate() {
+                let batch: Vec<&PreludeScaleJob> = scales.iter().filter(|j| j.buf_idx == buf_idx).collect();
+                if batch.is_empty() {
+                    continue;
+                }
+                let dst_va = buf.GetGPUVirtualAddress();
+                list.SetComputeRootUnorderedAccessView(1, dst_va);
+                for chunk in batch.chunks(65_535) {
+                    let mut words = Vec::with_capacity(chunk.len() * 12);
+                    for j in chunk {
+                        words.extend_from_slice(&[
+                            j.count, j.stride, j.mesh_offset, j.split, j.cap, j.src_win, j.src_off, j.dst_off, j.has_cnt, j.cnt_win, j.cnt_off, 0,
+                        ]);
+                    }
+                    let jobs_va = upload_words(&words)?;
+                    list.SetComputeRootUnorderedAccessView(0, jobs_va);
+                    list.Dispatch(chunk.len() as u32, 1, 1);
+                }
+            }
+        }
+
+        // 4. Transition all prelude scratch buffers UAV -> INDIRECT_ARGUMENT (plus global UAV
+        // barrier if any guard jobs wrote `IO_GROUP_LIMIT` into UMA).
+        let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(bufs.len() + usize::from(!guards.is_empty()));
+        for b in &bufs {
+            post_barriers.push(D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(Some(b.clone())),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        StateAfter: D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    }),
+                },
+            });
+        }
+        if !guards.is_empty() {
+            post_barriers.push(D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+                },
+            });
+        }
+        list.ResourceBarrier(&post_barriers);
+        for b in post_barriers.iter_mut().take(bufs.len()) {
+            std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
+        }
+
+        list.Close().map_err(|e| format!("prelude list close: {e}"))?;
+        with(seg, |s| {
+            s.prelude_owned = Some((alloc, list.clone(), dev_key, ty.0));
+            s.prelude_built = Some(list.clone());
+        });
+        static BATCHES: AtomicU64 = AtomicU64::new(0);
+        static TOTAL_JOBS: AtomicU64 = AtomicU64::new(0);
+        let n_jobs = (guards.len() + scales.len()) as u64;
+        let b = BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+        let tot = TOTAL_JOBS.fetch_add(n_jobs, Ordering::Relaxed) + n_jobs;
+        if b == 1 || (b.is_power_of_two() && b >= 16) {
+            crate::xlog_info!("D3D12.X: indirect prelude batch #{b} ({} guard + {} scale jobs, {tot} hoisted total)", guards.len(), scales.len());
+        }
+        Ok(list)
+    })();
+    match run {
+        Ok(l) => Some(l.as_raw()),
+        Err(e) => {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: indirect prelude build failed: {e}");
+            }
+            None
+        }
+    }
+}
 
 /// The groups of an indirect dispatch above which they are not the title's (`GUARD_ARGS_HLSL`):
 /// a 4K target in groups of 2x2 pixels is 2.1 million.
@@ -954,16 +1528,39 @@ fn indirect_guard() -> bool {
 
 /// The arguments of one indirect dispatch at UMA address `src`, checked and >65 535 X-folded
 /// (`GUARD_ARGS_HLSL`): writes the guarded/folded `(x, y, z)` to scratch (`INDIRECT_ARGUMENT`)
-/// and writes `IO_GROUP_LIMIT` into `dispatch_io_va`. The list's compute root signature and
-/// pipeline are the guard's after this.
-unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, dispatch_io_va: u64) -> Result<(ID3D12Resource, u64), String> {
+/// and writes `IO_GROUP_LIMIT` into `dispatch_io_va`. When no prior GPU write or cross-queue
+/// wait occurred in this segment, hoists the guard into the segment's batched prelude list so
+/// the main list avoids inline compute/barrier bubbles; otherwise runs inline.
+unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, dispatch_io_va: u64, dispatch_io_host: usize) -> Result<(ID3D12Resource, u64), String> {
     if super::list_x::tracked_list_type(this) == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE) {
         return Err("command bundles cannot record indirect argument barriers".into());
     }
     let dev = super::real::list_device(this).ok_or("no device")?;
-    let (rs, pso) = guard_indirect_pipeline(&dev)?;
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     super::real::uma_window_buffer(src, 12).ok_or("the indirect arguments are not in one memory window")?;
+    if can_hoist_prelude(this) {
+        if let (Some((src_win, src_off)), Some((lim_win, lim_off))) = (
+            uma_win_off(u, src, 12),
+            uma_win_off(u, dispatch_io_host + crate::gpu::recomp::IO_GROUP_LIMIT * 4, 4),
+        ) {
+            let (dst, dst_off, buf_idx) = alloc_prelude_scratch(this, &dev, 256)?;
+            if let Ok(dst_off32) = u32::try_from(dst_off) {
+                with(this, |s| {
+                    s.prelude_guards.push(PreludeGuardJob {
+                        buf_idx,
+                        dst_off: dst_off32,
+                        src_win,
+                        src_off,
+                        most: most_groups(),
+                        lim_win,
+                        lim_off,
+                    });
+                });
+                return Ok((dst, dst_off));
+            }
+        }
+    }
+    let (rs, pso) = guard_indirect_pipeline(&dev)?;
     let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
     let (src_base, src_off) = align_root_uav(src_va)?;
     let (dst, dst_off, slot, prev_state) = scratch_args_pingpong(this, &dev, 256)?;
@@ -1150,9 +1747,44 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     }
     let commands = validate_scale_args_layout(max, stride, mesh_offset)?;
     let dev = super::real::list_device(this).ok_or("no device")?;
-    let (rs, pso) = scale_indirect_pipeline(&dev)?;
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     super::real::uma_window_buffer(src, commands as usize).ok_or("the indirect arguments are not in one memory window")?;
+    if let Some(p) = count {
+        super::real::uma_window_buffer(p, 4).ok_or("the indirect count is not in a memory window")?;
+    }
+    if can_hoist_prelude(this) {
+        if let Some((src_win, src_off)) = uma_win_off(u, src, commands as usize) {
+            let cnt_loc = match count {
+                Some(p) => uma_win_off(u, p, 4).map(|(w, o)| (1u32, w, o)),
+                None => Some((0u32, 0u32, 0u32)),
+            };
+            if let Some((has_cnt, cnt_win, cnt_off)) = cnt_loc {
+                let (dst, dst_off, buf_idx) = alloc_prelude_scratch(this, &dev, commands.saturating_mul(2))?;
+                if let Ok(dst_off32) = u32::try_from(dst_off) {
+                    if dst_off32.checked_add((commands * 2) as u32).is_some() {
+                        with(this, |s| {
+                            s.prelude_scales.push(PreludeScaleJob {
+                                buf_idx,
+                                dst_off: dst_off32,
+                                count: max,
+                                stride,
+                                mesh_offset,
+                                split,
+                                cap,
+                                src_win,
+                                src_off,
+                                has_cnt,
+                                cnt_win,
+                                cnt_off,
+                            });
+                        });
+                        return Ok((dst, dst_off));
+                    }
+                }
+            }
+        }
+    }
+    let (rs, pso) = scale_indirect_pipeline(&dev)?;
     let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
     let (src_base, src_off) = align_root_uav(src_va)?;
     if (src_off as u64).checked_add(commands).is_none_or(|end| end > u32::MAX as u64) {
@@ -1160,7 +1792,6 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     }
     let count_bound = match count {
         Some(p) => {
-            super::real::uma_window_buffer(p, 4).ok_or("the indirect count is not in a memory window")?;
             let va = super::real::uma_va_of(p).ok_or("unified memory is not open on the GPU")?;
             Some(align_root_uav(va)?)
         }
@@ -1449,9 +2080,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             // Allocate a dedicated `io` buffer for this dispatch so `guard_dispatch_args` can
             // write `IO_GROUP_LIMIT` on the GPU without racing against cached `io` slots.
             match alloc_fresh_compute_io(this, pso) {
-                Ok(io_va) => {
+                Ok((io_va, io_host)) => {
                     preset_io = Some(io_va);
-                    match guard_dispatch_args(this, list, p, io_va) {
+                    match guard_dispatch_args(this, list, p, io_va, io_host) {
                         Ok(g) => guarded = Some(g),
                         Err(e) => {
                             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1486,7 +2117,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
             super::culprit::after_dispatch(list, mark);
             if compute {
-                with(this, |s| s.arg_order_clean = false);
+                with(this, |s| {
+                    s.arg_order_clean = false;
+                    s.prelude_blocked = true;
+                });
             }
         }
         Err(e) => {
@@ -2170,7 +2804,10 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
     let r = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
     super::culprit::after_dispatch(list, mark);
-    with(this, |s| s.arg_order_clean = false);
+    with(this, |s| {
+        s.arg_order_clean = false;
+        s.prelude_blocked = true;
+    });
     r
 }
 
@@ -2193,12 +2830,12 @@ pub(super) fn fold(x: u32, y: u32, z: u32) -> (u32, [u32; 3]) {
 }
 
 /// Allocate a dedicated compute `io` buffer in UMA for an indirect dispatch whose `IO_GROUP_LIMIT`
-/// slot will be written on the GPU by `guard_dispatch_args`.
-unsafe fn alloc_fresh_compute_io(this: *mut c_void, pso: usize) -> Result<u64, String> {
+/// slot will be written on the GPU by `guard_dispatch_args`. Returns `(gpu_va, host_ptr)`.
+unsafe fn alloc_fresh_compute_io(this: *mut c_void, pso: usize) -> Result<(u64, usize), String> {
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let real = super::pso_async::resolve_wait(pso);
     let user_sgprs = super::real::pso_user_sgprs(real);
-    with(this, |s| -> Result<u64, String> {
+    with(this, |s| -> Result<(u64, usize), String> {
         if s.uma_windows.as_ref().is_none_or(Vec::is_empty) {
             let w = super::real::uma_window_vas();
             if w.is_empty() {
@@ -2227,7 +2864,7 @@ unsafe fn alloc_fresh_compute_io(this: *mut c_void, pso: usize) -> Result<u64, S
         let io_bytes = io.len() * 4;
         let io_p = s.arena.take(u, io_bytes.max(16), 256, &mut s.uma).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(io.as_ptr().cast::<u8>(), io_p, io_bytes);
-        Ok(uma_va_in(u, windows, io_p as usize).unwrap_or(first))
+        Ok((uma_va_in(u, windows, io_p as usize).unwrap_or(first), io_p as usize))
     })
 }
 
@@ -3807,5 +4444,180 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
         assert_eq!(fake.set_compute_rs_calls.load(Ordering::Relaxed), 0);
         assert_eq!(fake.set_compute_uav_calls.load(Ordering::Relaxed), 0);
         assert_eq!(counts_snapshot(), before);
+    }
+
+    #[test]
+    fn prelude_state_tracks_gpu_writes_splits_and_resets() {
+        let a = 0x7710_0001usize as *mut c_void;
+        let b = 0x7710_0002usize as *mut c_void;
+        reset(a, 0x7710_A001, 0);
+        with(a, |s| {
+            assert!(!s.prelude_blocked);
+            s.arg_order_clean = true;
+            s.prelude_guards.push(PreludeGuardJob {
+                buf_idx: 0,
+                dst_off: 0,
+                src_win: 0,
+                src_off: 16,
+                most: MOST_GROUPS,
+                lim_win: 0,
+                lim_off: 64,
+            });
+        });
+        // Recording a GPU write/wait blocks subsequent hoisting without dropping prior hoisted jobs.
+        note_gpu_write(a);
+        with(a, |s| {
+            assert!(s.prelude_blocked);
+            assert!(!s.arg_order_clean);
+            assert_eq!(s.prelude_guards.len(), 1);
+        });
+        // Mid-list split (`from != to`) blocks hoisting on the continuation segment (Wait64 head).
+        inherit_for_split(a, b, 0x7710_A001);
+        with(b, |s| {
+            assert!(s.prelude_blocked);
+            assert!(s.prelude_guards.is_empty());
+        });
+        // KickoffX non-split (`from == to`) starts a fresh post-kickoff segment and unblocks hoisting.
+        inherit_for_split(a, a, 0x7710_A001);
+        with(a, |s| {
+            assert!(!s.prelude_blocked);
+            assert!(s.prelude_guards.is_empty());
+        });
+        note_gpu_write(a);
+        reset(a, 0x7710_A002, 0);
+        with(a, |s| {
+            assert!(!s.prelude_blocked);
+            assert!(s.prelude_guards.is_empty());
+            assert!(s.prelude_scales.is_empty());
+        });
+        forget(a);
+        forget(b);
+    }
+
+    #[test]
+    fn prelude_guard_and_scale_shaders_compile_and_transform_batches() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return;
+            }
+            let dev = dev.unwrap();
+            let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+            let (guard_rs, guard_pso) = prelude_guard_pipeline(&dev).expect("prelude guard pipeline");
+            let (scale_rs, scale_pso) = prelude_scale_pipeline(&dev).expect("prelude scale pipeline");
+
+            let mk_buf = |bytes: u64, heap: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: bytes,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: flags,
+                    ..Default::default()
+                };
+                let mut res: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut res).unwrap();
+                res.unwrap()
+            };
+
+            let w0 = mk_buf(4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            let dst = mk_buf(4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            let jobs = mk_buf(4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            let up_w0 = mk_buf(4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let up_jobs = mk_buf(4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let rb_dst = mk_buf(4096, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+            let rb_w0 = mk_buf(4096, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+            // Seed w0:
+            //  0x000: guard job 0 input (115_200, 1, 1) -> folded (65_535, 2, 1), limit = 115_200 at 0x100
+            //  0x010: guard job 1 input (0xFFFF_FFFF, 1, 1) -> zeroed (0, 0, 0), limit = 0 at 0x104
+            //  0x200: scale job 0 (2 cmds, stride 16, mesh_offset 4, split 2, cap 10, count=1 at 0x300)
+            //         cmd0 = [0xAA, 4, 2, 1] -> n=8 -> compute (8,1,1), mesh (16,1,1)
+            //         cmd1 = [0xBB, 3, 1, 1] -> tid>=live(1) -> (0,1,1)
+            let mut p = std::ptr::null_mut();
+            up_w0.Map(0, None, Some(&mut p)).unwrap();
+            std::ptr::write_bytes(p as *mut u8, 0, 4096);
+            let w0_u32 = std::slice::from_raw_parts_mut(p as *mut u32, 1024);
+            w0_u32[0..3].copy_from_slice(&[115_200, 1, 1]);
+            w0_u32[4..7].copy_from_slice(&[u32::MAX, 1, 1]);
+            w0_u32[0x200 / 4..0x200 / 4 + 8].copy_from_slice(&[0xAA, 4, 2, 1, 0xBB, 3, 1, 1]);
+            w0_u32[0x300 / 4] = 1;
+            up_w0.Unmap(0, None);
+
+            // Seed jobs: guard batch at 0x000 (2 jobs), scale batch at 0x200 (1 job).
+            up_jobs.Map(0, None, Some(&mut p)).unwrap();
+            std::ptr::write_bytes(p as *mut u8, 0, 4096);
+            let j_u32 = std::slice::from_raw_parts_mut(p as *mut u32, 1024);
+            j_u32[0..4].copy_from_slice(&[2, 0, 0, 0]);
+            j_u32[4..12].copy_from_slice(&[0, 0x000, MOST_GROUPS, 0x000, 0, 0x100, 0, 0]);
+            j_u32[12..20].copy_from_slice(&[0, 0x010, MOST_GROUPS, 0x100, 0, 0x104, 0, 0]);
+            j_u32[0x200 / 4..0x200 / 4 + 12].copy_from_slice(&[2, 16, 4, 2, 10, 0, 0x200, 0x400, 1, 0, 0x300, 0]);
+            up_jobs.Unmap(0, None);
+
+            list.CopyBufferRegion(&w0, 0, &up_w0, 0, 4096);
+            list.CopyBufferRegion(&jobs, 0, &up_jobs, 0, 4096);
+            emit_transition(&list, &w0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            emit_transition(&list, &jobs, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            emit_transition(&list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            let w0_va = w0.GetGPUVirtualAddress();
+            let dst_va = dst.GetGPUVirtualAddress();
+            let jobs_va = jobs.GetGPUVirtualAddress();
+            list.SetComputeRootSignature(&guard_rs);
+            list.SetPipelineState(&guard_pso);
+            list.SetComputeRootUnorderedAccessView(0, jobs_va);
+            list.SetComputeRootUnorderedAccessView(1, dst_va);
+            for k in 2..6 {
+                list.SetComputeRootUnorderedAccessView(k, w0_va);
+            }
+            list.Dispatch(1, 1, 1);
+            emit_uav_barrier(&list, Some(&w0));
+
+            list.SetComputeRootSignature(&scale_rs);
+            list.SetPipelineState(&scale_pso);
+            list.SetComputeRootUnorderedAccessView(0, jobs_va + 0x200);
+            list.SetComputeRootUnorderedAccessView(1, dst_va);
+            for k in 2..6 {
+                list.SetComputeRootUnorderedAccessView(k, w0_va);
+            }
+            list.Dispatch(1, 1, 1);
+
+            emit_transition(&list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            emit_transition(&list, &w0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list.CopyBufferRegion(&rb_dst, 0, &dst, 0, 4096);
+            list.CopyBufferRegion(&rb_w0, 0, &w0, 0, 4096);
+            list.Close().unwrap();
+
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            crate::gpu::fence::wait(&fence, 1, &dev, None, 5000).unwrap();
+
+            rb_dst.Map(0, None, Some(&mut p)).unwrap();
+            let out = std::slice::from_raw_parts(p as *const u32, 1024);
+            assert_eq!(&out[0..3], &[65_535, 2, 1], "guard job 0 must fold 115,200 into 65,535 x 2 x 1");
+            assert_eq!(&out[0x100 / 4..0x100 / 4 + 3], &[0, 0, 0], "guard job 1 overflow must zero out");
+            // Scale job 0 output at 0x400: compute cmds (0x400..0x420), mesh cmds (0x420..0x440)
+            let s = 0x400 / 4;
+            assert_eq!(&out[s..s + 4], &[0xAA, 8, 1, 1], "scale cmd0 compute");
+            assert_eq!(&out[s + 4..s + 8], &[0xBB, 0, 1, 1], "scale cmd1 masked by count");
+            assert_eq!(&out[s + 8..s + 12], &[0xAA, 16, 1, 1], "scale cmd0 mesh (split=2)");
+            assert_eq!(&out[s + 12..s + 16], &[0xBB, 0, 1, 1], "scale cmd1 mesh masked by count");
+            rb_dst.Unmap(0, None);
+
+            rb_w0.Map(0, None, Some(&mut p)).unwrap();
+            let w0_out = std::slice::from_raw_parts(p as *const u32, 1024);
+            assert_eq!(w0_out[0x100 / 4], 115_200, "guard job 0 must store IO_GROUP_LIMIT");
+            assert_eq!(w0_out[0x104 / 4], 0, "guard job 1 overflow must store 0 limit");
+            rb_w0.Unmap(0, None);
+            let _ = alloc;
+        }
     }
 }

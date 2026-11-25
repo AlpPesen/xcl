@@ -59,6 +59,34 @@ static WRAPPER_OF: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
 struct Vtable(usize);
 
+/// Command-list vtable slots (PC + older/newer console layouts) that can write to GPU buffers
+/// or wait on cross-queue fences: calling any of them marks the active recording segment as
+/// having GPU writes/waits so subsequent indirect argument clamps stay inline instead of being
+/// hoisted into the segment's prelude command list.
+fn is_gpu_write_or_wait_slot(slot: usize) -> bool {
+    matches!(
+        slot,
+        15..=18 // CopyBufferRegion, CopyTextureRegion, CopyResource, CopyTiles
+            | 27 // ExecuteBundle
+            | 30 // ResolveQueryData (console #30 = PC #54)
+            | 53..=54 // ClearUnorderedAccessView{Uint,Float} (console #53/#54 = PC #49/#50)
+            | 60..=65 // CopyMemoryToMemoryX / Fill{32,64,128}X (older + newer +2 shifted; #61 filtered below)
+            | 69..=74 // Write{32,64}BottomX / Wait{32,64}X (older + newer +2 shifted; #70 filtered below)
+            | 83..=86 // Copy{TextureRegion,Resource}FlagsX (older + newer +2 shifted; #83 filtered below)
+            | 88..=92 // Write{32,64}TopX / Write32BottomOfShaderX (older + newer +2 shifted)
+            | 104..=105 // AtomicCopyBufferUINT / UINT64
+    )
+}
+
+fn slot_writes_or_waits_now(slot: usize, shifted: bool) -> bool {
+    if !is_gpu_write_or_wait_slot(slot) {
+        return false;
+    }
+    // On the newer console layout (+2 shifted), #61 is ExecuteIndirect, #70 is SetDepthBoundsX,
+    // and #83 is DrawIndexedX – none of these write indirect arguments.
+    !(shifted && matches!(slot, 61 | 70 | 83))
+}
+
 /// The console list vtable: QueryInterface / AddRef / Release / Close / Reset of their own,
 /// every other slot a thunk to the currently active PC list's entry (`F_BACKING`).
 fn vtable() -> usize {
@@ -67,7 +95,13 @@ fn vtable() -> usize {
         let mut v = vec![0usize; LIST_SLOTS];
         let trace = std::env::var_os("XCL_LIST_TRACE").is_some();
         for (slot, e) in v.iter_mut().enumerate() {
-            *e = if trace { forward_traced(slot) } else { forward(slot) };
+            *e = if trace {
+                forward_precall(slot, record as usize)
+            } else if is_gpu_write_or_wait_slot(slot) {
+                forward_precall(slot, note_write_or_wait as usize)
+            } else {
+                forward(slot)
+            };
         }
         v[0] = qi as usize;
         v[1] = add_ref as usize;
@@ -93,8 +127,8 @@ fn forward(slot: usize) -> usize {
     p as usize
 }
 
-/// `forward` after `record(this, slot)` (argument registers, xmm0–3 kept)
-fn forward_traced(slot: usize) -> usize {
+/// `forward` after calling `precall(this, slot)` (argument registers and xmm0–3 preserved).
+fn forward_precall(slot: usize, precall: usize) -> usize {
     let mut c: Vec<u8> = vec![0x51, 0x52, 0x41, 0x50, 0x41, 0x51]; // push rcx, rdx, r8, r9
     c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x68]); // sub rsp, 0x68
     for (reg, off) in [(0x44u8, 0x20u8), (0x4C, 0x30), (0x54, 0x40), (0x5C, 0x50)] {
@@ -102,8 +136,8 @@ fn forward_traced(slot: usize) -> usize {
     }
     c.push(0xBA); // mov edx, slot
     c.extend_from_slice(&(slot as u32).to_le_bytes());
-    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, record
-    c.extend_from_slice(&(record as usize as u64).to_le_bytes());
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, precall
+    c.extend_from_slice(&(precall as u64).to_le_bytes());
     c.extend_from_slice(&[0xFF, 0xD0]); // call rax
     for (reg, off) in [(0x44u8, 0x20u8), (0x4C, 0x30), (0x54, 0x40), (0x5C, 0x50)] {
         c.extend_from_slice(&[0xF3, 0x0F, 0x6F, reg, 0x24, off]); // movdqu xmmN, [rsp+off]
@@ -121,11 +155,20 @@ fn forward_traced(slot: usize) -> usize {
     p as usize
 }
 
+unsafe extern "system" fn note_write_or_wait(this: *mut c_void, slot: u32) {
+    let shifted = super::real::QUEUE_SHIFTED.load(std::sync::atomic::Ordering::Relaxed);
+    if slot_writes_or_waits_now(slot as usize, shifted) {
+        let pc = *((this as usize + F_BACKING) as *const *mut c_void);
+        super::bind::note_gpu_write(pc);
+    }
+}
+
 unsafe extern "system" fn record(this: *mut c_void, slot: u32) {
     let at = (this as usize + F_RING_AT) as *mut usize;
     let k = *at % RING;
     *((this as usize + F_RING + 2 * k) as *mut u16) = slot as u16;
     *at += 1;
+    note_write_or_wait(this, slot);
 }
 
 /// #9 Close: closes the active recording segment (`F_BACKING`); a failure is logged with
@@ -245,18 +288,28 @@ pub fn backing(list: *mut c_void) -> Option<*mut c_void> {
 }
 
 /// Expand a console list object into all of its recorded PC command list segments (in exact
-/// recording order). Returns `false` if `list` is not a `title_list` wrapper.
+/// recording order), inserting any hoisted indirect-argument prelude list right before the
+/// segment that consumes it. Returns `false` if `list` is not a `title_list` wrapper.
 pub fn push_segments(list: *mut c_void, out: &mut Vec<*mut c_void>) -> bool {
     let Some(primary) = backing(list) else {
         return false;
     };
-    let sg = SEGMENTS.lock().unwrap();
-    let book = sg.as_ref().and_then(|m| m.get(&(list as usize)));
-    out.push(book.and_then(|b| b.first).map_or(primary, |f| f as *mut c_void));
-    if let Some(book) = book {
-        for &seg in &book.extra_active {
-            out.push(seg as *mut c_void);
+    let (first, extras) = {
+        let sg = SEGMENTS.lock().unwrap();
+        let book = sg.as_ref().and_then(|m| m.get(&(list as usize)));
+        let first = book.and_then(|b| b.first).map_or(primary, |f| f as *mut c_void);
+        let extras: Vec<*mut c_void> = book.map_or_else(Vec::new, |b| b.extra_active.iter().map(|&s| s as *mut c_void).collect());
+        (first, extras)
+    };
+    let push_with_prelude = |seg: *mut c_void, out: &mut Vec<*mut c_void>| {
+        if let Some(prelude) = unsafe { super::bind::prelude_list_for(seg) } {
+            out.push(prelude);
         }
+        out.push(seg);
+    };
+    push_with_prelude(first, out);
+    for seg in extras {
+        push_with_prelude(seg, out);
     }
     true
 }
@@ -309,19 +362,27 @@ pub(super) unsafe fn activate_segment(wrapper: *mut c_void, old_pc: *mut c_void,
     m.insert(new_pc as usize, wrapper as usize);
 }
 
-/// For `KickoffX` on an already-split list: returns `(primary, prior_closed_segments, extra_to_reclaim)`
-/// when `active_pc != primary`, switches `F_BACKING` back to `primary`, and moves all extra
+/// For `KickoffX`: returns `(primary, prior_closed_segments, extra_to_reclaim)` when `active_pc`
+/// was split mid-recording OR has hoisted indirect-argument prelude work that must execute right
+/// before `active_pc`. When split, switches `F_BACKING` back to `primary` and moves all extra
 /// segments (including `active_pc`) into `spares` so recording resumes cleanly on `primary`.
 /// (`primary` here is the recording's first segment: `first` when one stands in.)
 pub(super) unsafe fn reclaim_for_kickoff(active_pc: *mut c_void) -> Option<(*mut c_void, Vec<*mut c_void>, Vec<usize>)> {
     let wrapper = wrapper_of(active_pc)?;
-    let mut sg = SEGMENTS.lock().unwrap();
-    let book = sg.as_mut().and_then(|m| m.get_mut(&(wrapper as usize)))?;
-    let primary = book.first.map_or_else(|| *((wrapper as usize + F_PRIMARY) as *const *mut c_void), |f| f as *mut c_void);
+    let primary = {
+        let sg = SEGMENTS.lock().unwrap();
+        sg.as_ref()
+            .and_then(|m| m.get(&(wrapper as usize)))
+            .and_then(|b| b.first)
+            .map_or_else(|| *((wrapper as usize + F_PRIMARY) as *const *mut c_void), |f| f as *mut c_void)
+    };
     if primary == active_pc {
-        return None;
+        let prelude = super::bind::prelude_list_for(active_pc)?;
+        return Some((primary, vec![prelude], Vec::new()));
     }
-    let (prior, reclaimed) = {
+    let (raw_prior, reclaimed) = {
+        let mut sg = SEGMENTS.lock().unwrap();
+        let book = sg.as_mut().and_then(|m| m.get_mut(&(wrapper as usize)))?;
         let extra = std::mem::take(&mut book.extra_active);
         let mut prior = Vec::with_capacity(extra.len());
         prior.push(primary);
@@ -333,7 +394,6 @@ pub(super) unsafe fn reclaim_for_kickoff(active_pc: *mut c_void) -> Option<(*mut
         book.spares.extend(extra.iter().copied());
         (prior, extra)
     };
-    drop(sg);
     *((wrapper as usize + F_BACKING) as *mut usize) = primary as usize;
     {
         let mut wg = WRAPPER_OF.lock().unwrap();
@@ -343,6 +403,16 @@ pub(super) unsafe fn reclaim_for_kickoff(active_pc: *mut c_void) -> Option<(*mut
             }
             m.insert(primary as usize, wrapper as usize);
         }
+    }
+    let mut prior = Vec::with_capacity(raw_prior.len() * 2 + 1);
+    for seg in raw_prior {
+        if let Some(p) = super::bind::prelude_list_for(seg) {
+            prior.push(p);
+        }
+        prior.push(seg);
+    }
+    if let Some(p) = super::bind::prelude_list_for(active_pc) {
+        prior.push(p);
     }
     Some((primary, prior, reclaimed))
 }
@@ -634,6 +704,26 @@ mod tests {
             assert_eq!(rel(o), 0);
             drop(Box::from_raw(primary));
             drop(Box::from_raw(seg1));
+        }
+    }
+
+    #[test]
+    fn gpu_write_and_wait_slots_track_older_and_newer_layouts() {
+        // Common buffer-write / bundle / clear / wait slots block prelude hoisting on both layouts.
+        for slot in [15, 16, 17, 18, 27, 30, 53, 54, 60, 62, 71, 72, 84, 86, 88, 89, 90, 91, 92, 104, 105] {
+            assert!(slot_writes_or_waits_now(slot, false), "older slot {slot}");
+            assert!(slot_writes_or_waits_now(slot, true), "newer slot {slot}");
+        }
+        // On the newer (+2 shifted) layout, #61 is ExecuteIndirect, #70 is SetDepthBoundsX, and
+        // #83 is DrawIndexedX – must NOT block hoisting when shifted, while blocking on older.
+        for slot in [61, 70, 83] {
+            assert!(slot_writes_or_waits_now(slot, false), "older slot {slot}");
+            assert!(!slot_writes_or_waits_now(slot, true), "newer non-write slot {slot}");
+        }
+        // Hot draw / PSO / root-arg slots never block prelude hoisting.
+        for slot in [12, 13, 25, 34, 36, 38, 40, 42, 44, 46, 59, 127, 129] {
+            assert!(!slot_writes_or_waits_now(slot, false), "non-write slot {slot}");
+            assert!(!slot_writes_or_waits_now(slot, true), "non-write slot {slot}");
         }
     }
 }
