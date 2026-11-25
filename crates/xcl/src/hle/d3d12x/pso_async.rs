@@ -971,7 +971,15 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
         Some(p) if p.compute => resolve_wait(pso),
-        Some(_) => resolve(pso),
+        Some(p) => {
+            let bound = resolve(pso);
+            // a draw needs it now and goes on without it (`bind::pso_for_draw`): its build does not
+            // wait for free commit, which the speculative ones do
+            if !*p.done.lock().unwrap() {
+                p.want();
+            }
+            bound
+        }
         None => pso,
     }
 }
