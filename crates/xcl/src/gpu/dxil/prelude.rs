@@ -94,8 +94,14 @@ impl Lw {
         let mf = self.sel(nz, mf, z);
         (mf, ef)
     }
+    /// The ISA's mantissa keeps the input's sign (as `frexp_mant_d` does); DXC's `frexp` drops it.
     pub fn frexp_mant(&mut self, x: Value) -> Value {
         let (m, _) = self.frexp_dxc(x);
+        let mb = self.bits(m);
+        let xb = self.bits(x);
+        let sign = self.andc(xb, 0x8000_0000);
+        let mb = self.or(mb, sign);
+        let m = self.f(mb);
         let a = self.isinf(x);
         let b = self.isnan(x);
         let s = self.lor(a, b);
