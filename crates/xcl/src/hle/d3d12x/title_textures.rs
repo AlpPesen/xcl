@@ -430,8 +430,9 @@ static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
 static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
-static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
+/// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen,
+/// list_x::mirror_sources_gen)`
+static WATCH_CACHE: Mutex<Option<((u64, u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
@@ -795,6 +796,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
         super::sparse::mapped_gen(),
         TEXTURES_GEN.load(Ordering::Acquire),
         crate::hle::kernelx::graphics_reservations_gen(),
+        super::list_x::mirror_sources_gen(),
     );
     {
         let g = WATCH_CACHE.lock().unwrap();
@@ -811,6 +813,8 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
     wanted.extend(super::sparse::mapped_ranges());
     wanted.extend(super::sparse::gpu_view::sources());
+    // the sources of buffer mirrors: a draw copies only the pages written (`list_x::copy_written`)
+    wanted.extend(super::list_x::mirror_sources());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
@@ -878,6 +882,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
+            super::list_x::mirror_look_begin();
             for &(base, size) in ranges.iter() {
                 take_written(base, size, &mut buf, &mut dirty, &mut page);
             }
@@ -886,6 +891,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
         // (`XCL_PAGE_ALIAS`), a write through one view counting for all of them
         crate::hle::kernelx::guards::take_dirty(&mut dirty, page as usize);
         dirty.sort_unstable();
+        // pages of buffer mirrors' sources, now off the write-watch: their next draw copies them
+        super::list_x::mirror_pages_written(&dirty);
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
