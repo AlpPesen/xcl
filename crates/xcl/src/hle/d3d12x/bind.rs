@@ -551,13 +551,79 @@ void main(uint tid : SV_DispatchThreadID) {
 }
 "#;
 
+/// The groups of an indirect dispatch (u2, `io` dword 0: their byte offset) as they go out (u3):
+/// 0 x 0 x 0 when they are more than `io` dword 1 in all, or a count alone is (`MOST_GROUPS`). The
+/// counts come from memory the GPU wrote; where that is not what the title meant they can be
+/// anything, and billions of groups hold the GPU for seconds or until Windows resets the driver.
+/// A count over D3D12's 65 535 that is not one of those is cut to it.
+pub(super) const GUARD_ARGS_HLSL: &str = r#"RWByteAddressBuffer io : register(u0);
+RWByteAddressBuffer src : register(u2);
+RWByteAddressBuffer dst : register(u3);
+[numthreads(1, 1, 1)]
+void main() {
+    uint at = io.Load(0), most = io.Load(4), to = io.Load(8);
+    uint3 g = src.Load3(at);
+    bool none = g.x == 0u || g.y == 0u || g.z == 0u;
+    bool few = !none && all(g <= most) && g.x <= most / g.y && g.x * g.y <= most / g.z;
+    dst.Store3(to, few ? min(g, 65535u.xxx) : uint3(0u, 0u, 0u));
+}
+"#;
+
+/// The groups of an indirect dispatch above which they are not the title's (`GUARD_ARGS_HLSL`):
+/// a 4K target in groups of 2x2 pixels is 2.1 million.
+const MOST_GROUPS: u32 = 1 << 22;
+
+unsafe fn guard_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>> = Mutex::new(None);
+    args_pipeline(dev, GUARD_ARGS_HLSL, &CACHE)
+}
+
+/// `XCL_INDIRECT_GUARD=0`: indirect dispatches run the groups memory holds, whatever they are.
+fn indirect_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_INDIRECT_GUARD").map_or(true, |v| v.trim() != "0"))
+}
+
+/// The arguments of one indirect dispatch at UMA address `src`, checked (`GUARD_ARGS_HLSL`): the
+/// scratch block (INDIRECT_ARGUMENT until the caller puts it back to COMMON) and their offset. The
+/// list's compute root signature and pipeline are the guard's after this.
+unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize) -> Result<(ID3D12Resource, u64), String> {
+    let dev = super::real::list_device(this).ok_or("no device")?;
+    let (rs, pso) = guard_indirect_pipeline(&dev)?;
+    let u = crate::gpu::uma::get().ok_or("no unified memory")?;
+    super::real::uma_window_buffer(src, 12).ok_or("the indirect arguments are not in one memory window")?;
+    let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
+    let (dst, dst_off) = scratch_args(this, &dev, 256)?;
+    let consts: Vec<u8> = [0u32, MOST_GROUPS, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = with(this, |s| s.arena.take(u, consts.len(), 256, &mut s.uma)).ok_or("unified memory is full")?;
+    std::ptr::copy_nonoverlapping(consts.as_ptr(), p, consts.len());
+    let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
+    // the title's writes of the arguments before this (`fresh_indirect_arguments`)
+    emit_uav_barrier(list, None);
+    emit_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list.SetComputeRootSignature(&rs);
+    list.SetPipelineState(&pso);
+    list.SetComputeRootUnorderedAccessView(0, consts_va);
+    list.SetComputeRootUnorderedAccessView(2, src_va);
+    list.SetComputeRootUnorderedAccessView(3, dst.GetGPUVirtualAddress() + dst_off);
+    list.Dispatch(1, 1, 1);
+    emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    Ok((dst, dst_off))
+}
+
 unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
     static CACHE: Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>> = Mutex::new(None);
+    args_pipeline(dev, SCALE_ARGS_HLSL, &CACHE)
+}
+
+type ArgsPipelines = Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>>;
+
+unsafe fn args_pipeline(dev: &ID3D12Device, hlsl: &str, cache: &'static ArgsPipelines) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
     let key = dev.as_raw() as usize;
-    if let Some(pair) = CACHE.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
+    if let Some(pair) = cache.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
         return Ok(pair);
     }
-    let dxil = crate::gpu::recomp::dxc::compile_cached(SCALE_ARGS_HLSL, "main", "cs_6_6")?.0;
+    let dxil = crate::gpu::recomp::dxc::compile_cached(hlsl, "main", "cs_6_6")?.0;
     let rs = crate::gpu::recomp::pso::abi_root_signature(dev, false)?;
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
@@ -567,7 +633,7 @@ unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSigna
     let res_pso: Result<ID3D12PipelineState, _> = dev.CreateComputePipelineState(&cdesc);
     std::mem::ManuallyDrop::drop(&mut cdesc.pRootSignature);
     let pso = res_pso.map_err(|e| format!("scale pso create: {e}"))?;
-    CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, (rs.clone(), pso.clone()));
+    cache.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, (rs.clone(), pso.clone()));
     Ok((rs, pso))
 }
 
@@ -842,6 +908,30 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    // (before the dispatch's own root signature and pipeline are bound)
+    let mut guarded = None;
+    if compute && max == 1 && indirect_guard() && signature_dispatches(sig) {
+        if let Some((p, _)) = commands_at.filter(|&(_, n)| n >= 12) {
+            match guard_dispatch_args(this, list, p) {
+                Ok(g) => guarded = Some(g),
+                Err(e) => {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                        crate::xlog_warn!("D3D12.X: ExecuteIndirect's group counts are not checked: {e}");
+                    }
+                }
+            }
+            if let Some(real) = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)) {
+                list.SetPipelineState(real);
+            }
+        }
+    }
+    let (args, args_off) = guarded.as_ref().map_or((args, args_off), |(b, o)| (b.as_raw() as usize, *o));
+    let unguard = || {
+        if let Some((b, _)) = &guarded {
+            emit_transition(list, b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+        }
+    };
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             if compute {
@@ -851,14 +941,21 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     Err(e) => {
                         crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
                         count(DISPATCHES_SKIPPED);
+                        unguard();
                         return;
                     }
                 }
             }
             count(if gfx { DRAWS } else { DISPATCHES });
-            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
+            if guarded.is_some() {
+                pc(this, sig, max, args, args_off, count_buf, count_off);
+            } else {
+                fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
+            }
+            unguard();
         }
         Err(e) => {
+            unguard();
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -2327,6 +2424,35 @@ void main(uint t : SV_GroupIndex) {
         let out = runner::dispatch(&dxil, [(n as u32).div_ceil(64), 1, 1], &io, &mem).unwrap();
         let cmd = |k: usize| [out[64 + 4 * k], out[65 + 4 * k], out[66 + 4 * k], out[67 + 4 * k]];
         Some(((0..n).map(cmd).collect(), (n..2 * n).map(cmd).collect()))
+    }
+
+    /// Indirect group counts that are not the title's run nothing, the others go out as they are.
+    #[test]
+    fn gpu_indirect_dispatch_runs_no_garbage_group_counts() {
+        use crate::gpu::recomp::runner;
+        if runner::adapter().is_err() {
+            runner::skip_test("no GPU");
+            return;
+        }
+        let dxil = crate::gpu::recomp::dxc::compile(GUARD_ARGS_HLSL, "main", "cs_6_6", &[]).unwrap();
+        let cases: [([u32; 3], [u32; 3]); 10] = [
+            ([1, 1, 1], [1, 1, 1]),
+            ([2560 / 8, 1440 / 4, 1], [320, 360, 1]),
+            ([115_200, 1, 1], [65_535, 1, 1]),
+            ([0, 5, 5], [0, 0, 0]),
+            ([0xFF00_0000, 0xE3, 0xFF7F_0000], [0, 0, 0]),
+            ([65_535, 65_535, 65_535], [0, 0, 0]),
+            ([2048, 2048, 1], [2048, 2048, 1]),
+            ([2048, 2049, 1], [0, 0, 0]),
+            ([3, 1, 0xFFFF_FFFF], [0, 0, 0]),
+            ([1 << 16, 1 << 16, 1], [0, 0, 0]),
+        ];
+        for (g, want) in cases {
+            let mut mem = vec![0xDEADu32; 64];
+            mem[4..7].copy_from_slice(&g);
+            let out = runner::dispatch(&dxil, [1, 1, 1], &[16, MOST_GROUPS, 128], &mem).unwrap();
+            assert_eq!(&out[32..35], &want, "{g:?}");
+        }
     }
 
     #[test]
