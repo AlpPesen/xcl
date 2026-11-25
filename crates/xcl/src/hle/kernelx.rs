@@ -1179,7 +1179,7 @@ fn page_home(page: usize) -> Option<usize> {
 
 /// Whether every page of `pages` (at least one) is a physical page allocated now.
 pub fn physical_pages_live(pages: &[usize]) -> bool {
-    !pages.is_empty() && pages.iter().all(|&p| page_home(p).is_some())
+    !pages.is_empty() && pages.iter().all(|&p| if alias::enabled() { alias::page_live(p) } else { page_home(p).is_some() })
 }
 
 /// Whether a home is only reserved until it is used (a sparse window's, or plain memory's –

@@ -300,6 +300,11 @@ pub fn physical_page_at(va: usize) -> bool {
     with(|s| s.views.contains_key(&at) || s.away_at.contains_key(&at))
 }
 
+/// Whether `page` is a physical page allocated now.
+pub fn page_live(page: usize) -> bool {
+    with(|s| s.page(page).is_some())
+}
+
 /// The physical page mapped at the page holding `va` (a view, or a page moved there), or None.
 pub fn page_at(va: usize) -> Option<usize> {
     let at = va & !(PAGE - 1);
