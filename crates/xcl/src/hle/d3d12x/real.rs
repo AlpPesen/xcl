@@ -2497,8 +2497,8 @@ pub(super) unsafe extern "system" fn dev_create_sampler_x(this: *mut c_void, des
 /// Copy `n` console slots from `src` to `dst` (both in console heaps of one kind): the PC
 /// descriptors (2 per view slot) and the slots. False: not two console ranges.
 unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: u32) -> bool {
-    use super::console_heap::{copy_words_range, slot};
-    let (Some(d0), Some(s0)) = (slot(dst), slot(src)) else { return false };
+    use super::console_heap::{copy_words_range, slot_pair};
+    let Some((d0, s0)) = slot_pair(dst, src) else { return false };
     if d0.sampler != s0.sampler {
         return false;
     }

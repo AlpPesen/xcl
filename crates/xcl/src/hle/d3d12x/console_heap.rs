@@ -89,15 +89,18 @@ fn drain_retired_ranges<F>(
     retired: &mut VecDeque<RetiredRange<F>>,
     free: &mut Vec<(u32, u32)>,
     mut completed: impl FnMut(&F) -> u64,
-) {
+) -> bool {
+    let mut drained = false;
     while retired
         .front()
         .is_some_and(|r| r.marks.as_ref().is_some_and(|m| m.iter().all(|(f, v)| completed(f) >= *v)))
     {
         if let Some(r) = retired.pop_front() {
             merge_release(free, r.first, r.count);
+            drained = true;
         }
     }
+    drained
 }
 
 struct QueueFences(HashMap<usize, (ID3D12Fence, u64)>);
@@ -159,6 +162,8 @@ struct Global {
     free: Vec<(u32, u32)>,
     /// released ranges awaiting live GPU queue completion before entering `free`
     retired: VecDeque<RetiredRange<ID3D12Fence>>,
+    /// smallest allocation size that recently failed on a full/fragmented heap (`u32::MAX` = none)
+    smallest_failed: u32,
 }
 
 // D3D12 descriptor heaps and devices are free-threaded
@@ -268,6 +273,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             next: crate::gpu::recomp::MEM_HEAP_NULL + 1,
             free: Vec::new(),
             retired: VecDeque::new(),
+            smallest_failed: u32::MAX,
         });
     }
     true
@@ -361,11 +367,17 @@ unsafe fn set_window_views_checked(dev: &ID3D12Device, windows: &[(usize, usize)
 fn reserve_global(count: u32) -> Option<u32> {
     let mut g = GLOBAL.write().unwrap();
     let s = g.as_mut()?;
-    unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) };
+    if unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) } {
+        s.smallest_failed = u32::MAX;
+    }
+    if count >= s.smallest_failed {
+        return None;
+    }
     let (cap, mut next) = (s.cap, s.next);
     let r = take_range(&mut s.free, &mut next, cap, count);
     s.next = next;
     if r.is_none() {
+        s.smallest_failed = s.smallest_failed.min(count);
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
             crate::xlog_warn!("console descriptor heaps: the shared heap ({cap}) is full – shaders do not see the views of slots past it");
@@ -407,10 +419,13 @@ pub fn release_global(first: u32, count: u32) {
     if let Some(s) = GLOBAL.write().unwrap().as_mut() {
         if marks.as_ref().is_some_and(Vec::is_empty) {
             merge_release(&mut s.free, first, count);
+            s.smallest_failed = u32::MAX;
         } else {
             s.retired.push_back(RetiredRange { first, count, marks });
         }
-        unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) };
+        if unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) } {
+            s.smallest_failed = u32::MAX;
+        }
     }
 }
 
@@ -432,6 +447,23 @@ fn merge_release(free: &mut Vec<(u32, u32)>, first: u32, count: u32) {
 /// The shader-visible PC heap lists bind for view descriptors (None: none shared).
 pub fn global_heap() -> Option<ID3D12DescriptorHeap> {
     GLOBAL.read().unwrap().as_ref().map(|s| s.heap.clone())
+}
+
+/// Raw COM pointer of the shared shader-visible view heap without COM refcount traffic.
+pub fn global_heap_raw() -> Option<usize> {
+    GLOBAL.read().unwrap().as_ref().map(|s| s.heap.as_raw() as usize)
+}
+
+/// Binary-search `heaps` (sorted ascending by `shadow`) for the heap covering console handle `cpu`.
+#[inline]
+fn find_heap_by_addr(heaps: &[Heap], cpu: u64) -> Option<&Heap> {
+    let idx = heaps.partition_point(|h| (h.shadow as u64) <= cpu);
+    if idx == 0 {
+        return None;
+    }
+    let h = &heaps[idx - 1];
+    let end = (h.shadow as u64).wrapping_add((h.n as u64) * (h.slot_bytes() as u64));
+    (cpu < end).then_some(h)
 }
 
 /// Whether `obj` (a title's view heap) has its descriptors in the shared heap.
@@ -502,7 +534,11 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
     } else {
         Vec::new()
     };
-    HEAPS.write().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, memory });
+    {
+        let mut heaps = HEAPS.write().unwrap();
+        let idx = heaps.partition_point(|h| h.shadow < p as usize);
+        heaps.insert(idx, Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, memory });
+    }
     true
 }
 
@@ -510,7 +546,7 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
 pub fn unregister(obj: usize) {
     let gone = {
         let mut heaps = HEAPS.write().unwrap();
-        heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
+        heaps.iter().position(|h| h.obj == obj).map(|i| heaps.remove(i))
     };
     if let Some(h) = gone {
         for (p, f) in h.pages.iter().enumerate().map(|(p, a)| (p, a.load(Ordering::Relaxed))).filter(|&(_, f)| f != UNMAPPED) {
@@ -562,11 +598,7 @@ pub struct Slot {
     pub k: u32,
 }
 
-/// The slot behind a console CPU handle (None: not one of XCL's console heaps). A view slot
-/// of a heap in the shared heap gets its page's place there now if the page has none yet.
-pub fn slot(cpu: u64) -> Option<Slot> {
-    let heaps = HEAPS.read().unwrap();
-    let h = heaps.iter().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
+fn resolve_slot(h: &Heap, cpu: u64) -> Slot {
     let k = ((cpu - h.shadow as u64) / h.slot_bytes() as u64) as u32;
     if h.sampler {
         let shared = sampler_page_of(h, k).and_then(|(first, k0)| {
@@ -579,7 +611,7 @@ pub fn slot(cpu: u64) -> Option<Slot> {
         // shared heap must map overflowed slots to reserved zero-sampler slot 0 rather than
         // aliasing unrelated heap entries at local index `k`.
         let (index, shared_srv) = shared.unwrap_or_else(|| (sampler_unmapped_index(!h.pages.is_empty(), k), 0));
-        return Some(Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv, k });
+        return Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv, k };
     }
     let uav = ((2 * k + 1) * h.inc) as u64;
     let shared = page_of(h, k).and_then(|(first, k0)| {
@@ -592,7 +624,23 @@ pub fn slot(cpu: u64) -> Option<Slot> {
     let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or_else(|| {
         (view_unmapped_index(hosted, k), if hosted || h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0)
     });
-    Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
+    Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k }
+}
+
+/// The slot behind a console CPU handle (None: not one of XCL's console heaps). A view slot
+/// of a heap in the shared heap gets its page's place there now if the page has none yet.
+pub fn slot(cpu: u64) -> Option<Slot> {
+    let heaps = HEAPS.read().unwrap();
+    let h = find_heap_by_addr(&heaps, cpu)?;
+    Some(resolve_slot(h, cpu))
+}
+
+/// Resolve both `dst` and `src` console handles under a single `HEAPS` read lock.
+pub fn slot_pair(dst: u64, src: u64) -> Option<(Slot, Slot)> {
+    let heaps = HEAPS.read().unwrap();
+    let hd = find_heap_by_addr(&heaps, dst)?;
+    let hs = find_heap_by_addr(&heaps, src)?;
+    Some((resolve_slot(hd, dst), resolve_slot(hs, src)))
 }
 
 /// The view (or sampler) just made in slot `s` (its SRV, or with `uav` its UAV) goes to the shared heap.
@@ -713,10 +761,10 @@ pub fn copy_words_range(dst: u64, src: u64, n: u32) -> bool {
         return true;
     }
     let heaps = HEAPS.read().unwrap();
-    let Some(hd) = heaps.iter().find(|h| dst >= h.shadow as u64 && dst < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64) else {
+    let Some(hd) = find_heap_by_addr(&heaps, dst) else {
         return false;
     };
-    let Some(hs) = heaps.iter().find(|h| src >= h.shadow as u64 && src < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64) else {
+    let Some(hs) = find_heap_by_addr(&heaps, src) else {
         return false;
     };
     if hd.sampler != hs.sampler {
@@ -899,6 +947,7 @@ struct GlobalSampler {
     next: u32,
     free: Vec<(u32, u32)>,
     retired: VecDeque<RetiredRange<ID3D12Fence>>,
+    smallest_failed: u32,
 }
 
 unsafe impl Send for GlobalSampler {}
@@ -967,6 +1016,7 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
             next: 1,
             free: Vec::new(),
             retired: VecDeque::new(),
+            smallest_failed: u32::MAX,
         });
     }
     true
@@ -975,11 +1025,17 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
 fn reserve_global_sampler(count: u32) -> Option<u32> {
     let mut g = GLOBAL_SAMPLER.write().unwrap();
     let s = g.as_mut()?;
-    unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) };
+    if unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) } {
+        s.smallest_failed = u32::MAX;
+    }
+    if count >= s.smallest_failed {
+        return None;
+    }
     let (cap, mut next) = (s.cap, s.next);
     let r = take_range(&mut s.free, &mut next, cap, count);
     s.next = next;
     if r.is_none() {
+        s.smallest_failed = s.smallest_failed.min(count);
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
             crate::xlog_warn!("console descriptor heaps: the shared sampler heap ({cap}) is full – overflowed sampler slots map to reserved slot 0");
@@ -1016,16 +1072,24 @@ fn release_global_sampler(first: u32, count: u32) {
     if let Some(s) = GLOBAL_SAMPLER.write().unwrap().as_mut() {
         if marks.as_ref().is_some_and(Vec::is_empty) {
             merge_release(&mut s.free, first, count);
+            s.smallest_failed = u32::MAX;
         } else {
             s.retired.push_back(RetiredRange { first, count, marks });
         }
-        unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) };
+        if unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) } {
+            s.smallest_failed = u32::MAX;
+        }
     }
 }
 
 /// The shared shader-visible PC sampler heap lists bind (None: no shared sampler heap).
 pub fn global_sampler_heap() -> Option<ID3D12DescriptorHeap> {
     GLOBAL_SAMPLER.read().unwrap().as_ref().map(|s| s.heap.clone())
+}
+
+/// Raw COM pointer of the shared shader-visible sampler heap without COM refcount traffic.
+pub fn global_sampler_heap_raw() -> Option<usize> {
+    GLOBAL_SAMPLER.read().unwrap().as_ref().map(|s| s.heap.as_raw() as usize)
 }
 
 /// Whether `obj` (a title's sampler heap) has its descriptors in the shared sampler heap.
@@ -1128,7 +1192,7 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
-                next: crate::gpu::recomp::MEM_HEAP_NULL + 1, free: Vec::new(), retired: VecDeque::new(),
+                next: crate::gpu::recomp::MEM_HEAP_NULL + 1, free: Vec::new(), retired: VecDeque::new(), smallest_failed: u32::MAX,
             });
             let window = (&mut resource as *mut _ as usize, 0x10000);
             assert!(set_window_views_checked(&dev, &[window], true));
@@ -1323,7 +1387,7 @@ mod tests {
             *GLOBAL_SAMPLER.write().unwrap() = Some(GlobalSampler {
                 dev: ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
-                cpu: 0x1000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(),
+                cpu: 0x1000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(), smallest_failed: u32::MAX,
             });
             assert_eq!(reserve_global_sampler(4), Some(1));
             assert_eq!(reserve_global_sampler(4), Some(5));
@@ -1338,10 +1402,11 @@ mod tests {
             assert_eq!(reserve_global_sampler(8), Some(1));
             // Coalesced range ending at cursor straddles cleanly into the never-used tail.
             {
-                let mut g = GLOBAL_SAMPLER.write().unwrap();
-                let s = g.as_mut().unwrap();
+                let mut s = GLOBAL_SAMPLER.write().unwrap();
+                let s = s.as_mut().unwrap();
                 s.next = 13;
                 s.free.clear();
+                s.smallest_failed = u32::MAX;
             }
             release_global_sampler(9, 2);
             release_global_sampler(11, 2);
@@ -1382,12 +1447,12 @@ mod tests {
             *GLOBAL.write().unwrap() = Some(Global {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut view_heap as *mut _ as *mut c_void),
-                cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024, next: 64, free: Vec::new(), retired: VecDeque::new(),
+                cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024, next: 64, free: Vec::new(), retired: VecDeque::new(), smallest_failed: u32::MAX,
             });
             *GLOBAL_SAMPLER.write().unwrap() = Some(GlobalSampler {
                 dev,
                 heap: ID3D12DescriptorHeap::from_raw(&mut sampler_heap as *mut _ as *mut c_void),
-                cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(),
+                cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(), smallest_failed: u32::MAX,
             });
             if crate::gpu::uma::get().is_some() {
                 assert!(register(0xC100, 16, 0x9000, 0, 16, true, true, true));

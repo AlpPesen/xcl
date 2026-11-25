@@ -1263,7 +1263,7 @@ fn bind_cache_enabled() -> bool {
 }
 
 /// Whether `SetPipelineState(pso)` resolved to `bound` is already active on `list` (same title
-/// PSO and resolved PC PSO, with no pending/active depth-bias patch), allowing the redundant
+/// PSO or resolved PC PSO, with no pending/active depth-bias patch), allowing the redundant
 /// D3D12 call and DRED marker to be skipped.
 pub(super) fn skip_redundant_pso_bind(list: *mut c_void, pso: usize, bound: usize) -> bool {
     if !bind_cache_enabled() || list.is_null() || pso == 0 || bound == 0 {
@@ -1274,7 +1274,7 @@ pub(super) fn skip_redundant_pso_bind(list: *mut c_void, pso: usize, bound: usiz
         .unwrap()
         .as_ref()
         .and_then(|m| m.get(&(list as usize)))
-        .is_some_and(|s| s.bound_pso == pso && s.last_pc_pso == bound && !s.pso_dirty && !s.using_fallback_pso)
+        .is_some_and(|s| (s.bound_pso == pso || s.last_pc_pso == pso) && s.last_pc_pso == bound && !s.pso_dirty && !s.using_fallback_pso)
 }
 
 /// Track `SetPipelineState` on a command list (for `RSSetDepthBiasX`, `KickoffX`, and redundant
@@ -4291,13 +4291,13 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
 /// title binds one buffer at many offsets (a ring it fills through the frame: a retail title's
 /// views all end at the buffer's end), so a mirror covers a 64 KiB-aligned range and a view
 /// inside a mirrored range uses that mirror at its offset.
-static MIRRORS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
+static MIRRORS: std::sync::RwLock<Vec<(u64, usize, usize)>> = std::sync::RwLock::new(Vec::new());
 /// bytes of mirrors made (never freed)
 static MIRROR_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Where `[va, va + bytes)` is in a mirror, if it is in one.
 fn mirrored(va: u64, bytes: usize) -> Option<usize> {
-    MIRRORS.lock().unwrap().iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64).map(|&(s, _, m)| m + (va - s) as usize)
+    MIRRORS.read().unwrap().iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64).map(|&(s, _, m)| m + (va - s) as usize)
 }
 
 /// Per mirror (start, bytes, a bit per 4 KiB page from `start & !0xfff`): pages of its source
@@ -4307,14 +4307,15 @@ static MIRROR_STALE: Mutex<Vec<(u64, usize, Vec<u64>)>> = Mutex::new(Vec::new())
 /// odd while a look takes pages off the write-watch and has not handed them on yet: a draw
 /// then (or across one) copies its whole range
 static MIRROR_LOOK_SEQ: AtomicU64 = AtomicU64::new(0);
-// the write-watch's answer for a draw's range (one per thread, like `title_textures`' look)
+// the write-watch's answer and reusable dirty-page bitset for a draw's range (one per thread)
 thread_local! {
     static WRITTEN_BUF: std::cell::RefCell<Vec<*mut c_void>> = const { std::cell::RefCell::new(Vec::new()) };
+    static WRITTEN_BITS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The title's ranges with a mirror (start, end), which `title_textures`' look watches.
 pub(super) fn mirror_sources() -> Vec<(usize, usize)> {
-    MIRRORS.lock().unwrap().iter().map(|&(s, l, _)| (s as usize, s as usize + l)).collect()
+    MIRRORS.read().unwrap().iter().map(|&(s, l, _)| (s as usize, s as usize + l)).collect()
 }
 
 /// Changes when a mirror is made (`mirror_sources` then has a new range).
@@ -4344,41 +4345,104 @@ pub(super) fn mirror_pages_written(dirty: &[usize]) {
     MIRROR_LOOK_SEQ.fetch_add(1, Ordering::SeqCst);
 }
 
-/// The pages of `[a, end)` (from `a & !0xfff`, in the mirror of the buffer at `va`) a draw
-/// copies: those on the write-watch (written since the last look) and those a look took off it
-/// since the last copy (whose bits are cleared). None when the range is not write-watched.
-unsafe fn written_pages(va: u64, a: usize, end: usize) -> Option<Vec<bool>> {
+/// Call `on_run(first, end)` for every maximal contiguous run of set bits in `bits[..]` below `n`.
+fn for_each_bitset_run(bits: &[u64], n: usize, mut on_run: impl FnMut(usize, usize)) {
+    let words = n.div_ceil(64).min(bits.len());
+    let mut run_start: Option<usize> = None;
+    for (wi, &raw) in bits[..words].iter().enumerate() {
+        let valid_bits = (n - wi * 64).min(64);
+        let mask = if valid_bits == 64 { u64::MAX } else { (1u64 << valid_bits) - 1 };
+        let mut w = raw & mask;
+        if w == 0 {
+            if let Some(s) = run_start.take() {
+                on_run(s, wi * 64);
+            }
+            continue;
+        }
+        if w == u64::MAX && valid_bits == 64 {
+            if run_start.is_none() {
+                run_start = Some(wi * 64);
+            }
+            continue;
+        }
+        let mut bit = 0usize;
+        while bit < valid_bits {
+            if run_start.is_some() {
+                let ones = (w >> bit).trailing_ones() as usize;
+                let take = ones.min(valid_bits - bit);
+                bit += take;
+                if bit < valid_bits {
+                    let s = run_start.take().unwrap();
+                    on_run(s, wi * 64 + bit);
+                }
+            } else {
+                let zeros = (w >> bit).trailing_zeros() as usize;
+                bit += zeros;
+                if bit < valid_bits {
+                    run_start = Some(wi * 64 + bit);
+                }
+            }
+        }
+        let _ = &mut w;
+    }
+    if let Some(s) = run_start {
+        on_run(s, n);
+    }
+}
+
+/// Walk the dirty 4 KiB page runs of `[a, end)` (from `a & !0xfff`, in the mirror of the buffer at
+/// `va`) using a reusable thread-local bitset: pages on the write-watch plus those a look took off
+/// it since the last copy (whose bits are cleared). Returns `false` when not write-watched.
+unsafe fn for_each_written_page_run(va: u64, a: usize, end: usize, mut on_run: impl FnMut(usize, usize)) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     let base = a & !0xfff;
     let n = (end - base + 0xfff) >> 12;
-    let mut pages = vec![false; n];
-    WRITTEN_BUF.with(|c| {
-        let mut buf = c.borrow_mut();
-        if buf.len() < n {
-            buf.resize(n, std::ptr::null_mut());
+    let words = n.div_ceil(64);
+    WRITTEN_BITS.with(|bits_cell| {
+        let mut bits = bits_cell.borrow_mut();
+        if bits.len() < words {
+            bits.resize(words, 0);
         }
-        let (mut count, mut granularity) = (n, 0u32);
-        // (no reset: the look's to do, which hands the pages on)
-        if GetWriteWatch(0, base as *const c_void, n << 12, buf.as_mut_ptr(), &mut count, &mut granularity) != 0 || granularity != 0x1000 {
-            return None;
+        bits[..words].fill(0);
+        let ok = WRITTEN_BUF.with(|c| {
+            let mut buf = c.borrow_mut();
+            if buf.len() < n {
+                buf.resize(n, std::ptr::null_mut());
+            }
+            let (mut count, mut granularity) = (n, 0u32);
+            // (no reset: the look's to do, which hands the pages on)
+            if GetWriteWatch(0, base as *const c_void, n << 12, buf.as_mut_ptr(), &mut count, &mut granularity) != 0 || granularity != 0x1000 {
+                return false;
+            }
+            for &p in &buf[..count] {
+                let k = (p as usize - base) >> 12;
+                bits[k >> 6] |= 1u64 << (k & 63);
+            }
+            true
+        });
+        if !ok {
+            return false;
         }
-        for &p in &buf[..count] {
-            pages[(p as usize - base) >> 12] = true;
-        }
-        Some(())
-    })?;
-    let mut g = MIRROR_STALE.lock().unwrap();
-    if let Some((s, _, bits)) = g.iter_mut().find(|(s, l, _)| va >= *s && end as u64 <= *s + *l as u64) {
-        let first = (base - (*s as usize & !0xfff)) >> 12;
-        for (k, page) in pages.iter_mut().enumerate() {
-            let j = first + k;
-            if bits[j / 64] >> (j % 64) & 1 != 0 {
-                *page = true;
-                bits[j / 64] &= !(1 << (j % 64));
+        {
+            let mut g = MIRROR_STALE.lock().unwrap();
+            if let Some((s, _, stale)) = g.iter_mut().find(|(s, l, _)| va >= *s && end as u64 <= *s + *l as u64) {
+                let first = (base - (*s as usize & !0xfff)) >> 12;
+                for k in 0..n {
+                    let j = first + k;
+                    let sw = stale[j >> 6];
+                    let sm = 1u64 << (j & 63);
+                    if sw & sm != 0 {
+                        bits[k >> 6] |= 1u64 << (k & 63);
+                        stale[j >> 6] = sw & !sm;
+                    }
+                }
             }
         }
-    }
-    Some(pages)
+        for_each_bitset_run(&bits[..words], n, |first, last| {
+            on_run(base + (first << 12), base + (last << 12));
+        });
+        true
+    })
 }
 
 /// `[from, from + len)` of the title's buffer at `va` (`bytes` long) into its mirror at
@@ -4402,19 +4466,8 @@ unsafe fn copy_written(va: u64, mirror: usize, bytes: u32, from: u64, len: u64) 
         }
     };
     let seq = MIRROR_LOOK_SEQ.load(Ordering::SeqCst);
-    let Some(pages) = (seq % 2 == 0).then(|| written_pages(va, a, end)).flatten() else { return copy(a, end) };
-    let base = a & !0xfff;
-    let mut k = 0;
-    while k < pages.len() {
-        if !pages[k] {
-            k += 1;
-            continue;
-        }
-        let first = k;
-        while k < pages.len() && pages[k] {
-            k += 1;
-        }
-        copy(base + (first << 12), base + (k << 12));
+    if seq % 2 != 0 || !for_each_written_page_run(va, a, end, copy) {
+        return copy(a, end);
     }
     // a look took pages off the write-watch meanwhile, which may not have been handed on yet
     if MIRROR_LOOK_SEQ.load(Ordering::SeqCst) != seq {
@@ -4428,7 +4481,7 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
     if let Some(p) = mirrored(va, bytes) {
         return Some(p);
     }
-    let mut g = MIRRORS.lock().unwrap();
+    let mut g = MIRRORS.write().unwrap();
     // again under the lock: two lists binding one new range at once must share a mirror (a
     // second one would never be synced – every later lookup finds the first)
     if let Some(&(s, _, m)) = g.iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64) {
@@ -4532,6 +4585,17 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
 unsafe fn set_index_buffer(list: *mut c_void, view: Option<&D3D12_INDEX_BUFFER_VIEW>) {
     let f = pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_INDEX_BUFFER_VIEW)>(list, PC_IA_SET_INDEX_BUFFER);
     f(list, view.map_or(std::ptr::null(), |v| v as *const _));
+}
+
+unsafe fn ensure_global_sampler_heap_raw() -> Option<usize> {
+    if let Some(s) = super::console_heap::global_sampler_heap_raw() {
+        return Some(s);
+    }
+    let dev_raw = real::device_raw();
+    if let Some(dev) = ID3D12Device::from_raw_borrowed(&dev_raw) {
+        let _ = super::console_heap::shared_sampler_heap(dev);
+    }
+    super::console_heap::global_sampler_heap_raw()
 }
 
 /// Ensure the shared shader-visible PC sampler heap exists when a console device is live so
@@ -4647,18 +4711,18 @@ unsafe fn ensure_console_view_heap(this: *mut c_void) {
 /// Translated shaders with directly-indexed root signatures (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`
 /// / `SAMPLER_HEAP_DIRECTLY_INDEXED`) and heap windows (`pso::heap_windows`) require valid
 /// shader-visible view and sampler heaps to be bound even if the title bound 0 heaps (or only a
-/// view heap with 0 sampler heaps).
-pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
-    let view = if crate::gpu::recomp::pso::heap_windows() {
-        super::console_heap::global_heap()
+/// view heap with 0 sampler heaps). Returns `true` when all required shared heaps exist and are
+/// bound on `this` so callers may cache the check until `SetDescriptorHeaps` / `Reset`.
+pub(super) unsafe fn ensure_view_heap(this: *mut c_void) -> bool {
+    let need_view = crate::gpu::recomp::pso::heap_windows();
+    let view_raw = if need_view {
+        super::console_heap::global_heap_raw()
     } else {
         None
     };
-    let sampler = ensure_global_sampler_heap();
-    let view_raw = view.as_ref().map(|h| h.as_raw() as usize);
-    let sampler_raw = sampler.as_ref().map(|h| h.as_raw() as usize);
+    let sampler_raw = ensure_global_sampler_heap_raw();
     if view_raw.is_none() && sampler_raw.is_none() {
-        return;
+        return false;
     }
     let mut to_bind: Option<Vec<usize>> = None;
     with_bindings(this, |b| {
@@ -4671,6 +4735,7 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
     if let Some(raw) = to_bind {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, 28)(this, raw.len() as u32, raw.as_ptr());
     }
+    (!need_view || view_raw.is_some()) && sampler_raw.is_some()
 }
 
 /// console #32 SetDescriptorHeaps (PC #28)
@@ -8973,6 +9038,8 @@ mod tests {
             assert!(!skip_redundant_pso_bind(list, 0x1000, 0x3000));
             on_set_pipeline_state_bound(list, 0x1000, 0x3000);
             assert!(skip_redundant_pso_bind(list, 0x1000, 0x3000));
+            // bind_abi re-binding the resolved PC PSO directly also hits the cache.
+            assert!(skip_redundant_pso_bind(list, 0x3000, 0x3000));
             // Different title PSO -> must bind!
             assert!(!skip_redundant_pso_bind(list, 0x1001, 0x3001));
             // ClearState / PC Reset / segment clear invalidate the cached PC PSO.
@@ -9011,5 +9078,21 @@ mod tests {
             assert!(!skip_redundant_render_targets(list, 2, rtvs.as_ptr(), 0, &dsv));
             on_release(list as usize);
         }
+    }
+
+    #[test]
+    fn bitset_runs_emit_exact_contiguous_page_ranges() {
+        let collect = |bits: &[u64], n: usize| {
+            let mut runs = Vec::new();
+            for_each_bitset_run(bits, n, |a, b| runs.push((a, b)));
+            runs
+        };
+        assert_eq!(collect(&[0, 0], 100), vec![]);
+        assert_eq!(collect(&[u64::MAX, u64::MAX], 130), vec![(0, 128)]);
+        assert_eq!(collect(&[u64::MAX, u64::MAX, 0b11], 130), vec![(0, 130)]);
+        // Word-boundary straddle (bits 62..66), single bit 0, and trailing bit clipped by `n`.
+        let w0 = (1u64 << 0) | (1u64 << 62) | (1u64 << 63);
+        let w1 = (1u64 << 0) | (1u64 << 1) | (1u64 << 5) | (1u64 << 10);
+        assert_eq!(collect(&[w0, w1], 70), vec![(0, 1), (62, 66), (69, 70)]);
     }
 }

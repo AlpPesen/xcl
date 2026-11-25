@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -116,6 +116,35 @@ struct PreludeScaleJob {
     cnt_off: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PreludeDrawJob {
+    buf_idx: usize,
+    dst_off: u32,
+    count: u32,
+    stride: u32,
+    draw_offset: u32,
+    src_win: u32,
+    src_off: u32,
+}
+
+/// Cached free-threaded `ID3D12Device` wrapper for `State::vram_io_dev`.
+#[derive(Clone)]
+struct CachedIoDev(ID3D12Device);
+
+unsafe impl Send for CachedIoDev {}
+
+/// Cached resolved ABI metadata for the currently bound translated pipeline on a command list,
+/// avoiding repeated global `pso_async`/`real` map lookups across consecutive draws/dispatches
+/// using the same pipeline.
+#[derive(Clone, Copy, Debug)]
+struct CachedPsoAbi {
+    query_pso: usize,
+    real_pso: usize,
+    rs_raw: usize,
+    user_sgprs: Option<u32>,
+    is_gfx: bool,
+}
+
 type PreludeEntry = (ID3D12CommandAllocator, ID3D12GraphicsCommandList, usize, i32);
 
 /// Paired persistently-mapped `UPLOAD` slab and L1 VRAM `DEFAULT` (`ALLOW_UNORDERED_ACCESS`) slab
@@ -180,6 +209,7 @@ struct State {
     prelude_bufs: Vec<ID3D12Resource>,
     prelude_guards: Vec<PreludeGuardJob>,
     prelude_scales: Vec<PreludeScaleJob>,
+    prelude_draws: Vec<PreludeDrawJob>,
     prelude_owned: Option<PreludeEntry>,
     prelude_built: Option<ID3D12GraphicsCommandList>,
     /// true after an `INDIRECT_ARGUMENT` transition has ordered prior writes on this list and
@@ -190,6 +220,16 @@ struct State {
     uma_windows: Option<Vec<u64>>,
     /// reusable zeroed 256-byte `u1` (`res`) slot in this recording's UMA arena
     dummy_res_va: u64,
+    /// reusable 16-byte UMA root-argument table slot for draws/dispatches whose arguments fit
+    /// completely inline in user SGPRs (`tail.is_empty()`)
+    dummy_table_p: usize,
+    /// true once `list_x::ensure_view_heap` confirmed all required shared heaps are bound on this
+    /// list (invalidated on `Reset`, `ClearState`, split, `SetDescriptorHeaps`, or internal pass)
+    heaps_ensured: bool,
+    /// cached resolved ABI metadata for the active translated PSO on this list
+    pso_abi_cache: Option<CachedPsoAbi>,
+    /// lazily cached `vram_io_device(this)` result for this recording
+    vram_io_dev: Option<Option<CachedIoDev>>,
     /// tracked PC ABI root bindings for state-diffing
     pc_abi_gfx: AbiBound,
     pc_abi_cs: AbiBound,
@@ -440,7 +480,15 @@ unsafe fn alloc_vram_io_in(io_blocks: &mut Vec<IoBlock>, allocator: usize, prelu
     Some(va)
 }
 
-static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
+/// 64-way sharded per-list bind state map so parallel recording threads do not contend on a
+/// single global mutex across every root-argument update, draw, and dispatch.
+const STATE_SHARDS: usize = 64;
+static STATES: [Mutex<Option<HashMap<usize, State>>>; STATE_SHARDS] = [const { Mutex::new(None) }; STATE_SHARDS];
+
+#[inline]
+fn state_shard(list: usize) -> usize {
+    ((list >> 6) ^ (list >> 16)) & (STATE_SHARDS - 1)
+}
 
 /// draws / dispatches of console code: with a translated pipeline, skipped, with a PC one
 static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -470,7 +518,8 @@ fn count(k: usize) {
 }
 
 fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
-    f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
+    let key = list as usize;
+    f(STATES[state_shard(key)].lock().unwrap().get_or_insert_with(HashMap::new).entry(key).or_default())
 }
 
 /// Note that the active recording segment issued a GPU buffer write or cross-queue fence wait:
@@ -537,6 +586,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.prelude_bufs.clear();
         s.prelude_guards.clear();
         s.prelude_scales.clear();
+        s.prelude_draws.clear();
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
         s.inline_guard = None;
@@ -545,6 +595,10 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.arg_order_clean = false;
         s.uma_windows = None;
         s.dummy_res_va = 0;
+        s.dummy_table_p = 0;
+        s.heaps_ensured = false;
+        s.pso_abi_cache = None;
+        s.vram_io_dev = None;
         s.pc_abi_gfx = AbiBound::default();
         s.pc_abi_cs = AbiBound::default();
         s.args_gen_gfx = s.args_gen_gfx.wrapping_add(1);
@@ -579,6 +633,8 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
         s.rs_gfx = 0;
         s.heaps = [0; 2];
         s.rs_cs = 0;
+        s.heaps_ensured = false;
+        s.pso_abi_cache = None;
         s.pc_abi_gfx = AbiBound::default();
         s.pc_abi_cs = AbiBound::default();
         s.args_gen_gfx = s.args_gen_gfx.wrapping_add(1);
@@ -608,10 +664,12 @@ pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
         s.prelude_bufs.clear();
         s.prelude_guards.clear();
         s.prelude_scales.clear();
+        s.prelude_draws.clear();
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
         s.inline_guard = None;
         s.dummy_res_va = 0;
+        s.dummy_table_p = 0;
         s.io_cache_gfx = None;
         s.io_cache_cs = None;
         s.io_cache_tp_cs = None;
@@ -659,6 +717,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.prelude_bufs.clear();
         s.prelude_guards.clear();
         s.prelude_scales.clear();
+        s.prelude_draws.clear();
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
         s.inline_guard = None;
@@ -667,6 +726,10 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.arg_order_clean = false;
         s.uma_windows = None;
         s.dummy_res_va = 0;
+        s.dummy_table_p = 0;
+        s.heaps_ensured = false;
+        s.pso_abi_cache = None;
+        s.vram_io_dev = None;
         s.pc_abi_gfx = AbiBound::default();
         s.pc_abi_cs = AbiBound::default();
         s.args_gen_gfx = s.args_gen_gfx.wrapping_add(1);
@@ -708,7 +771,8 @@ pub(super) fn pass_arena(from: *mut c_void, to: *mut c_void) {
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
-    if let Some(mut s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
+    let key = list as usize;
+    if let Some(mut s) = STATES[state_shard(key)].lock().unwrap().as_mut().and_then(|m| m.remove(&key)) {
         console_list::hold_until_reset(s.allocator, s.uma);
         if let Some(b) = s.res_buf.take() {
             s.res_retired.push(b);
@@ -724,6 +788,7 @@ pub(crate) fn seed_reset_state_for_test(list: *mut c_void, allocator: usize, pso
     with(list, |s| {
         s.allocator = allocator;
         s.pso = pso;
+        s.pso_abi_cache = None;
         s.layout = Some(Arc::new(Layout::default()));
         s.args = vec![1, 2, 3, 4];
         s.layout_gfx = Some(Arc::new(Layout::default()));
@@ -739,7 +804,8 @@ pub(crate) fn reset_state_for_test(list: *mut c_void) -> (usize, usize, Vec<u8>,
 
 #[cfg(test)]
 pub(crate) fn remove_state_for_test(list: *mut c_void) {
-    STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+    let key = list as usize;
+    STATES[state_shard(key)].lock().unwrap().as_mut().and_then(|m| m.remove(&key));
 }
 
 /// SetDescriptorHeaps: the console addresses of `heaps`, for shaders that index them themselves
@@ -750,6 +816,7 @@ pub(super) fn set_heaps(list: *mut c_void, heaps: &[usize]) {
         bases[sampler as usize] = base;
     }
     with(list, |s| {
+        s.heaps_ensured = false;
         if s.heaps != bases {
             s.heaps = bases;
             s.args_gen_gfx = s.args_gen_gfx.wrapping_add(1);
@@ -799,8 +866,14 @@ pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_vo
     with(this, |s| {
         // the same root signature again keeps the bound arguments (D3D12: only a different
         // one invalidates them)
-        if !console_list::same_layout(&s.layout_gfx, &layout) {
-            s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        let same = console_list::same_layout(&s.layout_gfx, &layout);
+        if same && s.rs_gfx == rs as usize {
+            return;
+        }
+        if !same {
+            let size = layout.as_ref().map_or(0, |l| l.size as usize);
+            s.args_gfx.clear();
+            s.args_gfx.resize(size, 0);
         }
         s.layout_gfx = layout;
         s.rs_gfx = rs as usize;
@@ -823,9 +896,14 @@ pub(super) unsafe extern "system" fn set_graphics_root_constant(this: *mut c_voi
 
 /// #40 SetGraphicsRoot32BitConstants (PC #36)
 pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
-    if !data.is_null() {
-        let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
-        put_in(this, true, i, offset, &bytes);
+    if !data.is_null() && n > 0 {
+        #[cfg(target_endian = "little")]
+        let bytes = std::slice::from_raw_parts(data.cast::<u8>(), (n as usize).saturating_mul(4));
+        #[cfg(not(target_endian = "little"))]
+        let bytes_vec: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
+        #[cfg(not(target_endian = "little"))]
+        let bytes = bytes_vec.as_slice();
+        put_in(this, true, i, offset, bytes);
     }
 }
 
@@ -890,7 +968,7 @@ fn note_address(va: u64) {
 }
 
 /// command signatures that change root arguments (they need the title's root signature)
-static ROOT_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static ROOT_SIGNATURES: RwLock<Option<std::collections::HashSet<usize>>> = RwLock::new(None);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DispatchMeshSig {
@@ -899,11 +977,19 @@ struct DispatchMeshSig {
     mesh_offset: u32,
 }
 
-static DISPATCH_MESH_SIGS: Mutex<Option<HashMap<usize, DispatchMeshSig>>> = Mutex::new(None);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DrawSig {
+    byte_stride: u32,
+    draw_offset: u32,
+    indexed: bool,
+}
+
+static DISPATCH_MESH_SIGS: RwLock<Option<HashMap<usize, DispatchMeshSig>>> = RwLock::new(None);
+static DRAW_SIGS: RwLock<Option<HashMap<usize, DrawSig>>> = RwLock::new(None);
 
 /// noted at every creation, so a signature made at a freed one's address does not keep its kind
 pub(super) fn note_root_changing_signature(sig: usize, changes: bool) {
-    let mut s = ROOT_SIGNATURES.lock().unwrap();
+    let mut s = ROOT_SIGNATURES.write().unwrap();
     let s = s.get_or_insert_with(Default::default);
     if changes {
         s.insert(sig);
@@ -914,10 +1000,10 @@ pub(super) fn note_root_changing_signature(sig: usize, changes: bool) {
 
 /// command signatures with a Dispatch argument (noted at every creation, so a signature made
 /// at a freed one's address does not keep its kind)
-static DISPATCH_SIGNATURES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static DISPATCH_SIGNATURES: RwLock<Option<std::collections::HashSet<usize>>> = RwLock::new(None);
 
 pub(super) fn note_signature_dispatches(sig: usize, dispatches: bool) {
-    let mut s = DISPATCH_SIGNATURES.lock().unwrap();
+    let mut s = DISPATCH_SIGNATURES.write().unwrap();
     let s = s.get_or_insert_with(Default::default);
     if dispatches {
         s.insert(sig);
@@ -927,15 +1013,15 @@ pub(super) fn note_signature_dispatches(sig: usize, dispatches: bool) {
 }
 
 fn signature_dispatches(sig: usize) -> bool {
-    DISPATCH_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig))
+    DISPATCH_SIGNATURES.read().unwrap().as_ref().is_some_and(|s| s.contains(&sig))
 }
 
 /// command signatures of one Dispatch argument → their stride (a split program runs them as its
 /// chain, `chained_indirect`)
-static DISPATCH_ONLY: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+static DISPATCH_ONLY: RwLock<Option<HashMap<usize, u32>>> = RwLock::new(None);
 
 pub(super) fn note_dispatch_only_signature(sig: usize, stride: Option<u32>) {
-    let mut s = DISPATCH_ONLY.lock().unwrap();
+    let mut s = DISPATCH_ONLY.write().unwrap();
     let s = s.get_or_insert_with(Default::default);
     match stride {
         Some(n) => {
@@ -949,14 +1035,33 @@ pub(super) fn note_dispatch_only_signature(sig: usize, stride: Option<u32>) {
 
 pub(super) fn note_dispatch_mesh_signature(sig: usize, companion_dispatch: usize, byte_stride: u32, mesh_offset: u32) {
     DISPATCH_MESH_SIGS
-        .lock()
+        .write()
         .unwrap()
         .get_or_insert_with(HashMap::new)
         .insert(sig, DispatchMeshSig { companion_dispatch, byte_stride, mesh_offset });
 }
 
 fn dispatch_mesh_sig_of(sig: usize) -> Option<DispatchMeshSig> {
-    DISPATCH_MESH_SIGS.lock().unwrap().as_ref()?.get(&sig).copied()
+    DISPATCH_MESH_SIGS.read().unwrap().as_ref()?.get(&sig).copied()
+}
+
+/// noted at every creation, so a non-draw signature made at a freed draw signature's address does
+/// not inherit stale draw-guard metadata
+pub(super) fn note_draw_signature(sig: usize, info: Option<(u32, u32, bool)>) {
+    let mut s = DRAW_SIGS.write().unwrap();
+    let s = s.get_or_insert_with(HashMap::new);
+    match info {
+        Some((byte_stride, draw_offset, indexed)) => {
+            s.insert(sig, DrawSig { byte_stride, draw_offset, indexed });
+        }
+        None => {
+            s.remove(&sig);
+        }
+    }
+}
+
+fn draw_sig_of(sig: usize) -> Option<DrawSig> {
+    DRAW_SIGS.read().unwrap().as_ref()?.get(&sig).copied()
 }
 
 unsafe fn emit_uav_barrier(list: &ID3D12GraphicsCommandList, res: Option<&ID3D12Resource>) {
@@ -1111,7 +1216,14 @@ pub(super) fn note_records_queue(queue: usize, lists: &[*mut c_void]) {
     if RECORDS_QUEUES_DIFFER.load(Ordering::Relaxed) {
         return;
     }
-    let used = STATES.lock().unwrap().as_ref().is_some_and(|m| lists.iter().any(|&l| m.get(&(l as usize)).is_some_and(|s| s.shared_records)));
+    let used = lists.iter().any(|&l| {
+        let key = l as usize;
+        STATES[state_shard(key)]
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|m| m.get(&key).is_some_and(|s| s.shared_records))
+    });
     if used && !same_records_queue(&RECORDS_QUEUE, queue) {
         RECORDS_QUEUES_DIFFER.store(true, Ordering::Relaxed);
         crate::xlog_warn!("D3D12.X: two-pass draws go to a second queue ({queue:#x}): the record buffers are the lists' own from here");
@@ -1183,26 +1295,135 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
     Ok((buf, va, cap))
 }
 
-/// The `io` block of a two-pass stage: its user SGPRs (`compute_pass`: the MS layout) with the
-/// argument table at `table_at`, and the high dword of unified memory's base, as the other binds
-/// write it (the translated pair picks each access's memory window from it). The compute pass
-/// runs the console MS: when its layout says the shaders index the heaps themselves, the heaps'
-/// addresses (`State::heaps`) follow the mesh root arguments, as `bind_abi` places them.
-fn two_pass_io(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass: bool, uma_base: usize, heaps: [u32; 2]) -> Vec<u32> {
-    let mut io = match layout {
-        Some(l) if compute_pass => console_list::with_heaps(l, None, console_list::user_data_ms(l, args, table_at), heaps),
-        Some(l) => console_list::user_data_gfx(l, args, table_at),
-        None if compute_pass => {
-            let mut v = vec![0u32; 16];
-            v[8] = table_at as u32;
-            v[9] = (table_at >> 32) as u32;
-            v
+/// Write packed inline root arguments from `args` into `dst[first..]` as little-endian dwords,
+/// returning the next free SGPR index (zero heap allocation).
+fn write_inline_words(dst: &mut [u32], first: usize, inline_bytes: u32, args: &[u8]) -> usize {
+    let inline = &args[..(inline_bytes as usize).min(args.len())];
+    let mut len = first;
+    for chunk in inline.chunks(4) {
+        let mut w = [0u8; 4];
+        w[..chunk.len()].copy_from_slice(chunk);
+        if len < dst.len() {
+            dst[len] = u32::from_le_bytes(w);
         }
-        None => vec![table_at as u32, (table_at >> 32) as u32],
-    };
-    io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+        len += 1;
+    }
+    len
+}
+
+/// Append heap base addresses requested by `l.heaps` into `dst[len..]`, respecting `user_sgprs`.
+fn append_heap_words(dst: &mut [u32], mut len: usize, l: &Layout, user_sgprs: Option<u32>, heaps: [u32; 2]) {
+    for (_, base) in l.heaps.iter().zip(heaps).filter(|(&used, _)| used) {
+        if user_sgprs.is_some_and(|n| len as u32 >= n) {
+            break;
+        }
+        if len < dst.len() {
+            dst[len] = base;
+        }
+        len += 1;
+    }
+}
+
+/// Zero-allocation stack builder for graphics `io` (`u0`) user SGPRs (`KERNEL_SGPRS` dwords).
+fn fill_io_gfx(layout: Option<&Layout>, args: &[u8], table_at: u64, heaps: [u32; 2], uma_base: usize) -> [u32; crate::gpu::recomp::KERNEL_SGPRS] {
+    let mut io = [0u32; crate::gpu::recomp::KERNEL_SGPRS];
+    io[0] = table_at as u32;
+    io[1] = (table_at >> 32) as u32;
+    if let Some(l) = layout {
+        let len = write_inline_words(&mut io, 8, l.inline_gfx, args);
+        append_heap_words(&mut io, len, l, None, heaps);
+    }
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (uma_base as u64 >> 32) as u32;
     io
+}
+
+/// Zero-allocation stack builder for compute `io` (`u0`) user SGPRs (`KERNEL_SGPRS` dwords).
+fn fill_io_compute(layout: Option<&Layout>, user_sgprs: Option<u32>, args: &[u8], table_at: u64, heaps: [u32; 2], uma_base: usize, group_limit: u32) -> [u32; crate::gpu::recomp::KERNEL_SGPRS] {
+    let mut io = [0u32; crate::gpu::recomp::KERNEL_SGPRS];
+    io[0] = table_at as u32;
+    io[1] = (table_at >> 32) as u32;
+    if let Some(l) = layout {
+        let inline = console_list::inline_for(l, user_sgprs);
+        let len = write_inline_words(&mut io, 4, inline, args);
+        append_heap_words(&mut io, len, l, user_sgprs, heaps);
+    }
+    io[crate::gpu::recomp::IO_UMA_BASE_HI] = (uma_base as u64 >> 32) as u32;
+    io[crate::gpu::recomp::IO_GROUP_LIMIT] = group_limit;
+    io
+}
+
+/// Zero-allocation stack builder for two-pass stage `io` (`u0`) user SGPRs.
+fn fill_io_two_pass(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass: bool, uma_base: usize, heaps: [u32; 2]) -> [u32; crate::gpu::recomp::KERNEL_SGPRS] {
+    let mut io = [0u32; crate::gpu::recomp::KERNEL_SGPRS];
+    if compute_pass {
+        io[8] = table_at as u32;
+        io[9] = (table_at >> 32) as u32;
+        if let Some(l) = layout {
+            let len = write_inline_words(&mut io, 16, l.inline_ms, args);
+            append_heap_words(&mut io, len, l, None, heaps);
+        }
+    } else {
+        io[0] = table_at as u32;
+        io[1] = (table_at >> 32) as u32;
+        if let Some(l) = layout {
+            write_inline_words(&mut io, 8, l.inline_gfx, args);
+        }
+    }
+    io[crate::gpu::recomp::IO_UMA_BASE_HI] = (uma_base as u64 >> 32) as u32;
+    io
+}
+
+/// The `io` block of a two-pass stage (test helper wrapping `fill_io_two_pass`).
+#[cfg(test)]
+fn two_pass_io(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass: bool, uma_base: usize, heaps: [u32; 2]) -> Vec<u32> {
+    fill_io_two_pass(layout, args, table_at, compute_pass, uma_base, heaps).to_vec()
+}
+
+/// Ensure shared shader-visible descriptor heaps are bound on `this`, skipping global locks when
+/// already verified on this recording (`State::heaps_ensured`).
+unsafe fn ensure_heaps_cached(this: *mut c_void) {
+    if with(this, |s| s.heaps_ensured) {
+        return;
+    }
+    if super::list_x::ensure_view_heap(this) {
+        with(this, |s| s.heaps_ensured = true);
+    }
+}
+
+/// Lazily resolve and cache `vram_io_device(this)` outside `STATES`, avoiding 3 global locks +
+/// COM AddRef/Release on every draw/dispatch.
+unsafe fn ensure_vram_io_dev(this: *mut c_void) -> Option<ID3D12Device> {
+    if let Some(cached) = with(this, |s| s.vram_io_dev.as_ref().map(|o| o.as_ref().map(|d| d.0.clone()))) {
+        return cached;
+    }
+    let dev = vram_io_device(this);
+    with(this, |s| {
+        s.vram_io_dev = Some(dev.as_ref().map(|d| CachedIoDev(d.clone())));
+    });
+    dev
+}
+
+/// Copy `tail` of root arguments into UMA arena, reusing a single 16-byte dummy slot when `tail`
+/// is empty (all root arguments fit inline in user SGPRs). Takes disjoint `State` fields so
+/// callers can hold an immutable borrow of `s.uma_windows` across the call.
+unsafe fn upload_arg_table(
+    u: &crate::gpu::uma::Uma,
+    arena: &mut crate::gpu::uma::Arena,
+    uma: &mut Vec<usize>,
+    dummy_table_p: &mut usize,
+    tail: &[u8],
+) -> Result<u64, String> {
+    if tail.is_empty() {
+        if *dummy_table_p == 0 {
+            let p = arena.take(u, 16, 256, uma).ok_or("unified memory is full")?;
+            std::ptr::write_bytes(p, 0, 16);
+            *dummy_table_p = p as usize;
+        }
+        return Ok(*dummy_table_p as u64);
+    }
+    let table_p = arena.take(u, tail.len().max(16), 256, uma).ok_or("unified memory is full")?;
+    std::ptr::copy_nonoverlapping(tail.as_ptr(), table_p, tail.len());
+    Ok(table_p as u64)
 }
 
 unsafe fn bind_two_pass_stage(
@@ -1214,7 +1435,7 @@ unsafe fn bind_two_pass_stage(
     compute_pass: bool,
 ) -> Result<(), String> {
     // the pair is translated with heap windows when they are on (`pso::mem_windows`): as `bind_abi`
-    super::list_x::ensure_view_heap(this);
+    ensure_heaps_cached(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let rs_usize = if compute_pass { tp.compute_rs } else { tp.mesh_rs };
     let rs_raw = rs_usize as *mut c_void;
@@ -1222,7 +1443,18 @@ unsafe fn bind_two_pass_stage(
     let pso_raw = if compute_pass { tp.compute } else { real_mesh_pso } as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&pso_raw).ok_or(if compute_pass { "two-pass compute pipeline" } else { "two-pass mesh pipeline" })?;
 
-    let io_dev = vram_io_device(this);
+    let need_io_dev = with(this, |s| {
+        let hit = if compute_pass {
+            s.io_cache_tp_cs.is_some_and(|(gen, _)| gen == s.args_gen_gfx)
+        } else {
+            s.io_cache_tp_ms.is_some_and(|(gen, _)| gen == s.args_gen_gfx)
+        };
+        !hit && s.vram_io_dev.is_none()
+    });
+    if need_io_dev {
+        let _ = ensure_vram_io_dev(this);
+    }
+
     let (set_rs, uav_mask, views) = with(this, |s| -> Result<(bool, u8, [u64; 6]), String> {
         if s.uma_windows.as_ref().is_none_or(Vec::is_empty) {
             let w = super::real::uma_window_vas();
@@ -1248,20 +1480,14 @@ unsafe fn bind_two_pass_stage(
         let io_va = if let Some(va) = cached_io {
             va
         } else {
-            let layout = s.layout_gfx.as_deref();
-            let args = s.args_gfx.as_slice();
-            let inline = layout
+            let inline = s.layout_gfx.as_deref()
                 .map_or(0, |l| if compute_pass { l.inline_ms } else { l.inline_gfx } as usize)
-                .min(args.len());
-            let tail = &args[inline..];
-            let table_p = s.arena.take(u, tail.len().max(16), 256, &mut s.uma).ok_or("unified memory is full")?;
-            if !tail.is_empty() {
-                std::ptr::copy_nonoverlapping(tail.as_ptr(), table_p, tail.len());
-            }
-            let io = two_pass_io(layout, args, table_p as u64, compute_pass, u.base(), s.heaps);
-            let io_bytes = io.len() * 4;
+                .min(s.args_gfx.len());
+            let table_at = upload_arg_table(u, &mut s.arena, &mut s.uma, &mut s.dummy_table_p, &s.args_gfx[inline..])?;
+            let io = fill_io_two_pass(s.layout_gfx.as_deref(), s.args_gfx.as_slice(), table_at, compute_pass, u.base(), s.heaps);
+            let io_bytes = std::mem::size_of_val(&io);
             let io_slice = std::slice::from_raw_parts(io.as_ptr().cast::<u8>(), io_bytes);
-            let va = match io_dev.as_ref().and_then(|dev| alloc_vram_io_in(&mut s.io_blocks, s.allocator, s.prelude_built.is_some(), dev, io_slice)) {
+            let va = match s.vram_io_dev.as_ref().and_then(|o| o.as_ref()).and_then(|dev| alloc_vram_io_in(&mut s.io_blocks, s.allocator, s.prelude_built.is_some(), &dev.0, io_slice)) {
                 Some(va) => va,
                 None => {
                     let io_p = s.arena.take(u, io_bytes.max(16), 256, &mut s.uma).ok_or("unified memory is full")?;
@@ -1370,6 +1596,139 @@ const GUARD_ARGS_DRED_LABEL: &str = "xcl guard_dispatch_args";
 const SCALE_ARGS_DRED_LABEL: &str = "xcl make_scaled_args_buffer";
 const PRELUDE_GUARD_DRED_LABEL: &str = "xcl prelude_guard_dispatch_args";
 const PRELUDE_SCALE_DRED_LABEL: &str = "xcl prelude_scale_mesh_args";
+const GUARD_DRAW_DRED_LABEL: &str = "xcl guard_draw_args";
+const PRELUDE_DRAW_DRED_LABEL: &str = "xcl prelude_guard_draw_args";
+
+/// Exclusive upper bound on vertices/indices per instance in indirect Draw/DrawIndexed (`2^23` =
+/// `8,388,608`): any record with `verts >= 2^23` is zeroed to prevent garbage indirect-draw hangs.
+const DRAW_VERTS_PER_INST_LIMIT: u32 = 1 << 23;
+/// Inclusive upper bound on total vertices (`verts_per_inst * instances`, `2^26` = `67,108,864`):
+/// any record with `verts * instances > 2^26` is zeroed.
+const DRAW_TOTAL_VERTS_MAX: u32 = 1 << 26;
+
+/// Pure check matching `GUARD_DRAW_ARGS_*` / `PRELUDE_DRAW_GUARD_*`: true when an indirect
+/// Draw/DrawIndexed record should be zeroed (`verts == 0`, `insts == 0`, `verts >= 2^23`, or
+/// `verts * insts > 2^26`).
+#[cfg(test)]
+fn draw_record_rejected(verts: u32, insts: u32) -> bool {
+    verts == 0 || insts == 0 || verts >= DRAW_VERTS_PER_INST_LIMIT || insts > DRAW_TOTAL_VERTS_MAX / verts
+}
+
+/// Inline indirect Draw/DrawIndexed argument guard (`u0` = `[count, stride, draw_offset, src_off]`,
+/// `u2` = source UMA window, `u3` = destination scratch): copies each command and zeroes
+/// `(verts, insts)` whenever `verts == 0 || insts == 0 || verts >= 2^23 || verts * insts > 2^26`.
+pub(super) const GUARD_DRAW_ARGS_HLSL: &str = r#"RWByteAddressBuffer io  : register(u0);
+RWByteAddressBuffer src : register(u2);
+RWByteAddressBuffer dst : register(u3);
+[numthreads(64, 1, 1)]
+void main(uint tid : SV_DispatchThreadID) {
+    uint count = io.Load(0), stride = io.Load(4), draw_off = io.Load(8), src_off = io.Load(12);
+    if (tid >= count) return;
+    uint s = src_off + tid * stride;
+    uint d = tid * stride;
+    for (uint i = 0u; i < stride; i += 4u) {
+        dst.Store(d + i, src.Load(s + i));
+    }
+    uint verts = src.Load(s + draw_off);
+    uint insts = src.Load(s + draw_off + 4u);
+    if (verts == 0u || insts == 0u || verts >= 8388608u || insts > 67108864u / verts) {
+        dst.Store(d + draw_off, 0u);
+        dst.Store(d + draw_off + 4u, 0u);
+    }
+}
+"#;
+
+/// Descriptor-heap + inline root-constants form of `GUARD_DRAW_ARGS_HLSL`.
+pub(super) const GUARD_DRAW_ARGS_HEAP_HLSL: &str = r#"cbuffer Args : register(b0) {
+    uint count, stride, draw_off, src_slot, src_off;
+};
+RWByteAddressBuffer dst : register(u0);
+[numthreads(64, 1, 1)]
+void main(uint tid : SV_DispatchThreadID) {
+    if (tid >= count) return;
+    RWByteAddressBuffer src = ResourceDescriptorHeap[src_slot];
+    uint s = src_off + tid * stride;
+    uint d = tid * stride;
+    for (uint i = 0u; i < stride; i += 4u) {
+        dst.Store(d + i, src.Load(s + i));
+    }
+    uint verts = src.Load(s + draw_off);
+    uint insts = src.Load(s + draw_off + 4u);
+    if (verts == 0u || insts == 0u || verts >= 8388608u || insts > 67108864u / verts) {
+        dst.Store(d + draw_off, 0u);
+        dst.Store(d + draw_off + 4u, 0u);
+    }
+}
+"#;
+
+/// Batched prelude pass guarding all hoisted indirect Draw/DrawIndexed buffers in one
+/// `Dispatch(num_jobs, 1, 1)` (`jobs` u0: 32-byte records
+/// `[count, stride, draw_off, src_win, src_off, dst_off, 0, 0]`).
+pub(super) const PRELUDE_DRAW_GUARD_HLSL: &str = r#"RWByteAddressBuffer jobs : register(u0);
+RWByteAddressBuffer dst  : register(u1);
+RWByteAddressBuffer w0   : register(u2);
+RWByteAddressBuffer w1   : register(u3);
+RWByteAddressBuffer w2   : register(u4);
+RWByteAddressBuffer w3   : register(u5);
+uint load_u32(uint win, uint off) {
+    if (win == 0u) return w0.Load(off);
+    if (win == 1u) return w1.Load(off);
+    if (win == 2u) return w2.Load(off);
+    return w3.Load(off);
+}
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint b = gid.x * 32u;
+    uint count    = jobs.Load(b);
+    uint stride   = jobs.Load(b + 4u);
+    uint draw_off = jobs.Load(b + 8u);
+    uint src_win  = jobs.Load(b + 12u);
+    uint src_off  = jobs.Load(b + 16u);
+    uint dst_off  = jobs.Load(b + 20u);
+    for (uint tid = gtid.x; tid < count; tid += 64u) {
+        uint s = src_off + tid * stride;
+        uint d = dst_off + tid * stride;
+        for (uint i = 0u; i < stride; i += 4u) {
+            dst.Store(d + i, load_u32(src_win, s + i));
+        }
+        uint verts = load_u32(src_win, s + draw_off);
+        uint insts = load_u32(src_win, s + draw_off + 4u);
+        if (verts == 0u || insts == 0u || verts >= 8388608u || insts > 67108864u / verts) {
+            dst.Store(d + draw_off, 0u);
+            dst.Store(d + draw_off + 4u, 0u);
+        }
+    }
+}
+"#;
+
+/// Descriptor-heap form of `PRELUDE_DRAW_GUARD_HLSL`.
+pub(super) const PRELUDE_DRAW_GUARD_HEAP_HLSL: &str = r#"RWByteAddressBuffer jobs : register(u0);
+RWByteAddressBuffer dst  : register(u1);
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint b = gid.x * 32u;
+    uint count    = jobs.Load(b);
+    uint stride   = jobs.Load(b + 4u);
+    uint draw_off = jobs.Load(b + 8u);
+    uint src_win  = jobs.Load(b + 12u);
+    uint src_off  = jobs.Load(b + 16u);
+    uint dst_off  = jobs.Load(b + 20u);
+    RWByteAddressBuffer src = ResourceDescriptorHeap[NonUniformResourceIndex(4u + src_win)];
+    for (uint tid = gtid.x; tid < count; tid += 64u) {
+        uint s = src_off + tid * stride;
+        uint d = dst_off + tid * stride;
+        for (uint i = 0u; i < stride; i += 4u) {
+            dst.Store(d + i, src.Load(s + i));
+        }
+        uint verts = src.Load(s + draw_off);
+        uint insts = src.Load(s + draw_off + 4u);
+        if (verts == 0u || insts == 0u || verts >= 8388608u || insts > 67108864u / verts) {
+            dst.Store(d + draw_off, 0u);
+            dst.Store(d + draw_off + 4u, 0u);
+        }
+    }
+}
+"#;
 
 /// Batched prelude pass clamping & >65,535-folding all hoisted indirect compute dispatches of a
 /// command list in a single Dispatch(ceil(N / 64), 1, 1) before the list runs.
@@ -1779,6 +2138,11 @@ unsafe fn prelude_scale_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignat
     prelude_pipeline(dev, PRELUDE_SCALE_HLSL, PRELUDE_SCALE_DRED_LABEL, &CACHE)
 }
 
+unsafe fn prelude_draw_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: ArgsPipelines = Mutex::new(None);
+    prelude_pipeline(dev, PRELUDE_DRAW_GUARD_HLSL, PRELUDE_DRAW_DRED_LABEL, &CACHE)
+}
+
 unsafe fn prelude_heap_root_signature(dev: &ID3D12Device) -> Result<ID3D12RootSignature, String> {
     let params: [D3D12_ROOT_PARAMETER1; 2] = std::array::from_fn(|reg| D3D12_ROOT_PARAMETER1 {
         ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
@@ -1841,6 +2205,27 @@ unsafe fn prelude_scale_heap_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootS
     prelude_heap_pipeline(dev, PRELUDE_SCALE_HEAP_HLSL, PRELUDE_SCALE_DRED_LABEL, &CACHE)
 }
 
+unsafe fn prelude_draw_heap_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: ArgsPipelines = Mutex::new(None);
+    prelude_heap_pipeline(dev, PRELUDE_DRAW_GUARD_HEAP_HLSL, PRELUDE_DRAW_DRED_LABEL, &CACHE)
+}
+
+unsafe fn guard_draw_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: ArgsPipelines = Mutex::new(None);
+    args_pipeline(dev, GUARD_DRAW_ARGS_HLSL, GUARD_DRAW_DRED_LABEL, false, &CACHE)
+}
+
+unsafe fn guard_draw_heap_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: ArgsPipelines = Mutex::new(None);
+    heap_args_pipeline(dev, GUARD_DRAW_ARGS_HEAP_HLSL, GUARD_DRAW_DRED_LABEL, 5, &[0], &CACHE)
+}
+
+/// `XCL_INDIRECT_DRAW_GUARD=0`: skip indirect Draw/DrawIndexed vertex-count clamping.
+fn indirect_draw_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_INDIRECT_DRAW_GUARD").map_or(true, |v| v.trim() != "0"))
+}
+
 /// Allocate `bytes` in `State::prelude_scratch` (disjoint from inline ping-pong scratch so the
 /// prelude leaves these buffers in `INDIRECT_ARGUMENT` for the entire main segment).
 unsafe fn alloc_prelude_scratch(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, u64, usize), String> {
@@ -1890,9 +2275,9 @@ unsafe fn alloc_prelude_scratch(this: *mut c_void, dev: &ID3D12Device, bytes: u6
 /// `io` (`u0`) uploads and hoisted indirect-argument clamp/scale jobs for `seg` before `seg`
 /// executes on the queue.
 pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
-    let (already, io_copies, bufs, guards, scales) = with(seg, |s| {
+    let (already, io_copies, bufs, guards, scales, draws) = with(seg, |s| {
         if let Some(ref built) = s.prelude_built {
-            return (Some(built.as_raw()), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            return (Some(built.as_raw()), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         }
         let io_copies: Vec<(ID3D12Resource, ID3D12Resource, u64)> = s
             .io_blocks
@@ -1900,15 +2285,15 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
             .filter(|b| b.used > 0)
             .map(|b| (b.vram.clone(), b.upload.clone(), b.used))
             .collect();
-        if io_copies.is_empty() && s.prelude_guards.is_empty() && s.prelude_scales.is_empty() {
-            return (None, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        if io_copies.is_empty() && s.prelude_guards.is_empty() && s.prelude_scales.is_empty() && s.prelude_draws.is_empty() {
+            return (None, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         }
-        (None, io_copies, s.prelude_bufs.clone(), s.prelude_guards.clone(), s.prelude_scales.clone())
+        (None, io_copies, s.prelude_bufs.clone(), s.prelude_guards.clone(), s.prelude_scales.clone(), s.prelude_draws.clone())
     });
     if let Some(p) = already {
         return Some(p);
     }
-    if io_copies.is_empty() && guards.is_empty() && scales.is_empty() {
+    if io_copies.is_empty() && guards.is_empty() && scales.is_empty() && draws.is_empty() {
         return None;
     }
     let run = (|| -> Result<ID3D12GraphicsCommandList, String> {
@@ -1979,7 +2364,7 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
             }
         }
 
-        if !guards.is_empty() || !scales.is_empty() {
+        if !guards.is_empty() || !scales.is_empty() || !draws.is_empty() {
             let u = crate::gpu::uma::get().ok_or("no unified memory")?;
             let win_vas = with(seg, |s| -> Result<[u64; 4], String> {
                 if s.uma_windows.as_ref().is_none_or(Vec::is_empty) {
@@ -2103,6 +2488,33 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
                 }
             }
 
+            // 3b. Emit batched indirect draw-guard dispatches grouped by prelude scratch buffer.
+            if !draws.is_empty() {
+                let (rs, pso) = if shared_heap.is_some() { prelude_draw_heap_pipeline(&dev)? } else { prelude_draw_pipeline(&dev)? };
+                list.SetComputeRootSignature(&rs);
+                if shared_heap.is_none() {
+                    bind_windows(&list);
+                }
+                list.SetPipelineState(&pso);
+                for (buf_idx, buf) in bufs.iter().enumerate() {
+                    let batch: Vec<&PreludeDrawJob> = draws.iter().filter(|j| j.buf_idx == buf_idx).collect();
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    let dst_va = buf.GetGPUVirtualAddress();
+                    list.SetComputeRootUnorderedAccessView(1, dst_va);
+                    for chunk in batch.chunks(65_535) {
+                        let mut words = Vec::with_capacity(chunk.len() * 8);
+                        for j in chunk {
+                            words.extend_from_slice(&[j.count, j.stride, j.draw_offset, j.src_win, j.src_off, j.dst_off, 0, 0]);
+                        }
+                        let jobs_va = upload_words(&words)?;
+                        list.SetComputeRootUnorderedAccessView(0, jobs_va);
+                        list.Dispatch(chunk.len() as u32, 1, 1);
+                    }
+                }
+            }
+
             // 4. Transition all prelude scratch buffers UAV -> GUARDED_ARGS_STATE (plus global UAV
             // barrier if any guard jobs wrote `IO_GROUP_LIMIT` into UMA).
             let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(bufs.len() + usize::from(!guards.is_empty()));
@@ -2140,14 +2552,14 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
             s.prelude_owned = Some((alloc, list.clone(), dev_key, ty.0));
             s.prelude_built = Some(list.clone());
         });
-        if !guards.is_empty() || !scales.is_empty() {
+        if !guards.is_empty() || !scales.is_empty() || !draws.is_empty() {
             static BATCHES: AtomicU64 = AtomicU64::new(0);
             static TOTAL_JOBS: AtomicU64 = AtomicU64::new(0);
-            let n_jobs = (guards.len() + scales.len()) as u64;
+            let n_jobs = (guards.len() + scales.len() + draws.len()) as u64;
             let b = BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
             let tot = TOTAL_JOBS.fetch_add(n_jobs, Ordering::Relaxed) + n_jobs;
             if b == 1 || (b.is_power_of_two() && b >= 16) {
-                crate::xlog_info!("D3D12.X: indirect prelude batch #{b} ({} guard + {} scale jobs, {tot} hoisted total)", guards.len(), scales.len());
+                crate::xlog_info!("D3D12.X: indirect prelude batch #{b} ({} guard + {} scale + {} draw jobs, {tot} hoisted total)", guards.len(), scales.len(), draws.len());
             }
         }
         if !io_copies.is_empty() {
@@ -2326,7 +2738,7 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
                             std::ptr::copy_nonoverlapping(hdr.as_ptr(), jobs_p as *mut u32, hdr.len());
                             std::ptr::copy_nonoverlapping(rec0.as_ptr(), (jobs_p as usize + 16) as *mut u32, rec0.len());
                             let (rs, pso) = if use_heap {
-                                super::list_x::ensure_view_heap(this);
+                                ensure_heaps_cached(this);
                                 prelude_guard_heap_pipeline(&dev)?
                             } else {
                                 prelude_guard_pipeline(&dev)?
@@ -2369,7 +2781,7 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         if let Some((src_slot, src_off)) = uma_heap_slot_off(u, src, 12) {
             let (rs, pso) = guard_indirect_heap_pipeline(&dev)?;
             let consts = [src_slot, src_off, most_groups(), lim_off];
-            super::list_x::ensure_view_heap(this);
+            ensure_heaps_cached(this);
             // the title's writes of the arguments before this (`fresh_indirect_arguments`)
             emit_uav_and_transition(list, &dst, prev_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             list.SetComputeRootSignature(&rs);
@@ -2406,6 +2818,101 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     // Transition scratch to INDIRECT_ARGUMENT | NON_PIXEL_SHADER_RESOURCE and flush the
     // `IO_GROUP_LIMIT` store in `dispatch_io_va`.
     emit_transition_and_uav(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, GUARDED_ARGS_STATE);
+    with(this, |s| {
+        s.scratch[slot].state = GUARDED_ARGS_STATE;
+        s.pc_abi_cs = AbiBound::default();
+        s.arg_order_clean = true;
+    });
+    Ok((dst, dst_off))
+}
+
+/// Guard `max` indirect Draw/DrawIndexed command records at UMA address `src` (`stride` bytes
+/// each, draw arguments at `draw_offset`), zeroing any record with `>= 2^23` vertices per
+/// instance or `> 2^26` total vertices. Hoists into the batched prelude list when safe, else
+/// executes inline into ping-pong scratch.
+unsafe fn guard_draw_args(
+    this: *mut c_void,
+    list: &ID3D12GraphicsCommandList,
+    src: usize,
+    max: u32,
+    stride: u32,
+    draw_offset: u32,
+) -> Result<(ID3D12Resource, u64), String> {
+    if super::list_x::tracked_list_type(this) == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+        return Err("command bundles cannot record indirect argument barriers".into());
+    }
+    if max == 0 || stride == 0 || stride % 4 != 0 || draw_offset % 4 != 0 || draw_offset.checked_add(16).is_none_or(|e| e > stride) {
+        return Err(format!("invalid indirect draw layout (max {max}, stride {stride}, offset {draw_offset})"));
+    }
+    let commands = (max as u64).checked_mul(stride as u64).ok_or("indirect draw command span overflow")?;
+    if commands > u32::MAX as u64 {
+        return Err("indirect draw command buffer exceeds 32-bit offsets".into());
+    }
+    let dev = super::real::list_device(this).ok_or("no device")?;
+    let u = crate::gpu::uma::get().ok_or("no unified memory")?;
+    super::real::uma_window_buffer(src, commands as usize).ok_or("the indirect draw arguments are not in one memory window")?;
+    if can_hoist_prelude(this) {
+        if let Some((src_win, src_off)) = uma_win_off(u, src, commands as usize) {
+            let (dst, dst_off, buf_idx) = alloc_prelude_scratch(this, &dev, commands)?;
+            if let Ok(dst_off32) = u32::try_from(dst_off) {
+                if dst_off32.checked_add(commands as u32).is_some() {
+                    with(this, |s| {
+                        s.prelude_draws.push(PreludeDrawJob {
+                            buf_idx,
+                            dst_off: dst_off32,
+                            count: max,
+                            stride,
+                            draw_offset,
+                            src_win,
+                            src_off,
+                        });
+                    });
+                    return Ok((dst, dst_off));
+                }
+            }
+        }
+    }
+    with(this, |s| s.inline_guard = None);
+    let (dst, dst_off, slot, prev_state) = scratch_args_pingpong(this, &dev, commands)?;
+    let dst_va = dst.GetGPUVirtualAddress() + dst_off;
+    if super::console_heap::window_views_ready() {
+        if let Some((src_slot, src_off)) = uma_heap_slot_off(u, src, commands as usize) {
+            let (rs, pso) = guard_draw_heap_pipeline(&dev)?;
+            let consts = [max, stride, draw_offset, src_slot, src_off];
+            ensure_heaps_cached(this);
+            emit_uav_and_transition(list, &dst, prev_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            list.SetComputeRootSignature(&rs);
+            list.SetPipelineState(&pso);
+            list.SetComputeRoot32BitConstants(0, consts.len() as u32, consts.as_ptr() as *const c_void, 0);
+            list.SetComputeRootUnorderedAccessView(1, dst_va);
+            list.Dispatch(max.div_ceil(64), 1, 1);
+            emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, GUARDED_ARGS_STATE);
+            with(this, |s| {
+                s.scratch[slot].state = GUARDED_ARGS_STATE;
+                s.pc_abi_cs = AbiBound::default();
+                s.arg_order_clean = true;
+            });
+            return Ok((dst, dst_off));
+        }
+    }
+    let (rs, pso) = guard_draw_pipeline(&dev)?;
+    let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
+    let (src_base, src_off) = align_root_uav(src_va)?;
+    if (src_off as u64).checked_add(commands).is_none_or(|end| end > u32::MAX as u64) {
+        return Err("indirect draw command range exceeds 32-bit shader offsets".into());
+    }
+    let consts = [max, stride, draw_offset, src_off];
+    let p = with(this, |s| s.arena.take(u, std::mem::size_of_val(&consts), 256, &mut s.uma)).ok_or("unified memory is full")?;
+    std::ptr::copy_nonoverlapping(consts.as_ptr().cast::<u8>(), p, std::mem::size_of_val(&consts));
+    let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
+    emit_uav_and_transition(list, &dst, prev_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list.SetComputeRootSignature(&rs);
+    list.SetPipelineState(&pso);
+    list.SetComputeRootUnorderedAccessView(0, consts_va);
+    list.SetComputeRootUnorderedAccessView(1, src_base);
+    list.SetComputeRootUnorderedAccessView(2, dst_va);
+    list.Dispatch(max.div_ceil(64), 1, 1);
+    emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, GUARDED_ARGS_STATE);
     with(this, |s| {
         s.scratch[slot].state = GUARDED_ARGS_STATE;
         s.pc_abi_cs = AbiBound::default();
@@ -2697,7 +3204,7 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
             if let Some((has_cnt, cnt_slot, cnt_off)) = cnt_loc {
                 let (rs, pso) = scale_indirect_heap_pipeline(&dev)?;
                 let consts = [max, stride, mesh_offset, split, cap, src_slot, src_off, has_cnt, cnt_slot, cnt_off];
-                super::list_x::ensure_view_heap(this);
+                ensure_heaps_cached(this);
                 // the title's writes of the arguments before this (`fresh_indirect_arguments`)
                 emit_uav_and_transition(list, &dst, prev_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 list.SetComputeRootSignature(&rs);
@@ -2992,7 +3499,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         }
         return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
     }
-    if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
+    if ROOT_SIGNATURES.read().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         if gfx {
             note_skipped_indirect(this, sig);
         }
@@ -3003,8 +3510,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-    // Guard single-command indirect dispatches before binding or chaining so both `record_slicer`
-    // and the PC `ExecuteIndirect` read clamped, >65535 X-folded arguments from a committed buffer.
+    // Guard single-command indirect dispatches and indirect Draw/DrawIndexed buffers before
+    // binding or chaining so out-of-range GPU-written counts are clamped/zeroed in scratch.
     let mut guarded = None;
     let mut preset_io = None;
     if compute && max == 1 && indirect_guard() && signature_dispatches(sig) {
@@ -3028,6 +3535,23 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, Ordering::Relaxed) < 4 {
                         crate::xlog_warn!("D3D12.X: ExecuteIndirect's group counts are not checked: {e}");
+                    }
+                }
+            }
+        }
+    } else if gfx && indirect_guard() && indirect_draw_guard() {
+        if let Some(dsig) = draw_sig_of(sig) {
+            let _ = dsig.indexed;
+            if let Some(commands) = (max as usize).checked_mul(dsig.byte_stride as usize) {
+                if let Some((p, _)) = commands_at.filter(|&(_, n)| commands > 0 && commands <= n) {
+                    match guard_draw_args(this, list, p, max, dsig.byte_stride, dsig.draw_offset) {
+                        Ok(g) => guarded = Some(g),
+                        Err(e) => {
+                            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                                crate::xlog_warn!("D3D12.X: ExecuteIndirect's draw counts are not checked: {e}");
+                            }
+                        }
                     }
                 }
             }
@@ -3129,7 +3653,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             count(if gfx { DRAWS } else { DISPATCHES });
             // an indirect dispatch: its groups are in the argument buffer (`max` of them)
             let mark = if gfx { 0 } else { super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [0, 0, max]) };
-            if guarded.is_some() {
+            if guarded.is_some() && count_buf == 0 {
                 pc(this, sig, max, args, args_off, count_buf, count_off);
             } else {
                 fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
@@ -3176,7 +3700,7 @@ unsafe fn chained_indirect(
     preset_io: Option<u64>,
     ei: impl FnOnce(),
 ) -> Result<bool, String> {
-    let Some(stride) = DISPATCH_ONLY.lock().unwrap().as_ref().and_then(|m| m.get(&sig).copied()) else {
+    let Some(stride) = DISPATCH_ONLY.read().unwrap().as_ref().and_then(|m| m.get(&sig).copied()) else {
         return Ok(false);
     };
     let args_va = match guarded {
@@ -3458,54 +3982,59 @@ fn pso_for_draw(pso: usize) -> usize {
 /// translation, or no unified memory).
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
-    let pso = with(this, |s| s.pso);
-    // a pipeline still being built in the background is not waited for (`pso_for_draw`)
-    let real = pso_for_draw(pso);
-    if !super::real::is_translated_graphics(real) {
-        // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
-        // TWO_PASS rather than TRANSLATED_GRAPHICS. Binding the title's graphics RS and issuing
-        // DrawInstanced / DrawIndexedInstanced against a mesh PSO invalidates the command list
-        // (Close → E_INVALIDARG).
-        if let Some(tp) = super::real::two_pass_of(real) {
-            super::list_x::note_dropped_draw(this);
-            count(DRAWS_SKIPPED);
-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!(
-                    "D3D12.X: draw with two-pass {} pipeline ({real:#x}) skipped – PC pipeline is a mesh shader",
-                    tp.kind
-                );
+    let (pso, cached_gfx) = with(this, |s| {
+        let hit = s.pso_abi_cache.is_some_and(|c| c.query_pso == s.pso && c.is_gfx);
+        (s.pso, hit)
+    });
+    if !cached_gfx {
+        // a pipeline still being built in the background is not waited for (`pso_for_draw`)
+        let real = pso_for_draw(pso);
+        if !super::real::is_translated_graphics(real) {
+            // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
+            // TWO_PASS rather than TRANSLATED_GRAPHICS. Binding the title's graphics RS and issuing
+            // DrawInstanced / DrawIndexedInstanced against a mesh PSO invalidates the command list
+            // (Close → E_INVALIDARG).
+            if let Some(tp) = super::real::two_pass_of(real) {
+                super::list_x::note_dropped_draw(this);
+                count(DRAWS_SKIPPED);
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::xlog_warn!(
+                        "D3D12.X: draw with two-pass {} pipeline ({real:#x}) skipped – PC pipeline is a mesh shader",
+                        tp.kind
+                    );
+                }
+                return None;
             }
-            return None;
-        }
-        count(DRAWS_PC);
-        if super::present::trace_frame() {
-            // which pipelines draw without a translation (first 12 distinct)
-            static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-            let mut g = SEEN.lock().unwrap();
-            if !g.contains(&pso) && g.len() < 12 {
-                g.push(pso);
-                let real = super::pso_async::resolve(pso);
-                crate::xlog_info!(
-                    "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
-                    super::pso_async::is_pending(pso),
-                    super::real::two_pass_of(real).is_some(),
-                    super::present::rt0_resource(this as usize).map(|r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0) }))
-                );
+            count(DRAWS_PC);
+            if super::present::trace_frame() {
+                // which pipelines draw without a translation (first 12 distinct)
+                static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+                let mut g = SEEN.lock().unwrap();
+                if !g.contains(&pso) && g.len() < 12 {
+                    g.push(pso);
+                    let real = super::pso_async::resolve(pso);
+                    crate::xlog_info!(
+                        "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
+                        super::pso_async::is_pending(pso),
+                        super::real::two_pass_of(real).is_some(),
+                        super::present::rt0_resource(this as usize).map(|r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0) }))
+                    );
+                }
             }
+            // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
+            // the title's root signature, which nothing else binds on the PC list – a draw without
+            // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
+            if super::pso_async::is_stand_in(pso) {
+                super::list_x::note_dropped_draw(this);
+            }
+            let rs = with(this, |s| s.rs_gfx) as *mut c_void;
+            if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
+                list.SetGraphicsRootSignature(r);
+                with(this, |s| s.pc_abi_gfx = AbiBound::default());
+            }
+            return Some(list);
         }
-        // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
-        // the title's root signature, which nothing else binds on the PC list – a draw without
-        // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
-        if super::pso_async::is_stand_in(pso) {
-            super::list_x::note_dropped_draw(this);
-        }
-        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
-        if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
-            list.SetGraphicsRootSignature(r);
-            with(this, |s| s.pc_abi_gfx = AbiBound::default());
-        }
-        return Some(list);
     }
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
@@ -3749,8 +4278,14 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
 pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_void, rs: *mut c_void) {
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
-        if !console_list::same_layout(&s.layout, &layout) {
-            s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        let same = console_list::same_layout(&s.layout, &layout);
+        if same && s.rs_cs == rs as usize {
+            return;
+        }
+        if !same {
+            let size = layout.as_ref().map_or(0, |l| l.size as usize);
+            s.args.clear();
+            s.args.resize(size, 0);
         }
         s.layout = layout;
         s.rs_cs = rs as usize;
@@ -3771,9 +4306,14 @@ pub(super) unsafe extern "system" fn set_compute_root_constant(this: *mut c_void
 
 /// #39 SetComputeRoot32BitConstants (PC #35)
 pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
-    if !data.is_null() {
-        let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
-        put(this, i, offset, &bytes);
+    if !data.is_null() && n > 0 {
+        #[cfg(target_endian = "little")]
+        let bytes = std::slice::from_raw_parts(data.cast::<u8>(), (n as usize).saturating_mul(4));
+        #[cfg(not(target_endian = "little"))]
+        let bytes_vec: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
+        #[cfg(not(target_endian = "little"))]
+        let bytes = bytes_vec.as_slice();
+        put(this, i, offset, bytes);
     }
 }
 
@@ -3787,7 +4327,12 @@ pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_vo
 
 /// #25 SetPipelineState: noted, then bound as on the PC
 pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
-    with(this, |s| s.pso = pso as usize);
+    with(this, |s| {
+        if s.pso != pso as usize {
+            s.pso = pso as usize;
+            s.pso_abi_cache = None;
+        }
+    });
     super::real::bind_pipeline(this, pso);
 }
 
@@ -3984,23 +4529,10 @@ unsafe fn alloc_fresh_compute_io(this: *mut c_void, pso: usize) -> Result<(u64, 
         }
         let windows = s.uma_windows.as_deref().unwrap();
         let first = windows[0];
-        let layout = s.layout.as_deref();
-        let args = s.args.as_slice();
-        let inline = layout.map_or(0, |l| console_list::inline_for(l, user_sgprs) as usize).min(args.len());
-        let tail = &args[inline..];
-        let table_p = s.arena.take(u, tail.len().max(16), 256, &mut s.uma).ok_or("unified memory is full")?;
-        if !tail.is_empty() {
-            std::ptr::copy_nonoverlapping(tail.as_ptr(), table_p, tail.len());
-        }
-        let table_at = table_p as u64;
-        let mut io = match layout {
-            Some(l) => console_list::with_heaps(l, user_sgprs, console_list::user_data_for(l, user_sgprs, args, table_at), s.heaps),
-            None => vec![table_at as u32, (table_at >> 32) as u32],
-        };
-        io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
-        io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
-        io[crate::gpu::recomp::IO_GROUP_LIMIT] = 0;
-        let io_bytes = io.len() * 4;
+        let inline = s.layout.as_deref().map_or(0, |l| console_list::inline_for(l, user_sgprs) as usize).min(s.args.len());
+        let table_at = upload_arg_table(u, &mut s.arena, &mut s.uma, &mut s.dummy_table_p, &s.args[inline..])?;
+        let io = fill_io_compute(s.layout.as_deref(), user_sgprs, s.args.as_slice(), table_at, s.heaps, u.base(), 0);
+        let io_bytes = std::mem::size_of_val(&io);
         let io_p = s.arena.take(u, io_bytes.max(16), 256, &mut s.uma).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(io.as_ptr().cast::<u8>(), io_p, io_bytes);
         Ok((uma_va_in(u, windows, io_p as usize).unwrap_or(first), io_p as usize))
@@ -4012,20 +4544,52 @@ unsafe fn alloc_fresh_compute_io(this: *mut c_void, pso: usize) -> Result<(u64, 
 /// memory, u1 res, u2… the memory windows; then the pipeline. `group_limit`: a folded
 /// dispatch's group count in X (`recomp::IO_GROUP_LIMIT`), 0 for any other.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, group_limit: u32, preset_io_va: Option<u64>) -> Result<(), String> {
-    super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
-    // a pipeline still being built in the background is waited for
-    let real = super::pso_async::resolve_wait(pso);
-    // a compute shader takes no more arguments from registers than it has (`inline_for`)
-    let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
-    let rs_raw = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
+    let (need_heaps, cached_pso, need_io_dev) = with(this, |s| {
+        let c = s.pso_abi_cache.filter(|c| c.query_pso == pso && c.is_gfx == gfx);
+        let io_hit = preset_io_va.is_some()
+            || (group_limit == 0
+                && if gfx {
+                    s.io_cache_gfx.is_some_and(|(gen, _)| gen == s.args_gen_gfx)
+                } else {
+                    c.is_some_and(|ci| s.io_cache_cs.is_some_and(|(gen, sg, _)| gen == s.args_gen_cs && sg == ci.user_sgprs))
+                });
+        (!s.heaps_ensured, c, (!io_hit || s.dummy_res_va == 0) && s.vram_io_dev.is_none())
+    });
+    if need_heaps {
+        ensure_heaps_cached(this);
+    }
+    let (real, user_sgprs, rs_raw, store_pso_cache) = match cached_pso {
+        Some(c) => (c.real_pso, c.user_sgprs, c.rs_raw, false),
+        None => {
+            // a pipeline still being built in the background is waited for
+            let real = super::pso_async::resolve_wait(pso);
+            // a compute shader takes no more arguments from registers than it has (`inline_for`)
+            let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
+            let rs_raw = super::real::pso_root_signature(real)
+                .or_else(|| super::real::abi_rs_cached().map(|p| p as usize))
+                .ok_or("no XCL ABI root signature")?;
+            (real, user_sgprs, rs_raw, true)
+        }
+    };
+    if need_io_dev {
+        let _ = ensure_vram_io_dev(this);
+    }
     let rs_ptr = rs_raw as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs_ptr).ok_or("root signature")?;
     let real_ptr = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real_ptr).ok_or("pipeline")?;
 
-    let io_dev = vram_io_device(this);
     let (set_rs, uav_mask, views) = with(this, |s| -> Result<(bool, u8, [u64; 6]), String> {
+        if store_pso_cache {
+            s.pso_abi_cache = Some(CachedPsoAbi {
+                query_pso: pso,
+                real_pso: real,
+                rs_raw,
+                user_sgprs,
+                is_gfx: gfx,
+            });
+        }
         if s.uma_windows.as_ref().is_none_or(Vec::is_empty) {
             let w = super::real::uma_window_vas();
             if w.is_empty() {
@@ -4045,7 +4609,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         // Runtime VS/PS/CS shaders never write to `u1` (`res`), so one zeroed 256-byte slot
         // per recording suffices across all `bind_abi` draws and dispatches.
         if s.dummy_res_va == 0 {
-            s.dummy_res_va = match io_dev.as_ref().and_then(|dev| alloc_vram_io_in(&mut s.io_blocks, s.allocator, s.prelude_built.is_some(), dev, &[0u8; 256])) {
+            s.dummy_res_va = match s.vram_io_dev.as_ref().and_then(|o| o.as_ref()).and_then(|dev| alloc_vram_io_in(&mut s.io_blocks, s.allocator, s.prelude_built.is_some(), &dev.0, &[0u8; 256])) {
                 Some(va) => va,
                 None => {
                     let p = s.arena.take(u, 256, 256, &mut s.uma).ok_or("unified memory is full")?;
@@ -4069,26 +4633,23 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
             if let Some(va) = cached_io {
                 va
             } else {
-                let (layout, args) = if gfx { (s.layout_gfx.as_deref(), s.args_gfx.as_slice()) } else { (s.layout.as_deref(), s.args.as_slice()) };
-                let inline = layout.map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
-                let tail = &args[inline..];
-                // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
-                let table_p = s.arena.take(u, tail.len().max(16), 256, &mut s.uma).ok_or("unified memory is full")?;
-                if !tail.is_empty() {
-                    std::ptr::copy_nonoverlapping(tail.as_ptr(), table_p, tail.len());
-                }
-                let table_at = table_p as u64;
-                let mut io = match layout {
-                    Some(l) if gfx => console_list::with_heaps(l, None, console_list::user_data_gfx(l, args, table_at), s.heaps),
-                    Some(l) => console_list::with_heaps(l, user_sgprs, console_list::user_data_for(l, user_sgprs, args, table_at), s.heaps),
-                    None => vec![table_at as u32, (table_at >> 32) as u32],
+                let tail = if gfx {
+                    let inline = s.layout_gfx.as_deref().map_or(0, |l| l.inline_gfx as usize).min(s.args_gfx.len());
+                    &s.args_gfx[inline..]
+                } else {
+                    let inline = s.layout.as_deref().map_or(0, |l| console_list::inline_for(l, user_sgprs) as usize).min(s.args.len());
+                    &s.args[inline..]
                 };
-                io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
-                io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
-                io[crate::gpu::recomp::IO_GROUP_LIMIT] = group_limit;
-                let io_bytes = io.len() * 4;
+                // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
+                let table_at = upload_arg_table(u, &mut s.arena, &mut s.uma, &mut s.dummy_table_p, tail)?;
+                let io = if gfx {
+                    fill_io_gfx(s.layout_gfx.as_deref(), s.args_gfx.as_slice(), table_at, s.heaps, u.base())
+                } else {
+                    fill_io_compute(s.layout.as_deref(), user_sgprs, s.args.as_slice(), table_at, s.heaps, u.base(), group_limit)
+                };
+                let io_bytes = std::mem::size_of_val(&io);
                 let io_slice = std::slice::from_raw_parts(io.as_ptr().cast::<u8>(), io_bytes);
-                let va = match io_dev.as_ref().and_then(|dev| alloc_vram_io_in(&mut s.io_blocks, s.allocator, s.prelude_built.is_some(), dev, io_slice)) {
+                let va = match s.vram_io_dev.as_ref().and_then(|o| o.as_ref()).and_then(|dev| alloc_vram_io_in(&mut s.io_blocks, s.allocator, s.prelude_built.is_some(), &dev.0, io_slice)) {
                     Some(va) => va,
                     None => {
                         let io_p = s.arena.take(u, io_bytes.max(16), 256, &mut s.uma).ok_or("unified memory is full")?;
@@ -4139,11 +4700,12 @@ pub(super) fn counts_snapshot() -> [u64; 5] {
 
 #[cfg(test)]
 pub(super) fn tracked_pso(list: *mut c_void) -> usize {
-    STATES
+    let key = list as usize;
+    STATES[state_shard(key)]
         .lock()
         .unwrap()
         .as_ref()
-        .and_then(|m| m.get(&(list as usize)))
+        .and_then(|m| m.get(&key))
         .map_or(0, |s| s.pso)
 }
 
@@ -4151,14 +4713,16 @@ pub(super) fn tracked_pso(list: *mut c_void) -> usize {
 /// PC root signatures after an internal graphics/compute sync pass (invalidating cached PC ABI
 /// root bindings since the internal pass clobbered them).
 pub(super) fn tracked_root_sigs(list: *mut c_void) -> (usize, usize) {
-    STATES
+    let key = list as usize;
+    STATES[state_shard(key)]
         .lock()
         .unwrap()
         .as_mut()
-        .and_then(|m| m.get_mut(&(list as usize)))
+        .and_then(|m| m.get_mut(&key))
         .map_or((0, 0), |s| {
             s.pc_abi_gfx = AbiBound::default();
             s.pc_abi_cs = AbiBound::default();
+            s.heaps_ensured = false;
             (s.rs_gfx, s.rs_cs)
         })
 }
@@ -4687,7 +5251,7 @@ void main(uint t : SV_GroupIndex) {
     #[test]
     fn a_command_signature_made_at_a_freed_ones_address_does_not_keep_its_kind() {
         let sig = 0x7230_00F0usize;
-        let changing = |s: usize| ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|set| set.contains(&s));
+        let changing = |s: usize| ROOT_SIGNATURES.read().unwrap().as_ref().is_some_and(|set| set.contains(&s));
         note_root_changing_signature(sig, true);
         assert!(changing(sig));
         // the signature is freed; a simple one is made at its address
@@ -4996,7 +5560,7 @@ void main(uint t : SV_GroupIndex) {
             dispatch_mesh_sig_of(sig),
             Some(DispatchMeshSig { companion_dispatch: companion, byte_stride: 28, mesh_offset: 16 })
         );
-        DISPATCH_MESH_SIGS.lock().unwrap().as_mut().unwrap().remove(&sig);
+        DISPATCH_MESH_SIGS.write().unwrap().as_mut().unwrap().remove(&sig);
         assert_eq!(dispatch_mesh_sig_of(sig), None);
     }
 
@@ -6043,5 +6607,82 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             assert_eq!(&out[0x300 / 4..0x300 / 4 + 8], &[0, 0, 1, 1, 0, 0, 1, 1], "unmapped scale reads zero safely");
             rb.Unmap(0, None);
         }
+    }
+
+    #[test]
+    fn stack_io_builders_match_console_list_user_data_bit_for_bit() {
+        let layout = console_list::layout_from_blob(&test_rts0_blob()).expect("test layout");
+        let args = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC];
+        let table_at = 0x1234_5678_9ABC_DEF0u64;
+        let heaps = [0x0010_0000u32, 0x0020_0000u32];
+        let uma_base = 0x0000_007F_0000_0000usize;
+
+        let mut want_gfx = console_list::with_heaps(&layout, None, console_list::user_data_gfx(&layout, &args, table_at), heaps);
+        want_gfx.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+        want_gfx[crate::gpu::recomp::IO_UMA_BASE_HI] = (uma_base as u64 >> 32) as u32;
+        assert_eq!(fill_io_gfx(Some(&layout), &args, table_at, heaps, uma_base).as_slice(), want_gfx.as_slice());
+
+        for user_sgprs in [None, Some(4), Some(8), Some(16)] {
+            let mut want_cs = console_list::with_heaps(&layout, user_sgprs, console_list::user_data_for(&layout, user_sgprs, &args, table_at), heaps);
+            want_cs.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+            want_cs[crate::gpu::recomp::IO_UMA_BASE_HI] = (uma_base as u64 >> 32) as u32;
+            want_cs[crate::gpu::recomp::IO_GROUP_LIMIT] = 115_200;
+            assert_eq!(
+                fill_io_compute(Some(&layout), user_sgprs, &args, table_at, heaps, uma_base, 115_200).as_slice(),
+                want_cs.as_slice(),
+                "compute user_sgprs={user_sgprs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn idempotent_root_signature_preserves_io_cache_and_zero_alloc_constants_write_exact_words() {
+        let list = 0x7600_9001usize as *mut c_void;
+        let rs_key = 0x7600_9010usize;
+        console_list::note_root_signature(rs_key, &test_rts0_blob());
+        reset(list, 0x7600_9100, 0);
+        unsafe {
+            set_graphics_root_signature(list, rs_key as *mut c_void);
+            let words = [0x1122_3344u32, 0x5566_7788u32];
+            set_graphics_root_constants(list, 0, 2, words.as_ptr(), 0);
+        }
+        let gen1 = with(list, |s| {
+            assert_eq!(&s.args_gfx[..8], &[0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]);
+            s.io_cache_gfx = Some((s.args_gen_gfx, 0x8888_0000));
+            s.args_gen_gfx
+        });
+        // Re-binding the exact same graphics root signature preserves args_gen and io_cache.
+        unsafe { set_graphics_root_signature(list, rs_key as *mut c_void); }
+        with(list, |s| {
+            assert_eq!(s.args_gen_gfx, gen1);
+            assert_eq!(s.io_cache_gfx, Some((gen1, 0x8888_0000)));
+        });
+        forget(list);
+    }
+
+    #[test]
+    fn indirect_draw_guard_caps_per_instance_and_total_vertices() {
+        // Zero verts or zero instances are zeroed cleanly.
+        assert!(draw_record_rejected(0, 1));
+        assert!(draw_record_rejected(100, 0));
+        assert!(draw_record_rejected(0, u32::MAX));
+        // Just below 2^23 per instance is allowed.
+        assert!(!draw_record_rejected(DRAW_VERTS_PER_INST_LIMIT - 1, 1));
+        // Exactly 2^23 (8,388,608) per instance is rejected.
+        assert!(draw_record_rejected(DRAW_VERTS_PER_INST_LIMIT, 1));
+        // Exact 2^26 (67,108,864) total vertices is allowed; 2^26 + 1 is rejected.
+        assert!(!draw_record_rejected(1 << 22, 16));
+        assert!(draw_record_rejected(1 << 22, 17));
+        assert!(!draw_record_rejected(1, DRAW_TOTAL_VERTS_MAX));
+        assert!(draw_record_rejected(1, DRAW_TOTAL_VERTS_MAX + 1));
+        // Overflowing u32 products are rejected cleanly without wraparound.
+        assert!(draw_record_rejected(1 << 20, u32::MAX));
+        assert!(draw_record_rejected(u32::MAX, u32::MAX));
+        // Draw signature note/clear avoids stale address reuse.
+        let sig = 0x7600_A001usize;
+        note_draw_signature(sig, Some((20, 0, true)));
+        assert_eq!(draw_sig_of(sig), Some(DrawSig { byte_stride: 20, draw_offset: 0, indexed: true }));
+        note_draw_signature(sig, None);
+        assert_eq!(draw_sig_of(sig), None);
     }
 }
