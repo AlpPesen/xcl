@@ -1219,11 +1219,26 @@ struct Pipelines {
     /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
     running: (Mutex<usize>, std::sync::Condvar),
+    /// Serializes cold offline compiles `>= OFFLINE_GIANT_DXIL` (900 KiB) to 1-at-a-time so
+    /// multi-threaded `--pipelines` runs never stack multiple giant driver compiles into OOM.
+    giant: Mutex<()>,
     most: usize,
     /// DXIL bytes a pipeline is still handed to the driver (`XCL_PIPELINE_MAX_KB`, 8 MiB; 0: off)
     max_dxil: usize,
     #[cfg(test)]
     cache_dir: Option<PathBuf>,
+}
+
+const OFFLINE_LOG_DXIL: usize = 256 << 10;
+const OFFLINE_GIANT_DXIL: usize = 900 << 10;
+
+fn offline_pso_trace() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_PSO_TRACE").is_ok_and(|v| v.trim() == "1"))
+}
+
+fn should_log_offline_compile_start(dxil_bytes: usize, trace: bool) -> bool {
+    trace || dxil_bytes >= OFFLINE_LOG_DXIL
 }
 
 /// `XCL_PIPELINE_MAX_KB`: the KiB of DXIL `--pipelines` still compiles (default 8 MiB; 0: no
@@ -1255,6 +1270,11 @@ mod pipeline_cap_tests {
         assert!(std_key.starts_with("c-"));
         assert_eq!(split_key, format!("s{std_key}"));
         assert_ne!(std_key, split_key);
+        assert!(!super::should_log_offline_compile_start(super::OFFLINE_LOG_DXIL - 1, false));
+        assert!(super::should_log_offline_compile_start(super::OFFLINE_LOG_DXIL, false));
+        assert!(super::should_log_offline_compile_start(128, true));
+        assert!(crate::hle::d3d12x::real::rt_gated_compute_held(b"HDR\0CS_ScreenProbes_ActivateRays\0"));
+        assert!(!crate::hle::d3d12x::real::rt_gated_compute_held(b"HDR\0CS_DepthPyramid\0"));
     }
 
     #[test]
@@ -1455,6 +1475,7 @@ impl Pipelines {
                 capped: AtomicUsize::new(0),
                 capped_bytes: AtomicUsize::new(0),
                 running: (Mutex::new(0), std::sync::Condvar::new()),
+                giant: Mutex::new(()),
                 most,
                 max_dxil,
                 #[cfg(test)]
@@ -1467,11 +1488,21 @@ impl Pipelines {
     /// into a dispatch chain of at least two pieces, each piece is built and cached under the
     /// dispatch-chain root signature (`.chain.pso`) as the runtime does (`dispatch_chain::build`),
     /// instead of the unsplit whole container.
+    #[cfg(test)]
     fn make(&self, c: &recomp::pso::Compiled) {
-        self.make_with_cache_path(c, None);
+        self.make_with_cache_path_for(c, None, 0);
     }
 
+    fn make_record(&self, c: &recomp::pso::Compiled, record: u64) {
+        self.make_with_cache_path_for(c, None, record);
+    }
+
+    #[cfg(test)]
     fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
+        self.make_with_cache_path_for(c, path_override, 0);
+    }
+
+    fn make_with_cache_path_for(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>, record: u64) {
         if path_override.is_none() {
             if let Some(chain) = c.dispatch_chain.as_deref().filter(|chain| chain.pieces.len() >= 2) {
                 self.split_programs.fetch_add(1, Ordering::Relaxed);
@@ -1479,7 +1510,7 @@ impl Pipelines {
                 let workers = chain.pieces.len().min(self.most);
                 if workers <= 1 {
                     for piece in &chain.pieces {
-                        self.make_one(piece, &c.samplers, true, None);
+                        self.make_one(piece, &c.samplers, true, None, record);
                     }
                 } else {
                     let next = AtomicUsize::new(0);
@@ -1488,7 +1519,7 @@ impl Pipelines {
                             s.spawn(|| loop {
                                 let i = next.fetch_add(1, Ordering::Relaxed);
                                 let Some(piece) = chain.pieces.get(i) else { break };
-                                self.make_one(piece, &c.samplers, true, None);
+                                self.make_one(piece, &c.samplers, true, None, record);
                             });
                         }
                     });
@@ -1496,10 +1527,10 @@ impl Pipelines {
                 return;
             }
         }
-        self.make_one(&c.dxil, &c.samplers, false, path_override);
+        self.make_one(&c.dxil, &c.samplers, false, path_override, record);
     }
 
-    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>) {
+    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>, record: u64) {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
         let rs = {
@@ -1597,8 +1628,27 @@ impl Pipelines {
             self.reused.fetch_add(1, Ordering::Relaxed);
             Ok(pso)
         } else {
+            let _giant = (dxil.len() >= OFFLINE_GIANT_DXIL).then(|| self.giant.lock().unwrap());
+            let log_start = should_log_offline_compile_start(dxil.len(), offline_pso_trace());
+            if log_start {
+                eprintln!(
+                    "  pipeline compile start: record {record:016x} ({} B DXIL{})",
+                    dxil.len(),
+                    if chained { ", split piece" } else { "" }
+                );
+            }
+            let started = std::time::Instant::now();
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
             let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+            let took = started.elapsed();
+            if log_start || took >= std::time::Duration::from_secs(2) {
+                eprintln!(
+                    "  pipeline compile finish: record {record:016x} ({} B DXIL, {} ms, {})",
+                    dxil.len(),
+                    took.as_millis(),
+                    if pso.is_ok() { "ok" } else { "refused" }
+                );
+            }
             if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
                 if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
                     let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
@@ -1660,6 +1710,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let unused = AtomicUsize::new(0);
+    let rt_gated = AtomicUsize::new(0);
     if let Some(u) = used {
         println!("--used-only: {} pipelines earlier runs used (used-pipelines.txt); compute programs of other pipelines are passed over", u.len());
     }
@@ -1701,10 +1752,16 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         done.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
+                    if crate::hle::d3d12x::real::rt_gated_compute_held(&blob) {
+                        rt_gated.fetch_add(1, Ordering::Relaxed);
+                        done.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let record = crate::gpu::shader::fnv64(&blob);
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
-                                p.make(&c);
+                                p.make_record(&c, record);
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
@@ -1776,6 +1833,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     );
     if used.is_some() {
         println!("compute programs passed over (no earlier run used their pipeline): {}", unused.into_inner());
+    }
+    let rt_gated = rt_gated.into_inner();
+    if rt_gated != 0 {
+        println!("compute programs held back by XCL_RT_GATE=hold (set XCL_RT_GATE=auto or 0 to precompile): {rt_gated}");
     }
     if let Some(p) = pipelines {
         let saved_plib = p.flush();

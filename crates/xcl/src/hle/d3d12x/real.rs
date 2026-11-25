@@ -2266,6 +2266,13 @@ fn is_rt_gated_cs(cs: &[u8]) -> bool {
         || crate::gpu::effects::uses_bvh_intersect(cs)
 }
 
+/// Whether a console compute shader container is currently held back without compiling under
+/// `XCL_RT_GATE=hold` (default). Shared by offline `xcl shaders --precompile` so prebuilds skip
+/// the exact same RT traversal and RT companion shaders that runtime holds back.
+pub(crate) fn rt_gated_compute_held(cs: &[u8]) -> bool {
+    rt_gate_mode() == RtGateMode::Hold && is_rt_gated_cs(cs)
+}
+
 fn note_bvh_traversal(pso: usize, cs: &[u8]) {
     if pso != 0 && is_rt_gated_cs(cs) {
         BVH_TRAVERSAL_PSOS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
