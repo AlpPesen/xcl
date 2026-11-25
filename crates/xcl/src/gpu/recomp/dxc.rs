@@ -917,47 +917,13 @@ pub fn in_cached_only() -> bool {
     CACHED_ONLY.with(|c| c.get())
 }
 
-thread_local! {
-    /// local: this thread translates a program of `XCL_LOOP_FILE`
-    static LOOP_LISTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// local: the record is in `XCL_LOOP_FILE` (and `XCL_LOOP_N` is set)
-pub fn loop_record(record: u64) -> bool {
-    static L: std::sync::OnceLock<std::collections::HashSet<u64>> = std::sync::OnceLock::new();
-    !L.get_or_init(|| {
-        let Some(p) = std::env::var_os("XCL_LOOP_FILE") else { return Default::default() };
-        std::fs::read_to_string(p).unwrap_or_default().lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect()
-    })
-    .is_empty()
-        && L.get().is_some_and(|l| l.contains(&record))
-        && std::env::var("XCL_LOOP_N").is_ok()
-}
-
-pub fn with_loop_budget<R>(f: impl FnOnce() -> R) -> R {
-    let before = LOOP_LISTED.with(|l| l.replace(true));
-    let r = f();
-    LOOP_LISTED.with(|l| l.set(before));
-    r
-}
-
 pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
     // LOCAL EXPERIMENT: XCL_LOOP_FOR=<text in the HLSL> XCL_LOOP_N=<budget>: the loop budget of that program alone
     let patched;
-    let listed = LOOP_LISTED.with(|l| l.get());
     let src = match (std::env::var("XCL_LOOP_FOR"), std::env::var("XCL_LOOP_N")) {
         (Ok(t), Ok(n)) if !t.is_empty() && src.contains(&t) => {
             patched = src.replacen("static uint xcl_budget = 1u << 16;", &format!("static uint xcl_budget = {n}u;"), 1);
             crate::xlog_info!("[SHADER] loop budget {n} for a program of {} B HLSL ({entry}, {profile})", src.len());
-            &patched[..]
-        }
-        (_, Ok(n)) if listed => {
-            patched = src.replacen("static uint xcl_budget = 1u << 16;", &format!("static uint xcl_budget = {n}u;"), 1);
-            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if k <= 3 || k.is_power_of_two() {
-                crate::xlog_info!("[SHADER] loop budget {n} for a listed program of {} B HLSL ({entry}, {profile}; {k} so far, {} changed)", src.len(), patched.len() != src.len() || patched != src);
-            }
             &patched[..]
         }
         _ => src,

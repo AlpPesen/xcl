@@ -151,11 +151,6 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
-    // local: `XCL_LOOP_FILE` (records, 16 hex digits a line) translate past the caches with
-    // `XCL_LOOP_N` iterations a lane
-    if dxc::loop_record(crate::gpu::shader::fnv64(blob)) {
-        return dxc::with_loop_budget(|| compile_one()).map(|(c, _)| c);
-    }
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one().map(|(c, _)| c);
     }
