@@ -351,6 +351,9 @@ impl Lw {
         if name.starts_with("v_pk_") || name.starts_with("v_dot") {
             return self.valu_pk(d, name);
         }
+        if matches!(name, "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" | "v_mqsad_u32_u8") {
+            return self.valu_qsad(d, name);
+        }
         if name.starts_with("v_movrel") {
             return self.movrel(d, name);
         }
@@ -1290,10 +1293,14 @@ impl Lw {
             "f32" => {
                 let a = self.fsrc(m, 0, ua);
                 if opn == "class" {
-                    let cls = self.fclass(a);
-                    let s = self.bin(BinOp::LShr, ub, cls);
-                    let s = self.andc(s, 1);
-                    self.nz(s)
+                    if let Some(k) = self.s.m.const_u64(ub) {
+                        self.fclass_const(a, (k & 0x3FF) as u32)
+                    } else {
+                        let cls = self.fclass(a);
+                        let s = self.bin(BinOp::LShr, ub, cls);
+                        let s = self.andc(s, 1);
+                        self.nz(s)
+                    }
                 } else {
                     let b = self.fsrc(m, 1, ub);
                     self.float_compare(opn, a, b).ok_or_else(|| format!("{}: VOPC f32", rdna2::format(d)))?

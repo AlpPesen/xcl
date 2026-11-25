@@ -1014,6 +1014,81 @@ impl Lw {
         Ok(())
     }
 
+    /// Quad-byte SAD (`v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`, `v_mqsad_u32_u8`), as the HLSL
+    /// backend's `valu_qsad` (recomp/emit.rs): the 4-byte pattern in SRC1 against bytes 0..3,
+    /// 1..4, 2..5 and 3..6 of the 64-bit SRC0 (`mqsad` skips SRC1's zero bytes), each SAD added
+    /// to its element of SRC2 (16-bit elements for `_pk_u16`, 32-bit for `_u32`), saturating
+    /// per element with CLAMP.
+    pub fn valu_qsad(&mut self, d: &Decoded, name: &str) -> LResult<()> {
+        if d.variant != Variant::Plain {
+            return err(d, "quad-SAD SDWA/DPP");
+        }
+        let (outs, ins) = Self::ops(d);
+        let clamp = Self::mods(d).clamp;
+        let masked = name.starts_with("v_mqsad");
+        let wide = name == "v_mqsad_u32_u8";
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
+        let limit = if wide { 252 } else { 254 };
+        if matches!(dst, Dst::V(n) if n > limit) {
+            return err(d, "quad-SAD VDST out of range");
+        }
+        let bad = || format!("{}: op", rdna2::format(d));
+        let (l, h) = self.read64(d, ins.first().ok_or_else(bad)?, false).ok_or_else(bad)?;
+        let r = self.read(d, ins.get(1).ok_or_else(bad)?, false).ok_or_else(bad)?;
+        let s2 = ins.get(2).ok_or_else(bad)?;
+        // the four 4-byte windows of SRC0
+        let mut wins = vec![l];
+        for k in [8u32, 16, 24] {
+            let a = self.lshrc(l, k);
+            let b = self.shlc(h, 32 - k);
+            wins.push(self.or(a, b));
+        }
+        let sads: Vec<Value> = wins.iter().map(|&w| if masked { self.msad_u8(w, r) } else { self.sad_u8(w, r) }).collect();
+        if wide {
+            let f = s2.field.ok_or_else(bad)?;
+            let code = Self::field(d, f);
+            if !(256..=508).contains(&code) {
+                return err(d, "quad-SAD SRC2 not a 4-VGPR range");
+            }
+            let base = code - 256;
+            let mut res = Vec::new();
+            for (i, &sad) in sads.iter().enumerate() {
+                let acc = self.vreg(base + i as u64);
+                let sum = self.add(sad, acc);
+                let sum = if clamp {
+                    // the SAD is at most 1020, so the add overflowed iff the sum is below it
+                    let ovf = self.cmp(Pred::ULt, sum, sad);
+                    self.selc(ovf, u32::MAX, sum)
+                } else {
+                    sum
+                };
+                res.push(sum);
+            }
+            if let Dst::V(dn) = dst {
+                for (i, v) in res.into_iter().enumerate() {
+                    self.write32(&Dst::V(dn + i as u64), v);
+                }
+            }
+        } else {
+            let (al, ah) = self.read64(d, s2, false).ok_or_else(bad)?;
+            let half = |s: &mut Self, sad: Value, acc: Value, k: u32| {
+                let a = s.lshrc(acc, k);
+                let a = s.andc(a, 0xFFFF);
+                let t = s.add(a, sad);
+                let t = if clamp { let m = s.c(0xFFFF); s.umin(t, m) } else { s.andc(t, 0xFFFF) };
+                s.shlc(t, k)
+            };
+            let x0 = half(self, sads[0], al, 0);
+            let x1 = half(self, sads[1], al, 16);
+            let lo = self.or(x0, x1);
+            let y0 = half(self, sads[2], ah, 0);
+            let y1 = half(self, sads[3], ah, 16);
+            let hi = self.or(y0, y1);
+            self.write64(&dst, lo, hi);
+        }
+        Ok(())
+    }
+
     /// Double division (D3D11.1 double extensions).
     pub fn ddiv(&mut self, a: Value, b: Value) -> Value {
         self.s.require(Feature::DoubleExtensions);
