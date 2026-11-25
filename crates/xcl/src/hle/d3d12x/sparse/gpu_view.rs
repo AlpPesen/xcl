@@ -149,7 +149,13 @@ impl State {
 /// The address a view of `len` bytes at `va` gets when it lies in a GPU view of the title's and
 /// in no memory window: where the same bytes can be read by a shader. None: it keeps `va`.
 pub fn base_for(va: usize, len: usize) -> Option<usize> {
-    if !on() || len == 0 || len > MOST {
+    if !on() || len == 0 {
+        return None;
+    }
+    if len > MOST {
+        if crate::hle::kernelx::mirrors::source(va).is_some() {
+            refused(1, va, len);
+        }
         return None;
     }
     let u = crate::gpu::uma::get()?;
@@ -180,6 +186,9 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
         if m.tiles() + new.len() > budget() / TILE {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| crate::xlog_warn!("D3D12.X: the buffers of the GPU view take more than XCL_GPU_VIEW_MB: the rest keeps its address"));
+            drop(mg);
+            drop(g);
+            refused(0, t0, t1 - t0);
             return None;
         }
         // whole runs of new tiles at once (a mapping call and a signal for each run)
@@ -210,6 +219,22 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
         return None;
     }
     Some(win + (va - first))
+}
+
+/// local: what views kept their address (they read zeros): `kind` 0 the budget, 1 longer than
+/// `MOST`; the distinct title tiles of each, logged as they grow
+fn refused(kind: usize, at: usize, len: usize) {
+    static SEEN: Mutex<Option<[std::collections::HashSet<usize>; 2]>> = Mutex::new(None);
+    static VIEWS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let k = VIEWS[kind].fetch_add(1, Ordering::Relaxed) + 1;
+    let mut g = SEEN.lock().unwrap();
+    let set = &mut g.get_or_insert_with(Default::default)[kind];
+    for t in (at & !(TILE - 1)..at + len).step_by(TILE).take(4096) {
+        set.insert(t);
+    }
+    if k.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: GPU view buffers refused ({}): {k} views, {} distinct tiles ({} MB), latest {at:#x} ({len} B)", ["budget", "longer than MOST"][kind], set.len(), (set.len() * TILE) >> 20);
+    }
 }
 
 /// The pages of the CPU (and pool) side whose writes have to be seen: for the write watch.
