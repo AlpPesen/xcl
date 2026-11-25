@@ -7,10 +7,26 @@ use std::sync::{Arc, LazyLock, OnceLock};
 static PROGRAMS: AtomicU64 = AtomicU64::new(0);
 static PIECES: AtomicU64 = AtomicU64::new(0);
 static DISPATCHES: AtomicU64 = AtomicU64::new(0);
+/// slabs dispatched (`pso::dispatch_slabs`)
+static SLABS: AtomicU64 = AtomicU64::new(0);
+/// scratch alive now, the most there was, and the most a dispatch would have needed at once (bytes)
+static LIVE: AtomicU64 = AtomicU64::new(0);
+static PEAK: AtomicU64 = AtomicU64::new(0);
+static WANTED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn log_counts() {
-    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued",
-        PROGRAMS.load(Ordering::Relaxed), PIECES.load(Ordering::Relaxed), DISPATCHES.load(Ordering::Relaxed));
+    let mib = |a: &AtomicU64| a.load(Ordering::Relaxed) >> 20;
+    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab)",
+        PROGRAMS.load(Ordering::Relaxed), PIECES.load(Ordering::Relaxed), DISPATCHES.load(Ordering::Relaxed), SLABS.load(Ordering::Relaxed),
+        mib(&LIVE), mib(&PEAK), mib(&WANTED));
+}
+
+/// The scratch a dispatch uses at once, `XCL_SPLIT_SCRATCH_MB` (256): more groups than fit run in
+/// slabs. A retail title's split programs need 190 KB for each group (median), 3 GB for 960x540
+/// pixels in groups of 8x4.
+fn scratch_budget() -> u64 {
+    static B: OnceLock<u64> = OnceLock::new();
+    *B.get_or_init(|| std::env::var("XCL_SPLIT_SCRATCH_MB").ok().and_then(|v| v.trim().parse().ok()).filter(|&m| m > 0).unwrap_or(256u64).min(4096) << 20)
 }
 
 struct PipelineBuilder {
@@ -93,13 +109,46 @@ pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12Pi
     chain.map(|c| c.whole()).transpose()
 }
 
+struct Scratch {
+    buffer: ID3D12Resource,
+    bytes: u64,
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        LIVE.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 struct Recording {
-    scratch: ID3D12Resource,
+    scratch: Arc<Scratch>,
     first: ID3D12PipelineState,
     chain: Arc<Chain>,
 }
 
 static RECORDINGS: LazyLock<Mutex<HashMap<usize, Vec<Arc<Recording>>>>> = LazyLock::new(Default::default);
+/// list → the allocator it records on and the scratch its chains share: they are dispatched one
+/// after another, with a barrier between them (the recordings keep it alive)
+static SHARED: LazyLock<Mutex<HashMap<usize, (usize, std::sync::Weak<Scratch>)>>> = LazyLock::new(Default::default);
+
+/// `list` begins another recording, which the GPU may run beside the last one.
+pub(in crate::hle::d3d12x) fn list_reset(list: usize) {
+    SHARED.lock().unwrap().remove(&list);
+}
+
+/// A scratch of `bytes` for a chain recorded on `list` with `allocator`, and whether a chain
+/// before it on the list used it.
+unsafe fn scratch_for(dev: &ID3D12Device, list: usize, allocator: usize, bytes: u64) -> Option<(Arc<Scratch>, bool)> {
+    let had = SHARED.lock().unwrap().get(&list).filter(|s| s.0 == allocator).and_then(|s| s.1.upgrade());
+    if let Some(s) = had.filter(|s| s.bytes >= bytes) {
+        return Some((s, true));
+    }
+    let s = Arc::new(Scratch { buffer: scratch_buffer(dev, bytes)?, bytes });
+    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    PEAK.fetch_max(live, Ordering::Relaxed);
+    SHARED.lock().unwrap().insert(list, (allocator, Arc::downgrade(&s)));
+    Some((s, false))
+}
 
 pub(in crate::hle::d3d12x) fn allocator_reset(allocator: usize) {
     let recordings = RECORDINGS.lock().unwrap().remove(&allocator);
@@ -131,10 +180,14 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let allocator = if super::super::alloc_pool::enabled() {
         super::super::alloc_pool::recording_backing(list.as_raw() as usize).unwrap_or(0)
     } else { allocator };
-    let size = grid.into_iter().try_fold(u64::from(chain.words) * 4, |s, n| s.checked_mul(n as u64));
-    let scratch = size.filter(|&n| n <= u32::MAX as u64 + 1 && allocator != 0 && list.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE)
-        .and_then(|n| scratch_buffer(&chain.builder.device, n));
-    let Some(scratch) = scratch else {
+    let group = u64::from(chain.words) * 4;
+    let most = (scratch_budget() / group).max(1);
+    let slabs = pso::dispatch_slabs(grid, most);
+    let first = slabs[0].1.into_iter().map(u64::from).product::<u64>();
+    WANTED.fetch_max(grid.into_iter().fold(group, |s, n| s.saturating_mul(n as u64)), Ordering::Relaxed);
+    let scratch = (allocator != 0 && list.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE)
+        .then(|| scratch_for(&chain.builder.device, list.as_raw() as usize, allocator, first * group)).flatten();
+    let Some((scratch, used)) = scratch else {
         list.SetPipelineState(&chain.whole()?);
         list.Dispatch(x, y, z);
         return Ok(());
@@ -143,6 +196,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let held = Arc::new(Recording { scratch, first, chain });
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
-    pso::record_dispatch_chain(list, grid, &held.scratch, std::iter::once(&held.first).chain(&held.chain.tail));
+    SLABS.fetch_add(slabs.len() as u64, Ordering::Relaxed);
+    pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail));
     Ok(())
 }
