@@ -400,6 +400,9 @@ struct Target {
     used_extra: Vec<(usize, usize)>,
     /// its owned pages in graphics reservations (`Pages::follow`)
     follows: Vec<usize>,
+    /// whether uncommitted pages in graphics reservations may be skipped (`FollowSkip`):
+    /// true for sampled textures (`place_pages`), false for GPU-owned `RT | DS | UAV` targets (`place`)
+    follow_backing: bool,
     /// its levels get their pages one by one (`map_levels`); None: all of it has pages
     levels: Option<Levels>,
     recycle: Option<ReservedKey>,
@@ -1251,11 +1254,24 @@ impl Pages {
     }
 
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
-    /// A page in a graphics reservation the title has no memory at yet is left unmapped (tier 2:
-    /// reads zero) and mapped when the title puts memory there (`apply_backing`); the texture's
-    /// followed pages are returned third.
+    /// When `follow_key` is `Some`, a page in a graphics reservation the title has no memory at
+    /// yet is left unmapped (tier 2: reads zero) and mapped when the title puts memory there
+    /// (`apply_backing`); GPU-owned targets (`RT | DS | UAV`) pass `None` so every tile is backed.
+    unsafe fn bind_with_follow(
+        &mut self,
+        dev: &ID3D12Device,
+        res: &ID3D12Resource,
+        follow_key: Option<usize>,
+        va: usize,
+        console_bytes: Option<u64>,
+        total: u32,
+    ) -> Option<(Vec<usize>, Vec<(usize, usize)>, Vec<usize>)> {
+        self.bind_range(dev, res, follow_key, va, console_bytes, total, 0, 0..total as usize)
+    }
+
+    #[cfg(test)]
     unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, key: usize, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>, Vec<usize>)> {
-        self.bind_range(dev, res, Some(key), va, console_bytes, total, 0, 0..total as usize)
+        self.bind_with_follow(dev, res, Some(key), va, console_bytes, total)
     }
 
     /// `bind` for the tiles `range` of the resource's `total`, which start at subresource `sub`.
@@ -1757,6 +1773,7 @@ unsafe fn place_on_pages(
             lv
         }
     };
+    let follow_backing = !require_aligned;
     let bound = {
         let timer = step(Step::Lock);
         let mut g = PAGES.lock().unwrap();
@@ -1766,10 +1783,10 @@ unsafe fn place_on_pages(
                 // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, mapping_gen: 0, used: Vec::new(), used_extra: Vec::new(), follows: Vec::new(), levels, recycle: recycle_key });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, mapping_gen: 0, used: Vec::new(), used_extra: Vec::new(), follows: Vec::new(), follow_backing, levels, recycle: recycle_key });
                 true
-            } else if let Some((used, used_extra, follows)) = pages.bind(dev, res, raw as usize, va, console_bytes, total) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, mapping_gen: 0, used, used_extra, follows, levels: None, recycle: recycle_key });
+            } else if let Some((used, used_extra, follows)) = pages.bind_with_follow(dev, res, follow_backing.then_some(raw as usize), va, console_bytes, total) {
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, mapping_gen: 0, used, used_extra, follows, follow_backing, levels: None, recycle: recycle_key });
                 true
             } else {
                 false
@@ -1847,7 +1864,7 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
-    let Some((va, console_bytes, total, mapped)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped)) else {
+    let Some((va, console_bytes, total, mapped, follow_backing)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped, t.follow_backing)) else {
         return false;
     };
     if mapped {
@@ -1859,7 +1876,7 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         t.mapping_gen = t.mapping_gen.wrapping_add(1);
         return true;
     }
-    let Some((used, used_extra, follows)) = pages.bind(&dev, res, key, va, console_bytes, total) else {
+    let Some((used, used_extra, follows)) = pages.bind_with_follow(&dev, res, follow_backing.then_some(key), va, console_bytes, total) else {
         return false;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
@@ -2276,6 +2293,20 @@ fn tier2(dev: &ID3D12Device) -> bool {
     unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.ResourceHeapTier.0 >= 2 }
 }
 
+/// Whether a sampled reserved texture should defer tile mapping per mip level (`level_pages`).
+/// Sampled views aliasing an already-live 64 KiB GPU page (`aliases_live`, e.g., an SRV placed
+/// over a render target, depth buffer, or Hi-Z UAV pyramid) must map immediately onto those live
+/// pages rather than staying lazy: their CPU memory is zeros so upload-driven level mapping
+/// would leave every tile unmapped.
+fn should_use_lazy_levels(level_pages_on: bool, aliases_live: bool, desc: &D3D12_RESOURCE_DESC) -> bool {
+    !aliases_live
+        && level_pages_on
+        && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.DepthOrArraySize == 1
+        && desc.SampleDesc.Count == 1
+        && desc.Flags == D3D12_RESOURCE_FLAG_NONE
+}
+
 /// A sampled texture of the title at `va` (`desc`: the PC description, `console_bytes` its size on
 /// the console) backed by shared 4 KiB small-resource heaps (when < 64 KiB and not aliasing an
 /// existing 64 KiB GPU page) or shared 64 KiB video-memory pages; None when neither applies (the
@@ -2298,14 +2329,15 @@ pub unsafe fn place_pages(
     if console_has_packed_3d_mips(desc) {
         return None;
     }
-    if !(va % PAGE == 0 && has_live_page(dev.as_raw() as usize, canonical_va(va))) {
+    let aliases_live = va % PAGE == 0 && has_live_page(dev.as_raw() as usize, canonical_va(va));
+    if !aliases_live {
         if let Some(hr) = super::vram_small::place(dev, this, va, desc, state, clear, console_bytes, riid, ppv) {
             PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
             return Some(hr);
         }
     }
     // (one slice: the tiles of an array's packed levels are not asked about here)
-    let lazy = level_pages() && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1 && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
+    let lazy = should_use_lazy_levels(level_pages(), aliases_live, desc);
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, lazy, riid, ppv)
 }
 
@@ -3362,5 +3394,80 @@ mod tests {
         assert!(!commit_below_floor(Some(FLOOR + 1), FLOOR));
         assert!(!commit_below_floor(None, FLOOR));
         assert!(!commit_below_floor(Some(0), 0));
+    }
+
+    #[test]
+    fn should_use_lazy_levels_skips_gpu_aliased_sampled_textures() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_FLOAT, DXGI_SAMPLE_DESC};
+        let tex = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024,
+            Height: 1024,
+            DepthOrArraySize: 1,
+            MipLevels: 10,
+            Format: DXGI_FORMAT_R16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..Default::default()
+        };
+        assert!(should_use_lazy_levels(true, false, &tex));
+        assert!(!should_use_lazy_levels(true, true, &tex), "sampled view aliasing a live GPU page must map eagerly");
+        assert!(!should_use_lazy_levels(false, false, &tex));
+        let mut uav = tex;
+        uav.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        assert!(!should_use_lazy_levels(true, false, &uav));
+        let mut arr = tex;
+        arr.DepthOrArraySize = 2;
+        assert!(!should_use_lazy_levels(true, false, &arr));
+    }
+
+    #[test]
+    fn gpu_owned_bind_with_no_follow_maps_uncommitted_graphics_reservation_tiles() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_FLOAT, DXGI_SAMPLE_DESC};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(mut pages) = Pages::new(&dev) else {
+                return crate::gpu::recomp::runner::skip_test("tiled tier < 2");
+            };
+            let span = 4 * PAGE;
+            let va = VirtualAlloc(std::ptr::null(), span, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert!(va != 0 && va % PAGE == 0);
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 256,
+                Height: 256,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R16_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+            let res = r.unwrap();
+            let mut total = 0u32;
+            dev.GetResourceTiling(&res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+            assert!(total >= 1 && (total as usize) * PAGE <= span);
+
+            let (used, extra, follows) = pages
+                .bind_with_follow(&dev, &res, None, va, Some(total as u64 * PAGE as u64), total)
+                .expect("GPU-owned bind must map every tile even when title VA is uncommitted");
+            assert_eq!(used.len() + extra.len(), total as usize);
+            assert!(follows.is_empty(), "GPU-owned target must not register FollowSkip entries");
+            assert!(pages.follow.is_empty());
+
+            pages.unmap(&res, total);
+            pages.flush_signal();
+            let _ = pages.fence.SetEventOnCompletion(pages.value, windows::Win32::Foundation::HANDLE::default());
+            drop(res);
+            VirtualFree(va as *mut c_void, 0, MEM_RELEASE);
+        }
     }
 }
