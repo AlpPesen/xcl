@@ -1969,12 +1969,36 @@ const RT_COMPANION_CS_HASHES: &[u64] = &[
     0x95cc_1328_8a27_a96e,
 ];
 
+/// Generic RT companion compute shader name fragments matched in container metadata (`PRIV`/`ILDN`).
+const RT_COMPANION_CS_NAMES: &[&[u8]] = &[
+    b"RaytracingResolve",
+    b"ScreenProbes_ActivateRays",
+    b"IrradianceCache_Shade",
+];
+
+fn parse_rt_skip_hashes(raw: &str) -> HashSet<u64> {
+    raw.split(|c: char| c == ',' || c == ';' || c.is_ascii_whitespace())
+        .filter_map(|tok| {
+            let t = tok.trim().trim_start_matches("0x").trim_start_matches("0X");
+            (!t.is_empty()).then(|| u64::from_str_radix(t, 16).ok()).flatten()
+        })
+        .collect()
+}
+
+/// Optional extra 64-bit shader hashes to gate under `XCL_RT_GATE` (`XCL_RT_SKIP_HASHES=hex1,hex2`).
+fn extra_rt_skip_hashes() -> &'static HashSet<u64> {
+    static SET: OnceLock<HashSet<u64>> = OnceLock::new();
+    SET.get_or_init(|| std::env::var("XCL_RT_SKIP_HASHES").map_or_else(|_| HashSet::new(), |v| parse_rt_skip_hashes(&v)))
+}
+
 fn is_rt_gated_cs_hash(hash: u64) -> bool {
-    RT_COMPANION_CS_HASHES.contains(&hash)
+    RT_COMPANION_CS_HASHES.contains(&hash) || extra_rt_skip_hashes().contains(&hash)
 }
 
 fn is_rt_gated_cs(cs: &[u8]) -> bool {
-    is_rt_gated_cs_hash(crate::gpu::shader::fnv64(cs)) || crate::gpu::effects::uses_bvh_intersect(cs)
+    is_rt_gated_cs_hash(crate::gpu::shader::fnv64(cs))
+        || crate::gpu::effects::container_contains_ascii_any(cs, RT_COMPANION_CS_NAMES)
+        || crate::gpu::effects::uses_bvh_intersect(cs)
 }
 
 fn note_bvh_traversal(pso: usize, cs: &[u8]) {
@@ -4627,6 +4651,12 @@ mod big_compile_tests {
         assert!(std::ptr::eq(compile_slots(1_061_720), &GIANT_COMPILES));
         assert!(is_rt_gated_cs_hash(0x95cc_1328_8a27_a96e));
         assert!(!is_rt_gated_cs_hash(0xef5e_ce92_2dc3_3bfe));
+        let parsed = parse_rt_skip_hashes("0x39f0e9aeb156a61c, 73fb752d7f62c3a5; bad");
+        assert!(parsed.contains(&0x39f0_e9ae_b156_a61c));
+        assert!(parsed.contains(&0x73fb_752d_7f62_c3a5));
+        assert_eq!(parsed.len(), 2);
+        assert!(is_rt_gated_cs(b"HDR\0CS_RaytracingResolve_01\0"));
+        assert!(is_rt_gated_cs(b"HDR\0CS_IrradianceCache_Shade_Low\0"));
     }
 
     #[test]
@@ -5763,6 +5793,13 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         Some(p) => Some(p.to_vec()),
         None => None,
     };
+    // Large translated graphics pipelines (>= huge_pso_bytes) defer off the title thread when
+    // `dxc::defer()` is active, matching `translated_compute_pso_once` so cold >= 256 KiB graphics
+    // PSOs never stall title threads even when `XCL_LAZY_PSO=0`.
+    let big = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) >= huge_pso_bytes();
+    if big && crate::gpu::recomp::dxc::defer() {
+        return None;
+    }
     let rs = abi_rs_for(this, &samplers)?;
     let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
@@ -6904,6 +6941,10 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             return Some(E_INVALIDARG);
         }
     };
+    let big = tp.ms.len() + tp.cs.len() + ps.as_ref().map_or(0, Vec::len) >= huge_pso_bytes();
+    if big && crate::gpu::recomp::dxc::defer() {
+        return None;
+    }
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
     let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());

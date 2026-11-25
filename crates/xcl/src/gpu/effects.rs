@@ -109,10 +109,17 @@ pub fn big_and_image_only(blob: &[u8]) -> bool {
     code.len() >= BIG_CODE && of(&code).is_some_and(|e| !e.memory)
 }
 
-/// Console RDNA2 code bytes (24 KiB, ~6 000 instructions, ~512+ KiB DXIL) from which a compute
-/// shader is treated as heavyweight for async-only compilation so title threads never freeze
-/// compiling multi-10s RT compute shaders synchronously.
-pub const HEAVY_CODE: usize = 24 << 10;
+/// Console RDNA2 code bytes (16 KiB, ~4 000 instructions, ~200+ KiB DXIL) from which a compute
+/// shader is treated as heavyweight for worker-gated compilation so title threads never compile
+/// large compute shaders ungated (and `xcl-pso-pre-*` never speculatively preloads them).
+pub const HEAVY_CODE: usize = 16 << 10;
+
+/// Fast ASCII substring scan over a raw console shader container (`PRIV`/`ILDN`/metadata) to
+/// recognize known RT companion shader families without touching any `build.rs`-hashed translator
+/// sources.
+pub fn container_contains_ascii_any(blob: &[u8], needles: &[&[u8]]) -> bool {
+    needles.iter().any(|needle| !needle.is_empty() && blob.windows(needle.len()).any(|w| w == *needle))
+}
 
 /// Length in bytes of the compute program's RDNA2 code (`None` if not a valid console CS).
 pub fn compute_code_len(blob: &[u8]) -> Option<usize> {
@@ -178,6 +185,8 @@ mod tests {
         let rt_with_indirect = asm(&[indirect, bvh, END]);
         assert_eq!(of(&rt_with_indirect), None);
         assert!(code_uses_bvh_intersect(&rt_with_indirect));
+        assert!(container_contains_ascii_any(b"\0\x01CS_ScreenProbes_ActivateRays\0", &[b"RaytracingResolve", b"ScreenProbes_ActivateRays"]));
+        assert!(!container_contains_ascii_any(b"\0\x01CS_DepthPyramid\0", &[b"RaytracingResolve", b"ScreenProbes_ActivateRays"]));
         let image_atomic: (&str, &str, &[(&str, u64)]) = ("IMAGE_ATOMIC_ADD", "ENC_MIMG", &[("DMASK", 1), ("VADDR", 0), ("VDATA", 4), ("SRSRC", 2)]);
         assert_eq!(of(&asm(&[image_atomic, END])).map(|e| (e.memory, e.images)), Some((false, true)));
         // every way into memory another pass or an indirect call reads

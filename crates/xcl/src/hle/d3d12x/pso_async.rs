@@ -1401,14 +1401,80 @@ pub fn bvh_traversal(standin: usize) {
     }
 }
 
+/// Per-frame wait cap for non-critical spared compute PSOs (`XCL_PSO_FRAME_WAIT_MS`, default 24 ms,
+/// `0` = never wait). Lets fast warm `.plib` hits finish on their first bind without stalling
+/// `PresentX` past 24 ms/frame on cold compiles; never applies to memory-writing producer shaders.
+fn frame_wait_budget() -> Option<std::time::Duration> {
+    static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *B.get_or_init(|| {
+        let ms = std::env::var("XCL_PSO_FRAME_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(24);
+        (ms > 0).then(|| std::time::Duration::from_millis(ms))
+    })
+}
+
+struct FrameWaitBudget {
+    frame: u64,
+    spent: std::time::Duration,
+}
+
+impl FrameWaitBudget {
+    const fn new() -> Self {
+        Self { frame: 0, spent: std::time::Duration::ZERO }
+    }
+
+    fn remaining(&mut self, frame: u64, cap: std::time::Duration) -> std::time::Duration {
+        if frame > self.frame {
+            self.frame = frame;
+            self.spent = std::time::Duration::ZERO;
+        }
+        cap.saturating_sub(self.spent)
+    }
+
+    fn record(&mut self, frame: u64, elapsed: std::time::Duration) {
+        if frame > self.frame {
+            self.frame = frame;
+            self.spent = elapsed;
+        } else if frame == self.frame {
+            self.spent = self.spent.saturating_add(elapsed);
+        }
+    }
+}
+
+static FRAME_WAIT: Mutex<FrameWaitBudget> = Mutex::new(FrameWaitBudget::new());
+
 /// `resolve_wait` for a pipeline binds do not wait for (`image_only` or `bvh_traversal`): the real
-/// one once built, else the stand-in, with the build sent to the workers. Nobody waits, so the
-/// build is not `wanted`: a big one takes its turn among the driver's compiles and waits for free commit.
+/// one once built, else the stand-in, with the build sent to the workers. For non-BVH `spared`
+/// pipelines (e.g. pure image-only shaders), waits up to the remaining per-frame `frame_wait_budget`
+/// (`XCL_PSO_FRAME_WAIT_MS`, default 24 ms) so fast warm `.plib` loads complete on first bind
+/// without ever freezing `PresentX`. Nobody marks the build `wanted`, so cold big compiles stay
+/// strictly behind critical work and commit headroom.
 fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {
             if !p.sent.swap(true, Ordering::AcqRel) {
                 enqueue(p.clone());
+            }
+            if !p.bvh_traversal.load(Ordering::Acquire) && !p.late.load(Ordering::Acquire) {
+                if let Some(cap) = frame_wait_budget() {
+                    let frame = super::present::presents();
+                    let rem = FRAME_WAIT.lock().unwrap().remaining(frame, cap);
+                    if !rem.is_zero() {
+                        let t0 = std::time::Instant::now();
+                        let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), rem, |d| !*d).unwrap();
+                        let finished = *done;
+                        drop(done);
+                        FRAME_WAIT.lock().unwrap().record(frame, t0.elapsed());
+                        if finished {
+                            return match p.real.load(Ordering::Acquire) {
+                                0 => p.stand(pso),
+                                r => r,
+                            };
+                        }
+                    }
+                }
             }
             if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
                 static N: AtomicUsize = AtomicUsize::new(0);
@@ -1596,5 +1662,22 @@ mod pso_queue_tests {
         assert_eq!(resolve_wait_for(heavy_standin, None), 0x5D5D);
         assert!(ran.load(Ordering::Acquire));
         let _ = released(heavy_standin);
+    }
+
+    #[test]
+    fn frame_wait_budget_caps_per_frame_and_resets_on_new_frame() {
+        let cap = std::time::Duration::from_millis(24);
+        let mut b = FrameWaitBudget::new();
+        assert_eq!(b.remaining(1, cap), cap);
+        b.record(1, std::time::Duration::from_millis(10));
+        assert_eq!(b.remaining(1, cap), std::time::Duration::from_millis(14));
+        b.record(1, std::time::Duration::from_millis(20));
+        assert_eq!(b.remaining(1, cap), std::time::Duration::ZERO);
+        // Advancing to frame 2 resets the budget cleanly.
+        assert_eq!(b.remaining(2, cap), cap);
+        // Stale lower frame number must not clear frame 2's spent budget.
+        b.record(2, std::time::Duration::from_millis(12));
+        b.record(1, std::time::Duration::from_millis(5));
+        assert_eq!(b.remaining(2, cap), std::time::Duration::from_millis(12));
     }
 }
