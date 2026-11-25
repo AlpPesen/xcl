@@ -88,8 +88,8 @@ pub const MEM_HEAP_NULL: u32 = MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS
 pub const HEAP_WINDOWS: u32 = 0x100;
 
 /// Flag in a memory-windows count next to `HEAP_WINDOWS` (`pso::mem_windows`, the caches' keys):
-/// the direct DXIL translator reads the heap windows of compute stages without a branch
-/// (`Lw::with_mem_i32s`). The HLSL path ignores it.
+/// the direct DXIL translator reads heap windows without a branch (`Lw::with_mem_i32s`). The
+/// HLSL path ignores it (it uses `MEM_HEAP_NULL` unconditionally).
 pub const HEAP_FLAT: u32 = 0x200;
 
 pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {

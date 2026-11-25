@@ -115,11 +115,11 @@ pub fn heap_windows() -> bool {
     *ENV.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS").is_ok_and(|v| v.trim() == "1")) && !crate::hle::d3d12x::console_heap::window_views_failed()
 }
 
-/// `XCL_HEAP_FLAT=1` (with heap windows): the direct DXIL translator reads a compute stage's heap
-/// windows without a branch per access (`HEAP_FLAT`).
+/// `XCL_HEAP_FLAT` (default on with heap windows; `=0` to disable): the direct DXIL translator
+/// reads heap windows without a branch per access (`HEAP_FLAT`).
 pub fn heap_flat() -> bool {
     static ENV: OnceLock<bool> = OnceLock::new();
-    *ENV.get_or_init(|| std::env::var("XCL_HEAP_FLAT").is_ok_and(|v| v.trim() == "1"))
+    *ENV.get_or_init(|| std::env::var("XCL_HEAP_FLAT").map_or(true, |v| v.trim() != "0"))
 }
 
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.
