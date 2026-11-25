@@ -331,6 +331,11 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
     if n < 16 || n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: video-memory arena #{n} for title addresses {va:#x}..{:#x} ({made} bytes of arenas made so far)", va + size);
     }
+    if super::real::dred_on() {
+        if let Some(ref h) = heap {
+            super::real::name_heap(h.as_raw(), &format!("xcl vram arena va={va:#x}"));
+        }
+    }
     heap
 }
 
@@ -797,6 +802,11 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
     if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
         crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
         return None;
+    }
+    if super::real::dred_on() {
+        if let Some(ref h) = heap {
+            super::real::name_heap(h.as_raw(), "xcl vram tile_pool");
+        }
     }
     heap
 }
@@ -1747,6 +1757,15 @@ unsafe fn place_on_pages(
         hr
     };
     let raw = *ppv;
+    if super::real::dred_on() {
+        super::real::name_resource(
+            raw,
+            &format!(
+                "xcl vram tex va={va:#x} {}x{}x{} m={} fmt={} fl={:#x} lazy={}",
+                desc.Width, desc.Height, desc.DepthOrArraySize, desc.MipLevels, desc.Format.0, desc.Flags.0, lazy
+            ),
+        );
+    }
     let res = ID3D12Resource::from_raw_borrowed(&raw)?;
     let mut total = 0u32;
     let levels = match cached_tiling {
