@@ -2859,7 +2859,7 @@ mod tests {
             assert!(total >= 1);
 
             let key = ReservedKey::from_desc(&desc, D3D12_RESOURCE_STATE_COMMON.0 as u32);
-            let (used1, extra1) = pages.bind(&dev, borrowed, 0x2000_0000, Some(total as u64 * PAGE as u64), total).expect("initial bind");
+            let (used1, extra1, _) = pages.bind(&dev, borrowed, raw, 0x2000_0000, Some(total as u64 * PAGE as u64), total).expect("initial bind");
             pages.unmap(borrowed, total);
             pages.release_tiles(used1, extra1, std::time::Instant::now(), false);
             assert_eq!(pages.reserved_pool.push(key, raw, total, None), None);
@@ -2875,7 +2875,7 @@ mod tests {
             assert_eq!(reused_levels, None);
             let reused_ptr = reused_raw as *mut c_void;
             let reused = ID3D12Resource::from_raw_borrowed(&reused_ptr).unwrap();
-            let (used2, extra2) = pages.bind(&dev, reused, 0x2010_0000, Some(total as u64 * PAGE as u64), reused_total).expect("rebind after recycle");
+            let (used2, extra2, _) = pages.bind(&dev, reused, reused_raw, 0x2010_0000, Some(total as u64 * PAGE as u64), reused_total).expect("rebind after recycle");
             pages.unmap(reused, reused_total);
             pages.release_tiles(used2, extra2, std::time::Instant::now(), false);
             // Wait for unmap on the tile-mapping queue before dropping the resource and heaps.
