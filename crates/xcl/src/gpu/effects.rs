@@ -119,10 +119,35 @@ pub fn compute_code_len(blob: &[u8]) -> Option<usize> {
     compute_code(blob).map(|c| c.len())
 }
 
+/// Whether raw RDNA2 compute machine code `code` contains `IMAGE_BVH_INTERSECT_RAY` or
+/// `IMAGE_BVH64_INTERSECT_RAY`. Unlike [`of`], this does not bail out on indirect branches
+/// (`s_setpc_b64` / `s_swappc_b64` switch tables or subroutines), which large RT shaders use.
+pub fn code_uses_bvh_intersect(code: &[u8]) -> bool {
+    let mut off = 0;
+    let mut ended = false;
+    while off + 4 <= code.len() {
+        let Ok(d) = rdna2::decode(&code[off..], off as u64) else {
+            if ended {
+                break;
+            }
+            return false;
+        };
+        if ended && d.inst.name == "S_CODE_END" {
+            break;
+        }
+        if d.enc.name == "ENC_MIMG" && (d.inst.name == "IMAGE_BVH_INTERSECT_RAY" || d.inst.name == "IMAGE_BVH64_INTERSECT_RAY") {
+            return true;
+        }
+        off += d.len;
+        ended |= d.inst.flags & rdna2::F_TERMINATOR != 0;
+    }
+    false
+}
+
 /// Whether the compute shader `blob` issues `IMAGE_BVH_INTERSECT_RAY` or `IMAGE_BVH64_INTERSECT_RAY`.
 pub fn uses_bvh_intersect(blob: &[u8]) -> bool {
     let Some(code) = compute_code(blob) else { return false };
-    of(&code).is_some_and(|e| e.bvh_intersect)
+    code_uses_bvh_intersect(&code)
 }
 
 #[cfg(test)]
@@ -146,6 +171,13 @@ mod tests {
         assert_eq!(of(&asm(&[MOV, IMAGE_STORE, END])), Some(Effects { memory: false, images: true, bvh_intersect: false, instructions: 3 }));
         let bvh: (&str, &str, &[(&str, u64)]) = ("IMAGE_BVH64_INTERSECT_RAY", "ENC_MIMG", &[("DMASK", 15), ("VADDR", 0), ("VDATA", 4), ("SRSRC", 2)]);
         assert_eq!(of(&asm(&[bvh, END])).map(|e| (e.memory, e.images, e.bvh_intersect)), Some((false, false, true)));
+        assert!(code_uses_bvh_intersect(&asm(&[bvh, END])));
+        // Indirect jump (`s_setpc_b64`) makes conservative `of()` return None, yet BVH detection
+        // must still recognize `IMAGE_BVH64_INTERSECT_RAY` so large RT shaders are classified as BVH.
+        let indirect: (&str, &str, &[(&str, u64)]) = ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 2)]);
+        let rt_with_indirect = asm(&[indirect, bvh, END]);
+        assert_eq!(of(&rt_with_indirect), None);
+        assert!(code_uses_bvh_intersect(&rt_with_indirect));
         let image_atomic: (&str, &str, &[(&str, u64)]) = ("IMAGE_ATOMIC_ADD", "ENC_MIMG", &[("DMASK", 1), ("VADDR", 0), ("VDATA", 4), ("SRSRC", 2)]);
         assert_eq!(of(&asm(&[image_atomic, END])).map(|e| (e.memory, e.images)), Some((false, true)));
         // every way into memory another pass or an indirect call reads

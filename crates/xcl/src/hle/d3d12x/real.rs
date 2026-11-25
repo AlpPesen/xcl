@@ -4363,7 +4363,10 @@ impl Drop for SlotGuard {
 const LARGE_DRIVER_COMPILE: usize = 512 << 10;
 static MEDIUM_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), limit: SlotLimit::Medium };
 static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), limit: SlotLimit::Big };
-const GIANT_DRIVER_COMPILE: usize = 4 << 20;
+/// True giant DXIL shaders (`>= 900 KiB`, e.g. >1 MiB RT/compute shaders that can take >60-140s
+/// in the driver compiler) get their own dedicated 1-slot lane so they never starve `MEDIUM_COMPILES`
+/// (`256-512 KiB`) or `BIG_COMPILES` (`512-900 KiB`).
+const GIANT_DRIVER_COMPILE: usize = 900 << 10;
 static GIANT_COMPILES: Slots = Slots::fixed(1, 1);
 
 fn compile_slots(bytes: usize) -> &'static Slots {
@@ -4602,8 +4605,10 @@ mod big_compile_tests {
     fn giant_driver_compiles_have_their_own_lane() {
         assert!(std::ptr::eq(compile_slots(LARGE_DRIVER_COMPILE - 1), &MEDIUM_COMPILES));
         assert!(std::ptr::eq(compile_slots(LARGE_DRIVER_COMPILE), &BIG_COMPILES));
+        assert!(std::ptr::eq(compile_slots(729_672), &BIG_COMPILES));
         assert!(std::ptr::eq(compile_slots(GIANT_DRIVER_COMPILE - 1), &BIG_COMPILES));
         assert!(std::ptr::eq(compile_slots(GIANT_DRIVER_COMPILE), &GIANT_COMPILES));
+        assert!(std::ptr::eq(compile_slots(1_061_720), &GIANT_COMPILES));
     }
 
     #[test]
@@ -6200,25 +6205,22 @@ unsafe fn go_background(
             0
         }
     });
+    // Only pure image-writing compute shaders (zero buffer/global/GDS writes) or BVH RT traversal
+    // shaders may ever be spared/skipped while building. Heavy producer compute shaders that write
+    // memory are deprioritized onto gated workers (`deprioritized`) and excluded from speculative
+    // low-priority preloading, but NEVER skipped when bound.
+    let flags = super::pso_async::SubmitFlags {
+        spared: image_only || (heavy_compute && big_image_only),
+        bvh_traversal: bvh_trav && bvh_gate_enabled(),
+        deprioritized: heavy_compute || (bvh_trav && bvh_gate_enabled()),
+    };
     if super::pso_async::lazy() {
-        super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
+        super::pso_async::submit_lazy_with_flags(*ppv as usize, compute, job, key, flags);
     } else {
-        super::pso_async::submit(*ppv as usize, compute, job);
+        super::pso_async::submit_with_flags(*ppv as usize, compute, job, flags);
     }
     if driver != 0 {
         super::pso_async::shared(*ppv as usize, driver);
-    }
-    // Only pure image-writing compute shaders (zero buffer/global/GDS writes) or BVH RT traversal
-    // shaders may ever be spared/skipped while building. Heavy producer compute shaders that write
-    // memory are deprioritized onto gated workers (`heavy_compute`) but NEVER skipped.
-    if image_only || (heavy_compute && big_image_only) {
-        super::pso_async::image_only(*ppv as usize);
-    }
-    if bvh_trav && bvh_gate_enabled() {
-        super::pso_async::bvh_traversal(*ppv as usize);
-    }
-    if heavy_compute {
-        super::pso_async::heavy_compute(*ppv as usize);
     }
     Some(hr)
 }

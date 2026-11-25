@@ -519,9 +519,24 @@ pub fn release(p: usize) {
     }
 }
 
+/// Initial scheduling classification set atomically before a `Pending` entry is visible to
+/// preload or normal workers (avoids any race where `xcl-pso-pre-*` pops a heavy/BVH pipeline
+/// before its flags are applied).
+#[derive(Clone, Copy, Default)]
+pub struct SubmitFlags {
+    pub spared: bool,
+    pub bvh_traversal: bool,
+    pub deprioritized: bool,
+}
+
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0);
+    submit_as(standin, compute, job, true, 0, SubmitFlags::default());
+}
+
+/// Like [`submit`], with initial scheduling flags applied before the entry is queued.
+pub fn submit_with_flags(standin: usize, compute: bool, job: Job, flags: SubmitFlags) {
+    submit_as(standin, compute, job, true, 0, flags);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -537,10 +552,17 @@ pub fn lazy() -> bool {
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`) – or now, at a low
 /// priority, when an earlier run used a pipeline of these shaders (`key`, 0 = none; `used`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
-    submit_as(standin, compute, job, false, key);
+    submit_as(standin, compute, job, false, key, SubmitFlags::default());
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+/// Like [`submit_lazy`], applying `flags` atomically before insertion and excluding heavyweight /
+/// BVH / spared pipelines from speculative `xcl-pso-pre-*` preloading so `THREAD_PRIORITY_LOWEST`
+/// workers never stall `BIG_COMPILES`/`GIANT_COMPILES` on unreferenced >1 MiB shaders.
+pub fn submit_lazy_with_flags(standin: usize, compute: bool, job: Job, key: u64, flags: SubmitFlags) {
+    submit_as(standin, compute, job, false, key, flags);
+}
+
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, flags: SubmitFlags) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
@@ -553,9 +575,9 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         used: Default::default(),
         orphan: Default::default(),
         late: Default::default(),
-        spared: Default::default(),
-        bvh_traversal: Default::default(),
-        deprioritized: Default::default(),
+        spared: std::sync::atomic::AtomicBool::new(flags.spared),
+        bvh_traversal: std::sync::atomic::AtomicBool::new(flags.bvh_traversal),
+        deprioritized: std::sync::atomic::AtomicBool::new(flags.deprioritized),
         demand: Default::default(),
     });
     PENDING.write().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -565,7 +587,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     });
     if send {
         enqueue(p);
-    } else if used::known(key) {
+    } else if used::known(key) && !flags.deprioritized && !flags.bvh_traversal && !flags.spared {
         if let Some(q) = preload() {
             q.list.lock().unwrap().push_back(p);
             q.cv.notify_one();
@@ -695,6 +717,14 @@ fn preload() -> Option<&'static Preload> {
                     // (released by the title meanwhile)
                     if p.orphan.load(Ordering::Acquire) {
                         drop_unstarted_job(&p);
+                        continue;
+                    }
+                    // Never speculatively compile deprioritized/heavy/BVH/spared pipelines at
+                    // THREAD_PRIORITY_LOWEST; leave `p.job` untouched until actually bound.
+                    if p.deprioritized.load(Ordering::Acquire)
+                        || p.bvh_traversal.load(Ordering::Acquire)
+                        || p.spared.load(Ordering::Acquire)
+                    {
                         continue;
                     }
                     // Pause speculative preload under low commit headroom (< 4 GiB) unless a bind
@@ -1258,9 +1288,10 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
         return resolve_within(&p, pso, budget);
     }
     if p.deprioritized.load(Ordering::Acquire) && !building_here() {
-        // Heavy non-RT producer compute PSO: compile on an `xcl-pso-*` worker (where `BIG_COMPILES`
-        // gating bounds concurrent driver compiles) and wait until ready so the producer dispatch
-        // is NEVER skipped.
+        // Heavy non-RT producer compute PSO: mark wanted BEFORE enqueueing so it jumps straight
+        // to the front of `PsoQueue` on `xcl-pso-*` workers (under `BIG_COMPILES`/`GIANT_COMPILES`
+        // gating) and wait until ready so the producer dispatch is NEVER skipped.
+        p.want();
         if !p.sent.swap(true, Ordering::AcqRel) {
             enqueue(p.clone());
         }
@@ -1269,8 +1300,8 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
         if let Some(job) = job {
             complete(&p, job());
         }
+        p.want();
     }
-    p.want();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
@@ -1539,5 +1570,31 @@ mod pso_queue_tests {
         assert!(!should_pause_preload(Some(PRELOAD_PAUSE_COMMIT)));
         assert!(should_pause_preload(Some(PRELOAD_PAUSE_COMMIT - 1)));
         assert!(should_pause_preload(Some(0)));
+    }
+
+    #[test]
+    fn heavy_and_bvh_pipelines_are_not_speculatively_preloaded() {
+        let heavy_standin = 0x7E57_B0D1usize;
+        let heavy_key = 0x5EED_B0D1u64;
+        used::earlier_run_used(heavy_key);
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_job = ran.clone();
+        submit_lazy_with_flags(
+            heavy_standin,
+            true,
+            Box::new(move || {
+                ran_job.store(true, Ordering::Release);
+                0x5D5D
+            }),
+            heavy_key,
+            SubmitFlags { spared: false, bvh_traversal: false, deprioritized: true },
+        );
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(!ran.load(Ordering::Acquire), "heavy deprioritized PSO must not be speculatively preloaded");
+        assert!(is_pending(heavy_standin));
+        // Once actually bound, resolve_wait compiles it on a worker and returns the real PSO.
+        assert_eq!(resolve_wait_for(heavy_standin, None), 0x5D5D);
+        assert!(ran.load(Ordering::Acquire));
+        let _ = released(heavy_standin);
     }
 }
