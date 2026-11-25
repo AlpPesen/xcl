@@ -772,6 +772,34 @@ unsafe fn ensure_dispatch_heaps(list: &ID3D12GraphicsCommandList, bound: &mut Ve
     ensure_dispatch_heaps_with(list, bound, has_sampler, view, sampler);
 }
 
+unsafe fn ensure_uav_clear_heap(list: &ID3D12GraphicsCommandList, bound: &mut Vec<ID3D12DescriptorHeap>, has_sampler: &mut bool) {
+    let mut dev: Option<ID3D12Device> = None;
+    let _ = list.GetDevice(&mut dev);
+    let view = super::console_heap::global_heap();
+    let view = match dev.as_ref().map(|d| d.as_raw() as usize) {
+        Some(dev_raw) => heap_on_device(view, dev_raw),
+        None => view,
+    };
+    let Some(view) = view else { return };
+    if bound.iter().any(|h| h.as_raw() == view.as_raw()) {
+        return;
+    }
+    let sampler = (*has_sampler)
+        .then(|| bound.iter().find(|h| h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER).cloned())
+        .flatten();
+    let mut next = Vec::with_capacity(2);
+    next.push(view);
+    if let Some(s) = sampler {
+        next.push(s);
+        *has_sampler = true;
+    } else {
+        *has_sampler = false;
+    }
+    let args: Vec<Option<ID3D12DescriptorHeap>> = next.iter().cloned().map(Some).collect();
+    list.SetDescriptorHeaps(&args);
+    *bound = next;
+}
+
 /// Turn the recorded console commands into commands on the PC list and close it.
 pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let obj = obj as usize;
@@ -870,6 +898,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let (gpu, cpu) = (super::console_heap::slot(q(0)), super::console_heap::slot(q(1)));
                 match (gpu, cpu, ID3D12Resource::from_raw_borrowed(&res)) {
                     (Some(g), Some(c), Some(r)) if g.pc_gpu_uav != 0 => {
+                        if g.shared_srv != 0 {
+                            ensure_uav_clear_heap(&list, &mut bound_heaps, &mut has_sampler_heap);
+                        }
                         let (gh, ch) = (D3D12_GPU_DESCRIPTOR_HANDLE { ptr: g.pc_gpu_uav }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: c.pc_uav as usize });
                         if get(1) != 0 {
                             let f = values.map(f32::from_bits);

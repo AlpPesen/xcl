@@ -3910,6 +3910,43 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
     out
 }
 
+/// Ensure `view` (the shared shader-visible CBV/SRV/UAV heap) is bound on a command list,
+/// preserving any currently bound sampler heap. Returns `None` when `view` is already bound.
+fn bind_view_heap(view: usize, current: &[usize], has_sampler: bool, is_sampler: impl Fn(usize) -> bool) -> Option<(Vec<usize>, bool)> {
+    if current.contains(&view) {
+        return None;
+    }
+    if has_sampler {
+        if let Some(&s) = current.iter().find(|&&p| is_sampler(p)) {
+            return Some((vec![view, s], true));
+        }
+    }
+    Some((vec![view], false))
+}
+
+/// Bind `console_heap::global_heap()` on `this` when a console-slot `ClearUnorderedAccessView*`
+/// passes a GPU handle from the shared view heap and that heap is not currently bound (for
+/// example after `Reset()` or `SetDescriptorHeaps(0, NULL)`, even when `heap_windows()` is off).
+unsafe fn ensure_console_view_heap(this: *mut c_void) {
+    let Some(view) = super::console_heap::global_heap() else { return };
+    let view_raw = view.as_raw() as usize;
+    let mut to_bind: Option<Vec<usize>> = None;
+    with_bindings(this, |b| {
+        let next = bind_view_heap(view_raw, &b.heaps, b.has_sampler_heap, |p| {
+            let p = p as *mut c_void;
+            ID3D12DescriptorHeap::from_raw_borrowed(&p).is_some_and(|h| h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+        });
+        if let Some((next, has_sampler)) = next {
+            b.heaps = next.clone();
+            b.has_sampler_heap = has_sampler;
+            to_bind = Some(next);
+        }
+    });
+    if let Some(raw) = to_bind {
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, 28)(this, raw.len() as u32, raw.as_ptr());
+    }
+}
+
 /// Translated shaders with directly-indexed root signatures (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`
 /// / `SAMPLER_HEAP_DIRECTLY_INDEXED`) and heap windows (`pso::heap_windows`) require valid
 /// shader-visible view and sampler heaps to be bound even if the title bound 0 heaps (or only a
@@ -4495,8 +4532,8 @@ const PC_CLEAR_UAV_FLOAT: usize = 50;
 #[derive(Debug, PartialEq)]
 enum UavClearHandles {
     /// both are console slots: their PC UAVs (GPU: in the heap lists bind; CPU: in the
-    /// title's CPU-only heap)
-    Console { gpu: u64, cpu: u64 },
+    /// title's CPU-only heap); `shared` is true when `gpu` lives in `console_heap::global_heap()`
+    Console { gpu: u64, cpu: u64, shared: bool },
     /// neither is a console slot: PC handles already
     Pc,
     /// one console slot and one not, or a slot with no shader-visible UAV
@@ -4506,7 +4543,9 @@ enum UavClearHandles {
 fn uav_clear_handles(gpu: Option<super::console_heap::Slot>, cpu: Option<super::console_heap::Slot>) -> UavClearHandles {
     match (gpu, cpu) {
         (None, None) => UavClearHandles::Pc,
-        (Some(g), Some(c)) if !g.sampler && !c.sampler && g.pc_gpu_uav != 0 => UavClearHandles::Console { gpu: g.pc_gpu_uav, cpu: c.pc_uav },
+        (Some(g), Some(c)) if !g.sampler && !c.sampler && g.pc_gpu_uav != 0 => {
+            UavClearHandles::Console { gpu: g.pc_gpu_uav, cpu: c.pc_uav, shared: g.shared_srv != 0 }
+        }
         _ => UavClearHandles::Unusable,
     }
 }
@@ -4515,9 +4554,9 @@ fn uav_clear_handles(gpu: Option<super::console_heap::Slot>, cpu: Option<super::
 /// resource, values[4], rects, rect list) (PC #49 / #50): console handles are addresses of
 /// console heap slots (heap #9 / #10), not PC descriptors
 unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usize, values: *const c_void, n: u32, rects: *const windows::Win32::Foundation::RECT) {
-    let (gpu, cpu) = match uav_clear_handles(super::console_heap::slot(gpu), super::console_heap::slot(cpu)) {
-        UavClearHandles::Console { gpu, cpu } => (gpu, cpu),
-        UavClearHandles::Pc => (gpu, cpu),
+    let (gpu, cpu, shared) = match uav_clear_handles(super::console_heap::slot(gpu), super::console_heap::slot(cpu)) {
+        UavClearHandles::Console { gpu, cpu, shared } => (gpu, cpu, shared),
+        UavClearHandles::Pc => (gpu, cpu, false),
         UavClearHandles::Unusable => {
             static N: AtomicU64 = AtomicU64::new(0);
             if once(&N, 1) {
@@ -4526,6 +4565,9 @@ unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usi
             return;
         }
     };
+    if shared {
+        ensure_console_view_heap(this);
+    }
     pc::<unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT)>(this, slot)(this, gpu, cpu, res, values, n, rects)
 }
 
@@ -7286,21 +7328,38 @@ mod tests {
         assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x10, 0x99], true), None);
     }
 
+    #[test]
+    fn bind_view_heap_binds_shared_heap_after_reset_and_preserves_sampler() {
+        let is_sampler = |p: usize| p == 0x20 || p == 0x99;
+        // Empty after Reset() / SetDescriptorHeaps(0, NULL) -> binds shared view heap
+        assert_eq!(bind_view_heap(0x10, &[], false, is_sampler), Some((vec![0x10], false)));
+        // Shared view heap already bound -> no-op
+        assert_eq!(bind_view_heap(0x10, &[0x10], false, is_sampler), None);
+        assert_eq!(bind_view_heap(0x10, &[0x10, 0x20], true, is_sampler), None);
+        // Sampler heap bound alone -> bind shared view heap alongside it
+        assert_eq!(bind_view_heap(0x10, &[0x20], true, is_sampler), Some((vec![0x10, 0x20], true)));
+        // Different view heap bound with sampler -> replace view heap while keeping sampler
+        assert_eq!(bind_view_heap(0x10, &[0x77, 0x99], true, is_sampler), Some((vec![0x10, 0x99], true)));
+        // Different view heap bound alone -> replace with shared view heap
+        assert_eq!(bind_view_heap(0x10, &[0x77], false, is_sampler), Some((vec![0x10], false)));
+    }
+
     /// ClearUnorderedAccessView* handles: two console slots → their PC UAVs, two PC handles as
     /// they are, anything else not usable.
     #[test]
     fn uav_clear_handles_translate_console_slots() {
         use super::super::console_heap::Slot;
-        let s = |pc_uav: u64, pc_gpu_uav: u64, sampler: bool| Some(Slot { at: 0x1000, index: 1, pc_srv: 0, pc_uav, pc_gpu_uav, sampler, shared_srv: 0, k: 0 });
-        assert_eq!(uav_clear_handles(s(0x10, 0x5010, false), s(0x20, 0, false)), UavClearHandles::Console { gpu: 0x5010, cpu: 0x20 });
+        let s = |pc_uav: u64, pc_gpu_uav: u64, shared_srv: u64, sampler: bool| Some(Slot { at: 0x1000, index: 1, pc_srv: 0, pc_uav, pc_gpu_uav, sampler, shared_srv, k: 0 });
+        assert_eq!(uav_clear_handles(s(0x10, 0x5010, 0, false), s(0x20, 0, 0, false)), UavClearHandles::Console { gpu: 0x5010, cpu: 0x20, shared: false });
+        assert_eq!(uav_clear_handles(s(0x10, 0x5010, 0x9000, false), s(0x20, 0, 0, false)), UavClearHandles::Console { gpu: 0x5010, cpu: 0x20, shared: true });
         assert_eq!(uav_clear_handles(None, None), UavClearHandles::Pc);
         // a console slot beside a PC handle, a GPU slot of a heap that is not shader visible,
         // sampler slots
-        assert_eq!(uav_clear_handles(s(0x10, 0x5010, false), None), UavClearHandles::Unusable);
-        assert_eq!(uav_clear_handles(None, s(0x20, 0, false)), UavClearHandles::Unusable);
-        assert_eq!(uav_clear_handles(s(0x10, 0, false), s(0x20, 0, false)), UavClearHandles::Unusable);
-        assert_eq!(uav_clear_handles(s(0x10, 0x5010, false), s(0, 0, true)), UavClearHandles::Unusable);
-        assert_eq!(uav_clear_handles(s(0, 0, true), s(0x20, 0, false)), UavClearHandles::Unusable);
+        assert_eq!(uav_clear_handles(s(0x10, 0x5010, 0, false), None), UavClearHandles::Unusable);
+        assert_eq!(uav_clear_handles(None, s(0x20, 0, 0, false)), UavClearHandles::Unusable);
+        assert_eq!(uav_clear_handles(s(0x10, 0, 0, false), s(0x20, 0, 0, false)), UavClearHandles::Unusable);
+        assert_eq!(uav_clear_handles(s(0x10, 0x5010, 0, false), s(0, 0, 0, true)), UavClearHandles::Unusable);
+        assert_eq!(uav_clear_handles(s(0, 0, 0, true), s(0x20, 0, 0, false)), UavClearHandles::Unusable);
     }
 
     /// Console code clears a UAV with its console heap slots (heap #9 / #10 give it their
