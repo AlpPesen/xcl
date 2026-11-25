@@ -10228,6 +10228,9 @@ mod pso_lib {
         riid: *const GUID,
         ppv: *mut *mut c_void,
     ) -> bool {
+        if ppv.is_null() {
+            return false;
+        }
         let Some(lib) = library_for(device) else { return false };
         let Some(pso) = lib.load_compute(key, desc) else { return false };
         if deliver_adopted(pso, riid, ppv) {
@@ -10244,6 +10247,9 @@ mod pso_lib {
         rs: *mut c_void,
         cs: &[u8],
     ) -> Option<*mut c_void> {
+        if rs.is_null() || cs.is_empty() {
+            return None;
+        }
         let lib = library_for(device)?;
         let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
         cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
@@ -10260,6 +10266,9 @@ mod pso_lib {
         riid: *const GUID,
         ppv: *mut *mut c_void,
     ) -> bool {
+        if ppv.is_null() {
+            return false;
+        }
         let Some(lib) = library_for(device) else { return false };
         let Some(pso) = lib.load_graphics(key, desc) else { return false };
         if deliver_adopted(pso, riid, ppv) {
@@ -10277,6 +10286,9 @@ mod pso_lib {
         riid: *const GUID,
         ppv: *mut *mut c_void,
     ) -> bool {
+        if ppv.is_null() || stream_bytes.is_empty() {
+            return false;
+        }
         let Some(lib) = library_for(device) else { return false };
         let sdesc = D3D12_PIPELINE_STATE_STREAM_DESC {
             SizeInBytes: stream_bytes.len(),

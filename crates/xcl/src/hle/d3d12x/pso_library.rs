@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock};
 
 use windows::core::{Interface, HSTRING};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -360,13 +360,14 @@ pub struct MmapPipelineLibrary {
     dirty: AtomicU64,
     saving: AtomicBool,
     save_lock: Mutex<()>,
-    /// Synchronizes concurrent `StorePipeline` (shared read lock) against `GetSerializedSize` +
-    /// `Serialize` (exclusive write lock) so serialization never races a concurrent size growth.
-    lib_rw: RwLock<()>,
+    /// Serializes all `ID3D12PipelineLibrary1` operations (`Load*`, `StorePipeline`,
+    /// `GetSerializedSize`, `Serialize`). `D3D12Core.dll` is not thread-safe for concurrent
+    /// `StorePipeline` + `Load*` (races on internal lookup tables -> 0xc0000005).
+    lib_lock: Mutex<()>,
 }
 
-// `ID3D12PipelineLibrary1` methods are free-threaded per the D3D12 specification; `_backing` is
-// read-only and `save_lock` serializes disk snapshots.
+// `_backing` is read-only; `lib_lock` serializes all `ID3D12PipelineLibrary1` calls and
+// `save_lock` serializes disk snapshots.
 unsafe impl Send for MmapPipelineLibrary {}
 unsafe impl Sync for MmapPipelineLibrary {}
 
@@ -393,7 +394,7 @@ impl MmapPipelineLibrary {
                         dirty: AtomicU64::new(0),
                         saving: AtomicBool::new(false),
                         save_lock: Mutex::new(()),
-                        lib_rw: RwLock::new(()),
+                        lib_lock: Mutex::new(()),
                     });
                 }
                 Err(e) => {
@@ -439,31 +440,43 @@ impl MmapPipelineLibrary {
             dirty: AtomicU64::new(0),
             saving: AtomicBool::new(false),
             save_lock: Mutex::new(()),
-            lib_rw: RwLock::new(()),
+            lib_lock: Mutex::new(()),
         })
     }
 
     pub unsafe fn load_compute(&self, key: &str, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC) -> Option<ID3D12PipelineState> {
+        if key.is_empty() || desc.pRootSignature.is_none() || desc.CS.pShaderBytecode.is_null() || desc.CS.BytecodeLength == 0 {
+            return None;
+        }
         let name = HSTRING::from(key);
-        let _r = self.lib_rw.read().unwrap();
+        let _g = self.lib_lock.lock().unwrap();
         self.lib.LoadComputePipeline(&name, desc).ok()
     }
 
     pub unsafe fn load_graphics(&self, key: &str, desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Option<ID3D12PipelineState> {
+        if key.is_empty() || desc.pRootSignature.is_none() {
+            return None;
+        }
         let name = HSTRING::from(key);
-        let _r = self.lib_rw.read().unwrap();
+        let _g = self.lib_lock.lock().unwrap();
         self.lib.LoadGraphicsPipeline(&name, desc).ok()
     }
 
     pub unsafe fn load_stream(&self, key: &str, desc: &D3D12_PIPELINE_STATE_STREAM_DESC) -> Option<ID3D12PipelineState> {
+        if key.is_empty() || desc.pPipelineStateSubobjectStream.is_null() || desc.SizeInBytes == 0 {
+            return None;
+        }
         let name = HSTRING::from(key);
-        let _r = self.lib_rw.read().unwrap();
+        let _g = self.lib_lock.lock().unwrap();
         self.lib.LoadPipeline(&name, desc).ok()
     }
 
     pub unsafe fn store(&self, key: &str, pso: &ID3D12PipelineState) -> bool {
+        if key.is_empty() {
+            return false;
+        }
         let name = HSTRING::from(key);
-        let _r = self.lib_rw.read().unwrap();
+        let _g = self.lib_lock.lock().unwrap();
         if self.lib.StorePipeline(&name, pso).is_ok() {
             self.dirty.fetch_add(1, Ordering::Relaxed);
             true
@@ -476,15 +489,15 @@ impl MmapPipelineLibrary {
         self.dirty.load(Ordering::Relaxed)
     }
 
-    /// Serialize under `save_lock` (already held by caller), taking `lib_rw.write()` so no
-    /// `StorePipeline` can grow the library between `GetSerializedSize` and `Serialize`.
+    /// Serialize under `save_lock` (already held by caller), taking `lib_lock` so no concurrent
+    /// `StorePipeline` or `Load*` can race `GetSerializedSize` + `Serialize`.
     unsafe fn save_locked(&self, min_dirty: u64) -> Option<PathBuf> {
         let dirty_before = self.dirty.load(Ordering::Acquire);
         if dirty_before < min_dirty {
             return None;
         }
         let (size, saved) = {
-            let _w = self.lib_rw.write().unwrap();
+            let _g = self.lib_lock.lock().unwrap();
             let size = self.lib.GetSerializedSize();
             let saved = if size > 0 {
                 self.store.write_generation(size, |buf| self.lib.Serialize(buf).is_ok())
