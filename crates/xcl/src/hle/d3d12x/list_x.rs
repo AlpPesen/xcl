@@ -2974,14 +2974,20 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     }
     let next_pc = match next_pc {
         Some(p) => p,
-        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
-            Some(p) => p,
-            None => {
-                static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
-                warn(&CREATE_ERR, "mid-list split", format_args!("CreateCommandList failed"));
-                return None;
+        None => {
+            let pc_alloc = super::alloc_pool::current(alloc);
+            match real::create_raw_pc_command_list(dev.as_raw(), ty, pc_alloc, init_pso) {
+                Some(p) => {
+                    super::alloc_pool::created_on(p as usize, pc_alloc, ty.0);
+                    p
+                }
+                None => {
+                    static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
+                    warn(&CREATE_ERR, "mid-list split", format_args!("CreateCommandList failed"));
+                    return None;
+                }
             }
-        },
+        }
     };
 
     // the next segment is a recording of its own (reset or made here, not through `cl_reset`)
@@ -3125,7 +3131,12 @@ unsafe fn deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_CO
     };
     let p = match super::title_list::pop_spare(wrapper).filter(emptied) {
         Some(p) => p,
-        None => real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(own), 0)?,
+        None => {
+            let pc_alloc = super::alloc_pool::current(own);
+            let made = real::create_raw_pc_command_list(dev.as_raw(), ty, pc_alloc, 0)?;
+            super::alloc_pool::created_on(made as usize, pc_alloc, ty.0);
+            made
+        }
     };
     let ext = *(p as *const usize);
     pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);

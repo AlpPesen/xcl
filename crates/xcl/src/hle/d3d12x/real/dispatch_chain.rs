@@ -41,10 +41,23 @@ fn scratch_budget() -> u64 {
     *B.get_or_init(|| std::env::var("XCL_SPLIT_SCRATCH_MB").ok().and_then(|v| v.trim().parse().ok()).filter(|&m| m > 0).unwrap_or(256u64).min(4096) << 20)
 }
 
+/// Thread name for the dedicated background whole-form compiler. The `xcl-pso` prefix ensures
+/// `driver_compile_identified` routes its driver compiles through `compile_slots` (`BIG_COMPILES`
+/// / `MEDIUM_COMPILES` / `GIANT_COMPILES`) and `big_compile_commit_free` commit-headroom gating.
+const WHOLE_WORKER_THREAD_NAME: &str = "xcl-pso-whole";
+
+/// Deterministic cross-run `.plib` key for a split compute pipeline (piece or whole form).
+/// Prefixed with `s` (`sc-...`) so 8-parameter split-root-signature PSOs never collide with
+/// 6-parameter standard compute PSOs (`c-...`) in the shared pipeline library.
+fn split_plib_key(dxil: &[u8], samplers: &[pso::StaticSampler], flags: i32) -> String {
+    format!("s{}", pso_lib::compute_key(dxil, samplers, flags))
+}
+
 struct PipelineBuilder {
     device: ID3D12Device,
     create: PsoFn,
     signature: ID3D12RootSignature,
+    samplers: Vec<pso::StaticSampler>,
     flags: D3D12_PIPELINE_STATE_FLAGS,
     node: u32,
     record: u64,
@@ -52,11 +65,27 @@ struct PipelineBuilder {
 
 impl PipelineBuilder {
     unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Option<ID3D12PipelineState> {
+        let lib_key = split_plib_key(dxil, &self.samplers, self.flags.0);
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
+        let lib_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(self.signature.as_raw()),
+            CS: bytecode(dxil),
+            NodeMask: self.node,
+            Flags: self.flags,
+            ..Default::default()
+        };
         let mut raw = std::ptr::null_mut();
+        if pso_lib::try_load_compute(self.device.as_raw(), &lib_key, &lib_desc, iid, &mut raw) && !raw.is_null() {
+            return Some(ID3D12PipelineState::from_raw(raw));
+        }
         let (hr, _, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
             dxil, self.record, iid, &mut raw, true);
-        (hr >= 0 && !raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw))
+        if hr >= 0 && !raw.is_null() {
+            pso_lib::store_pipeline(self.device.as_raw(), &lib_key, raw);
+            Some(ID3D12PipelineState::from_raw(raw))
+        } else {
+            None
+        }
     }
 }
 
@@ -107,21 +136,49 @@ impl Chain {
         if self.whole_started.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return;
         }
-        let chain = Arc::clone(self);
-        let record = chain.builder.record;
+        if !enqueue_whole_async(Arc::clone(self)) {
+            self.whole_started.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Queue a background whole-form build onto the single `xcl-pso-whole` worker so multiple split
+/// programs never compile huge whole forms concurrently and every build goes through
+/// `driver_compile_identified`'s `BIG_COMPILES` + commit-headroom gate.
+fn enqueue_whole_async(chain: Arc<Chain>) -> bool {
+    static QUEUE: LazyLock<(Mutex<std::collections::VecDeque<Arc<Chain>>>, std::sync::Condvar)> =
+        LazyLock::new(|| (Mutex::new(std::collections::VecDeque::new()), std::sync::Condvar::new()));
+    static WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+    if WORKER_STARTED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
         if std::thread::Builder::new()
-            .name(format!("xcl-whole-{record:016x}"))
-            .spawn(move || {
-                if let Err(e) = unsafe { chain.whole() } {
-                    chain.whole_failed.store(true, Ordering::Release);
-                    crate::xlog_warn!("D3D12.X: background whole compute PSO for cs {record:016x} failed: {e}");
+            .name(WHOLE_WORKER_THREAD_NAME.into())
+            .spawn(|| {
+                let (lock, cv) = &*QUEUE;
+                loop {
+                    let chain = {
+                        let mut q = lock.lock().unwrap();
+                        while q.is_empty() {
+                            q = cv.wait(q).unwrap();
+                        }
+                        q.pop_front().unwrap()
+                    };
+                    let record = chain.builder.record;
+                    if let Err(e) = unsafe { chain.whole() } {
+                        chain.whole_failed.store(true, Ordering::Release);
+                        crate::xlog_warn!("D3D12.X: background whole compute PSO for cs {record:016x} failed: {e}");
+                    }
                 }
             })
             .is_err()
         {
-            self.whole_started.store(false, Ordering::Release);
+            WORKER_STARTED.store(false, Ordering::Release);
+            return false;
         }
     }
+    let (lock, cv) = &*QUEUE;
+    lock.lock().unwrap().push_back(chain);
+    cv.notify_one();
+    true
 }
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
@@ -134,7 +191,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let signature = pso::dispatch_chain_root_signature(dev, samplers).ok()?;
     let rs = signature.as_raw() as usize;
     let builder = Arc::new(PipelineBuilder { device: dev.clone(), create, signature,
-        flags: desc.Flags, node: desc.NodeMask, record });
+        samplers: samplers.to_vec(), flags: desc.Flags, node: desc.NodeMask, record });
     let jobs = (0..plan.pieces.len()).map(|i| {
         let plan = plan.clone();
         let builder = builder.clone();
@@ -718,5 +775,26 @@ mod tests {
         assert_eq!(super::indirect_rounds(&[[100, 4, 1]], 100, 0, 16), 5);
         assert_eq!(super::indirect_rounds(&[[100, 1, 1]], 100, 8, 16), 10);
         assert_eq!(super::indirect_rounds(&[[100, 40, 1]], 100, 0, 16), 16);
+    }
+
+    #[test]
+    fn whole_worker_thread_name_matches_driver_compile_gate() {
+        assert!(
+            super::WHOLE_WORKER_THREAD_NAME.starts_with("xcl-pso"),
+            "whole-form background worker must carry the xcl-pso prefix so driver_compile_identified gates it"
+        );
+    }
+
+    #[test]
+    fn split_plib_key_is_distinct_from_standard_compute_key() {
+        let dxil = b"DXBC-fake-split-whole-dxil";
+        let samplers = [([1, 2, 3, 4], false)];
+        let std_key = super::super::pso_lib::compute_key(dxil, &samplers, 0);
+        let split_key = super::split_plib_key(dxil, &samplers, 0);
+        assert!(split_key.starts_with("sc-"));
+        assert_ne!(split_key, std_key);
+        assert_eq!(split_key, super::split_plib_key(dxil, &samplers, 0));
+        assert_ne!(split_key, super::split_plib_key(dxil, &[], 0));
+        assert_ne!(split_key, super::split_plib_key(dxil, &samplers, 1));
     }
 }
