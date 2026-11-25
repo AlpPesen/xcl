@@ -118,6 +118,29 @@ struct PreludeScaleJob {
 
 type PreludeEntry = (ID3D12CommandAllocator, ID3D12GraphicsCommandList, usize, i32);
 
+/// Paired persistently-mapped `UPLOAD` slab and L1 VRAM `DEFAULT` (`ALLOW_UNORDERED_ACCESS`) slab
+/// for a recording's `io` (`u0`) user-SGPR blocks. CPU writes `io` bytes into `upload` during
+/// command-list recording and `prelude_list_for` copies `0..used` into `vram` once before the
+/// segment executes, avoiding PCIe/system-RAM stalls on every shader's first `u0` load.
+struct IoBlock {
+    vram: ID3D12Resource,
+    upload: ID3D12Resource,
+    mapped: usize,
+    vram_va: u64,
+    cap: u64,
+    used: u64,
+    dev_key: usize,
+}
+
+impl Drop for IoBlock {
+    fn drop(&mut self) {
+        if self.mapped != 0 {
+            unsafe { self.upload.Unmap(0, None) };
+            self.mapped = 0;
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     layout: Option<Arc<Layout>>,
@@ -178,6 +201,8 @@ struct State {
     io_cache_cs: Option<(u64, Option<u32>, u64)>,
     io_cache_tp_cs: Option<(u64, u64)>,
     io_cache_tp_ms: Option<(u64, u64)>,
+    /// L1 VRAM `io` (`u0`) slabs populated during this recording and copied in `prelude_list_for`
+    io_blocks: Vec<IoBlock>,
 }
 
 /// A recording's blocks of rewritten indirect arguments, and most bytes of them (past it, its
@@ -186,11 +211,17 @@ const SCRATCH_BLOCK: u64 = 1 << 20;
 const SCRATCH_CAP: u64 = 16 << 20;
 /// Most bytes of buffers kept for reuse (`FREE_RES`)
 const FREE_RES_CAP: u64 = 256 << 20;
+/// Size of one pooled VRAM `io` (`u0`) slab (64 KiB = 256 distinct 256-byte `io` slots).
+const IO_BLOCK_BYTES: u64 = 64 << 10;
+/// Most bytes of VRAM `io` slabs kept for reuse (`FREE_IO`).
+const FREE_IO_CAP: u64 = 64 << 20;
 /// Most recycled prelude (allocator, list) pairs kept for reuse (`FREE_PRELUDE`)
-const FREE_PRELUDE_CAP: usize = 64;
+const FREE_PRELUDE_CAP: usize = 256;
 
 static ALLOC_RES: Mutex<Option<HashMap<usize, Vec<(ID3D12Resource, u64, usize)>>>> = Mutex::new(None);
 static FREE_RES: Mutex<Vec<(ID3D12Resource, u64, usize)>> = Mutex::new(Vec::new());
+static ALLOC_IO: Mutex<Option<HashMap<usize, Vec<IoBlock>>>> = Mutex::new(None);
+static FREE_IO: Mutex<Vec<IoBlock>> = Mutex::new(Vec::new());
 static ALLOC_PRELUDE: Mutex<Option<HashMap<usize, Vec<PreludeEntry>>>> = Mutex::new(None);
 static FREE_PRELUDE: Mutex<Vec<PreludeEntry>> = Mutex::new(Vec::new());
 
@@ -199,6 +230,13 @@ fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, us
         return;
     }
     ALLOC_RES.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().append(&mut bufs);
+}
+
+fn hold_io_until_reset(allocator: usize, mut blocks: Vec<IoBlock>) {
+    if blocks.is_empty() || allocator == 0 {
+        return;
+    }
+    ALLOC_IO.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().append(&mut blocks);
 }
 
 fn hold_prelude_until_reset(allocator: usize, entry: Option<PreludeEntry>) {
@@ -219,6 +257,16 @@ pub(super) fn release_allocator_res(allocator: usize) {
             }
         }
     }
+    if let Some(blocks) = ALLOC_IO.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
+        let mut free = FREE_IO.lock().unwrap();
+        for mut b in blocks {
+            b.used = 0;
+            let held: u64 = free.iter().map(|f| f.cap).sum();
+            if io_pool_keeps(held, b.cap) {
+                free.push(b);
+            }
+        }
+    }
     if let Some(entries) = ALLOC_PRELUDE.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
         let mut free = FREE_PRELUDE.lock().unwrap();
         for e in entries {
@@ -232,6 +280,121 @@ pub(super) fn release_allocator_res(allocator: usize) {
 /// Whether `FREE_RES`, holding `count` buffers of `held` bytes, keeps one of `bytes` more.
 fn pool_keeps(count: usize, held: u64, bytes: u64) -> bool {
     count < 16 && held + bytes <= FREE_RES_CAP
+}
+
+/// Whether `FREE_IO`, holding `held` bytes of VRAM `io` slabs, keeps one of `bytes` more.
+fn io_pool_keeps(held: u64, bytes: u64) -> bool {
+    held.saturating_add(bytes) <= FREE_IO_CAP
+}
+
+/// `XCL_VRAM_IO=0`: keep `io` (`u0`) user-SGPR buffers in UMA system RAM instead of L1 VRAM.
+fn vram_io_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_VRAM_IO").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Return the device if `this` can place `io` (`u0`) slots in L1 VRAM (wrapped DIRECT/COMPUTE
+/// command list whose prelude list runs before it on submit).
+unsafe fn vram_io_device(this: *mut c_void) -> Option<ID3D12Device> {
+    if !vram_io_on()
+        || super::title_list::wrapper_of(this).is_none()
+        || !matches!(
+            super::list_x::tracked_list_type(this),
+            Some(D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE)
+        )
+    {
+        return None;
+    }
+    super::real::list_device(this)
+}
+
+unsafe fn create_io_block(dev: &ID3D12Device, cap: u64) -> Option<IoBlock> {
+    let vram_desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: cap,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut vram: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, CreationNodeMask: 1, VisibleNodeMask: 1, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE,
+        &vram_desc,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        None,
+        &mut vram,
+    )
+    .ok()?;
+    let vram = vram?;
+    let _ = vram.SetName(windows::core::w!("xcl io vram"));
+    let vram_va = vram.GetGPUVirtualAddress();
+    if vram_va == 0 {
+        return None;
+    }
+    let up_desc = D3D12_RESOURCE_DESC {
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+        ..vram_desc
+    };
+    let mut upload: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, CreationNodeMask: 1, VisibleNodeMask: 1, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE,
+        &up_desc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        None,
+        &mut upload,
+    )
+    .ok()?;
+    let upload = upload?;
+    let _ = upload.SetName(windows::core::w!("xcl io upload"));
+    let mut mapped = std::ptr::null_mut();
+    let empty_read = D3D12_RANGE { Begin: 0, End: 0 };
+    upload.Map(0, Some(&empty_read), Some(&mut mapped)).ok()?;
+    if mapped.is_null() {
+        return None;
+    }
+    Some(IoBlock {
+        vram,
+        upload,
+        mapped: mapped as usize,
+        vram_va,
+        cap,
+        used: 0,
+        dev_key: dev.as_raw() as usize,
+    })
+}
+
+/// Write `bytes` into a 256-byte-aligned slot of `io_blocks` and return its L1 VRAM GPU VA.
+unsafe fn alloc_vram_io_in(io_blocks: &mut Vec<IoBlock>, allocator: usize, prelude_built: bool, dev: &ID3D12Device, bytes: &[u8]) -> Option<u64> {
+    if allocator == 0 || prelude_built {
+        return None;
+    }
+    let take = (bytes.len().max(16) as u64).next_multiple_of(256);
+    if let Some(b) = io_blocks.last_mut().filter(|b| b.used + take <= b.cap) {
+        let off = b.used;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), (b.mapped as *mut u8).add(off as usize), bytes.len());
+        b.used += take;
+        return Some(b.vram_va + off);
+    }
+    let dev_key = dev.as_raw() as usize;
+    let mut block = {
+        let mut free = FREE_IO.lock().unwrap();
+        free.iter().position(|b| b.dev_key == dev_key && b.cap >= take).map(|i| free.swap_remove(i))
+    };
+    if block.is_none() {
+        block = create_io_block(dev, take.max(IO_BLOCK_BYTES));
+    }
+    let mut b = block?;
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.mapped as *mut u8, bytes.len());
+    b.used = take;
+    let va = b.vram_va;
+    io_blocks.push(b);
+    Some(va)
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -277,6 +440,14 @@ pub(super) fn note_gpu_write(list: *mut c_void) {
     });
 }
 
+/// Allow indirect-argument prelude hoisting on a freshly split continuation segment whose
+/// predecessor finished on the same queue with no cross-queue head fence wait.
+pub(super) fn unblock_prelude(list: *mut c_void) {
+    with(list, |s| {
+        s.prelude_blocked = false;
+    });
+}
+
 /// Resolve the PC backing allocator that actually owns `list`'s recording (`alloc_pool` can swap
 /// a title allocator to a new PC allocator while recordings on the old backing are still in flight,
 /// so UMA arena blocks and scratch buffers must stay pinned to the backing allocator until
@@ -293,7 +464,7 @@ fn backing_allocator(list: *mut c_void, allocator: usize) -> usize {
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     let backing = backing_allocator(list, allocator);
-    let (old, blocks, res_bufs, prelude) = with(list, |s| {
+    let (old, blocks, res_bufs, io_blocks, prelude) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
         s.pso = initial_pso;
@@ -330,11 +501,13 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
         }
+        let io_blocks = std::mem::take(&mut s.io_blocks);
         s.rs_cs = 0;
-        (old, std::mem::take(&mut s.uma), res_bufs, prelude)
+        (old, std::mem::take(&mut s.uma), res_bufs, io_blocks, prelude)
     });
     console_list::hold_until_reset(old, blocks);
     hold_res_until_reset(old, res_bufs);
+    hold_io_until_reset(old, io_blocks);
     hold_prelude_until_reset(old, prelude);
 }
 
@@ -373,7 +546,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     let (layout, args, layout_gfx, args_gfx, rs_gfx, rs_cs, pso, heaps) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.rs_cs, s.pso, s.heaps)
     });
-    let (old, blocks, res_bufs, prelude) = with(to, |s| {
+    let (old, blocks, res_bufs, io_blocks, prelude) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
         s.layout = layout;
@@ -408,10 +581,12 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.io_cache_cs = None;
         s.io_cache_tp_cs = None;
         s.io_cache_tp_ms = None;
-        (old, std::mem::take(&mut s.uma), std::mem::take(&mut s.res_retired), prelude)
+        let io_blocks = std::mem::take(&mut s.io_blocks);
+        (old, std::mem::take(&mut s.uma), std::mem::take(&mut s.res_retired), io_blocks, prelude)
     });
     console_list::hold_until_reset(old, blocks);
     hold_res_until_reset(old, res_bufs);
+    hold_io_until_reset(old, io_blocks);
     hold_prelude_until_reset(old, prelude);
 }
 
@@ -439,6 +614,7 @@ pub(super) fn forget(list: *mut c_void) {
             s.res_retired.push(b);
         }
         hold_res_until_reset(s.allocator, s.res_retired);
+        hold_io_until_reset(s.allocator, s.io_blocks);
         hold_prelude_until_reset(s.allocator, s.prelude_owned.take());
     }
 }
@@ -925,6 +1101,7 @@ unsafe fn bind_two_pass_stage(
     let pso_raw = if compute_pass { tp.compute } else { real_mesh_pso } as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&pso_raw).ok_or(if compute_pass { "two-pass compute pipeline" } else { "two-pass mesh pipeline" })?;
 
+    let io_dev = vram_io_device(this);
     let (set_rs, uav_mask, views) = with(this, |s| -> Result<(bool, u8, [u64; 6]), String> {
         if s.uma_windows.as_ref().is_none_or(Vec::is_empty) {
             let w = super::real::uma_window_vas();
@@ -962,9 +1139,15 @@ unsafe fn bind_two_pass_stage(
             }
             let io = two_pass_io(layout, args, table_p as u64, compute_pass, u.base(), s.heaps);
             let io_bytes = io.len() * 4;
-            let io_p = s.arena.take(u, io_bytes.max(16), 256, &mut s.uma).ok_or("unified memory is full")?;
-            std::ptr::copy_nonoverlapping(io.as_ptr().cast::<u8>(), io_p, io_bytes);
-            let va = uma_va_in(u, windows, io_p as usize).unwrap_or(first);
+            let io_slice = std::slice::from_raw_parts(io.as_ptr().cast::<u8>(), io_bytes);
+            let va = match io_dev.as_ref().and_then(|dev| alloc_vram_io_in(&mut s.io_blocks, s.allocator, s.prelude_built.is_some(), dev, io_slice)) {
+                Some(va) => va,
+                None => {
+                    let io_p = s.arena.take(u, io_bytes.max(16), 256, &mut s.uma).ok_or("unified memory is full")?;
+                    std::ptr::copy_nonoverlapping(io_slice.as_ptr(), io_p, io_bytes);
+                    uma_va_in(u, windows, io_p as usize).unwrap_or(first)
+                }
+            };
             if compute_pass {
                 s.io_cache_tp_cs = Some((s.args_gen_gfx, va));
             } else {
@@ -1581,22 +1764,29 @@ unsafe fn alloc_prelude_scratch(this: *mut c_void, dev: &ID3D12Device, bytes: u6
     Ok((b, 0, buf_idx))
 }
 
-/// Build (once per recording) and return the closed PC prelude command list that runs all hoisted
-/// indirect-argument clamp/scale jobs for `seg` before `seg` executes on the queue.
+/// Build (once per recording) and return the closed PC prelude command list that runs all VRAM
+/// `io` (`u0`) uploads and hoisted indirect-argument clamp/scale jobs for `seg` before `seg`
+/// executes on the queue.
 pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
-    let (already, bufs, guards, scales) = with(seg, |s| {
+    let (already, io_copies, bufs, guards, scales) = with(seg, |s| {
         if let Some(ref built) = s.prelude_built {
-            return (Some(built.as_raw()), Vec::new(), Vec::new(), Vec::new());
+            return (Some(built.as_raw()), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         }
-        if s.prelude_guards.is_empty() && s.prelude_scales.is_empty() {
-            return (None, Vec::new(), Vec::new(), Vec::new());
+        let io_copies: Vec<(ID3D12Resource, ID3D12Resource, u64)> = s
+            .io_blocks
+            .iter()
+            .filter(|b| b.used > 0)
+            .map(|b| (b.vram.clone(), b.upload.clone(), b.used))
+            .collect();
+        if io_copies.is_empty() && s.prelude_guards.is_empty() && s.prelude_scales.is_empty() {
+            return (None, Vec::new(), Vec::new(), Vec::new(), Vec::new());
         }
-        (None, s.prelude_bufs.clone(), s.prelude_guards.clone(), s.prelude_scales.clone())
+        (None, io_copies, s.prelude_bufs.clone(), s.prelude_guards.clone(), s.prelude_scales.clone())
     });
     if let Some(p) = already {
         return Some(p);
     }
-    if guards.is_empty() && scales.is_empty() {
+    if io_copies.is_empty() && guards.is_empty() && scales.is_empty() {
         return None;
     }
     let run = (|| -> Result<ID3D12GraphicsCommandList, String> {
@@ -1605,24 +1795,6 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
         if ty != D3D12_COMMAND_LIST_TYPE_DIRECT && ty != D3D12_COMMAND_LIST_TYPE_COMPUTE {
             return Err("unsupported list type for prelude".into());
         }
-        let u = crate::gpu::uma::get().ok_or("no unified memory")?;
-        let win_vas = with(seg, |s| -> Result<[u64; 4], String> {
-            if s.uma_windows.as_ref().is_none_or(Vec::is_empty) {
-                let w = super::real::uma_window_vas();
-                if w.is_empty() {
-                    return Err("unified memory is not open on the GPU".into());
-                }
-                s.uma_windows = Some(w);
-            }
-            let w = s.uma_windows.as_deref().unwrap();
-            let first = w[0];
-            Ok([
-                first,
-                w.get(1).copied().filter(|&v| v != 0).unwrap_or(first),
-                w.get(2).copied().filter(|&v| v != 0).unwrap_or(first),
-                w.get(3).copied().filter(|&v| v != 0).unwrap_or(first),
-            ])
-        })?;
 
         let dev_key = dev.as_raw() as usize;
         let reused = {
@@ -1642,139 +1814,201 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
             }
         };
 
-        // 1. Order prior queue writes into UMA and transition all prelude scratch buffers COMMON -> UAV.
-        let mut pre_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(1 + bufs.len());
-        pre_barriers.push(D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
-            },
-        });
-        for b in &bufs {
+        // 0. Upload all VRAM `io` (`u0`) slabs (`UNORDERED_ACCESS -> COPY_DEST -> CopyBufferRegion
+        //    -> UNORDERED_ACCESS`) so `seg`'s shaders read user SGPRs from L1 VRAM.
+        if !io_copies.is_empty() {
+            let mut to_copy: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(io_copies.len());
+            let mut to_uav: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(io_copies.len());
+            for (vram, _, _) in &io_copies {
+                to_copy.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(Some(vram.clone())),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            StateAfter: D3D12_RESOURCE_STATE_COPY_DEST,
+                        }),
+                    },
+                });
+                to_uav.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(Some(vram.clone())),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                            StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        }),
+                    },
+                });
+            }
+            list.ResourceBarrier(&to_copy);
+            for (vram, upload, used) in &io_copies {
+                list.CopyBufferRegion(vram, 0, upload, 0, *used);
+            }
+            list.ResourceBarrier(&to_uav);
+            for b in to_copy.iter_mut().chain(to_uav.iter_mut()) {
+                std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
+            }
+        }
+
+        if !guards.is_empty() || !scales.is_empty() {
+            let u = crate::gpu::uma::get().ok_or("no unified memory")?;
+            let win_vas = with(seg, |s| -> Result<[u64; 4], String> {
+                if s.uma_windows.as_ref().is_none_or(Vec::is_empty) {
+                    let w = super::real::uma_window_vas();
+                    if w.is_empty() {
+                        return Err("unified memory is not open on the GPU".into());
+                    }
+                    s.uma_windows = Some(w);
+                }
+                let w = s.uma_windows.as_deref().unwrap();
+                let first = w[0];
+                Ok([
+                    first,
+                    w.get(1).copied().filter(|&v| v != 0).unwrap_or(first),
+                    w.get(2).copied().filter(|&v| v != 0).unwrap_or(first),
+                    w.get(3).copied().filter(|&v| v != 0).unwrap_or(first),
+                ])
+            })?;
+
+            // 1. Order prior queue writes into UMA and transition all prelude scratch buffers COMMON -> UAV.
+            let mut pre_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(1 + bufs.len());
             pre_barriers.push(D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(Some(b.clone())),
-                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                        StateBefore: D3D12_RESOURCE_STATE_COMMON,
-                        StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    }),
-                },
-            });
-        }
-        list.ResourceBarrier(&pre_barriers);
-        for b in pre_barriers.iter_mut().skip(1) {
-            std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
-        }
-
-        // Helper to upload a packed `u32` job slice into `seg`'s UMA arena.
-        let upload_words = |words: &[u32]| -> Result<u64, String> {
-            let bytes = std::mem::size_of_val(words);
-            let p = with(seg, |s| s.arena.take(u, bytes.max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
-            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), p, bytes);
-            super::real::uma_va_of(p as usize).ok_or_else(|| "unified memory is not open on the GPU".into())
-        };
-
-        let bind_windows = |list: &ID3D12GraphicsCommandList| {
-            for (k, &va) in win_vas.iter().enumerate() {
-                list.SetComputeRootUnorderedAccessView((2 + k) as u32, va);
-            }
-        };
-
-        let shared_heap = super::console_heap::window_views_ready().then(super::console_heap::global_heap).flatten();
-        if let Some(ref heap) = shared_heap {
-            list.SetDescriptorHeaps(&[Some(heap.clone())]);
-        }
-
-        // 2. Emit batched guard dispatches grouped by prelude scratch buffer.
-        if !guards.is_empty() {
-            let (rs, pso) = if shared_heap.is_some() { prelude_guard_heap_pipeline(&dev)? } else { prelude_guard_pipeline(&dev)? };
-            list.SetComputeRootSignature(&rs);
-            if shared_heap.is_none() {
-                bind_windows(&list);
-            }
-            list.SetPipelineState(&pso);
-            for (buf_idx, buf) in bufs.iter().enumerate() {
-                let batch: Vec<&PreludeGuardJob> = guards.iter().filter(|j| j.buf_idx == buf_idx).collect();
-                if batch.is_empty() {
-                    continue;
-                }
-                let dst_va = buf.GetGPUVirtualAddress();
-                list.SetComputeRootUnorderedAccessView(1, dst_va);
-                for chunk in batch.chunks(65_535 * 64) {
-                    let mut words = Vec::with_capacity(4 + chunk.len() * 8);
-                    words.extend_from_slice(&[chunk.len() as u32, 0, 0, 0]);
-                    for j in chunk {
-                        words.extend_from_slice(&[j.src_win, j.src_off, j.most, j.dst_off, j.lim_win, j.lim_off, 0, 0]);
-                    }
-                    let jobs_va = upload_words(&words)?;
-                    list.SetComputeRootUnorderedAccessView(0, jobs_va);
-                    list.Dispatch((chunk.len() as u32).div_ceil(64), 1, 1);
-                }
-            }
-        }
-
-        // 3. Emit batched scale dispatches grouped by prelude scratch buffer.
-        if !scales.is_empty() {
-            let (rs, pso) = if shared_heap.is_some() { prelude_scale_heap_pipeline(&dev)? } else { prelude_scale_pipeline(&dev)? };
-            list.SetComputeRootSignature(&rs);
-            if shared_heap.is_none() {
-                bind_windows(&list);
-            }
-            list.SetPipelineState(&pso);
-            for (buf_idx, buf) in bufs.iter().enumerate() {
-                let batch: Vec<&PreludeScaleJob> = scales.iter().filter(|j| j.buf_idx == buf_idx).collect();
-                if batch.is_empty() {
-                    continue;
-                }
-                let dst_va = buf.GetGPUVirtualAddress();
-                list.SetComputeRootUnorderedAccessView(1, dst_va);
-                for chunk in batch.chunks(65_535) {
-                    let mut words = Vec::with_capacity(chunk.len() * 12);
-                    for j in chunk {
-                        words.extend_from_slice(&[
-                            j.count, j.stride, j.mesh_offset, j.split, j.cap, j.src_win, j.src_off, j.dst_off, j.has_cnt, j.cnt_win, j.cnt_off, 0,
-                        ]);
-                    }
-                    let jobs_va = upload_words(&words)?;
-                    list.SetComputeRootUnorderedAccessView(0, jobs_va);
-                    list.Dispatch(chunk.len() as u32, 1, 1);
-                }
-            }
-        }
-
-        // 4. Transition all prelude scratch buffers UAV -> INDIRECT_ARGUMENT (plus global UAV
-        // barrier if any guard jobs wrote `IO_GROUP_LIMIT` into UMA).
-        let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(bufs.len() + usize::from(!guards.is_empty()));
-        for b in &bufs {
-            post_barriers.push(D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(Some(b.clone())),
-                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                        StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        StateAfter: GUARDED_ARGS_STATE,
-                    }),
-                },
-            });
-        }
-        if !guards.is_empty() {
-            post_barriers.push(D3D12_RESOURCE_BARRIER {
                 Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                 Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                 Anonymous: D3D12_RESOURCE_BARRIER_0 {
                     UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
                 },
             });
-        }
-        list.ResourceBarrier(&post_barriers);
-        for b in post_barriers.iter_mut().take(bufs.len()) {
-            std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
+            for b in &bufs {
+                pre_barriers.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(Some(b.clone())),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_COMMON,
+                            StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        }),
+                    },
+                });
+            }
+            list.ResourceBarrier(&pre_barriers);
+            for b in pre_barriers.iter_mut().skip(1) {
+                std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
+            }
+
+            // Helper to upload a packed `u32` job slice into `seg`'s UMA arena.
+            let upload_words = |words: &[u32]| -> Result<u64, String> {
+                let bytes = std::mem::size_of_val(words);
+                let p = with(seg, |s| s.arena.take(u, bytes.max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
+                std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), p, bytes);
+                super::real::uma_va_of(p as usize).ok_or_else(|| "unified memory is not open on the GPU".into())
+            };
+
+            let bind_windows = |list: &ID3D12GraphicsCommandList| {
+                for (k, &va) in win_vas.iter().enumerate() {
+                    list.SetComputeRootUnorderedAccessView((2 + k) as u32, va);
+                }
+            };
+
+            let shared_heap = super::console_heap::window_views_ready().then(super::console_heap::global_heap).flatten();
+            if let Some(ref heap) = shared_heap {
+                list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            }
+
+            // 2. Emit batched guard dispatches grouped by prelude scratch buffer.
+            if !guards.is_empty() {
+                let (rs, pso) = if shared_heap.is_some() { prelude_guard_heap_pipeline(&dev)? } else { prelude_guard_pipeline(&dev)? };
+                list.SetComputeRootSignature(&rs);
+                if shared_heap.is_none() {
+                    bind_windows(&list);
+                }
+                list.SetPipelineState(&pso);
+                for (buf_idx, buf) in bufs.iter().enumerate() {
+                    let batch: Vec<&PreludeGuardJob> = guards.iter().filter(|j| j.buf_idx == buf_idx).collect();
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    let dst_va = buf.GetGPUVirtualAddress();
+                    list.SetComputeRootUnorderedAccessView(1, dst_va);
+                    for chunk in batch.chunks(65_535 * 64) {
+                        let mut words = Vec::with_capacity(4 + chunk.len() * 8);
+                        words.extend_from_slice(&[chunk.len() as u32, 0, 0, 0]);
+                        for j in chunk {
+                            words.extend_from_slice(&[j.src_win, j.src_off, j.most, j.dst_off, j.lim_win, j.lim_off, 0, 0]);
+                        }
+                        let jobs_va = upload_words(&words)?;
+                        list.SetComputeRootUnorderedAccessView(0, jobs_va);
+                        list.Dispatch((chunk.len() as u32).div_ceil(64), 1, 1);
+                    }
+                }
+            }
+
+            // 3. Emit batched scale dispatches grouped by prelude scratch buffer.
+            if !scales.is_empty() {
+                let (rs, pso) = if shared_heap.is_some() { prelude_scale_heap_pipeline(&dev)? } else { prelude_scale_pipeline(&dev)? };
+                list.SetComputeRootSignature(&rs);
+                if shared_heap.is_none() {
+                    bind_windows(&list);
+                }
+                list.SetPipelineState(&pso);
+                for (buf_idx, buf) in bufs.iter().enumerate() {
+                    let batch: Vec<&PreludeScaleJob> = scales.iter().filter(|j| j.buf_idx == buf_idx).collect();
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    let dst_va = buf.GetGPUVirtualAddress();
+                    list.SetComputeRootUnorderedAccessView(1, dst_va);
+                    for chunk in batch.chunks(65_535) {
+                        let mut words = Vec::with_capacity(chunk.len() * 12);
+                        for j in chunk {
+                            words.extend_from_slice(&[
+                                j.count, j.stride, j.mesh_offset, j.split, j.cap, j.src_win, j.src_off, j.dst_off, j.has_cnt, j.cnt_win, j.cnt_off, 0,
+                            ]);
+                        }
+                        let jobs_va = upload_words(&words)?;
+                        list.SetComputeRootUnorderedAccessView(0, jobs_va);
+                        list.Dispatch(chunk.len() as u32, 1, 1);
+                    }
+                }
+            }
+
+            // 4. Transition all prelude scratch buffers UAV -> GUARDED_ARGS_STATE (plus global UAV
+            // barrier if any guard jobs wrote `IO_GROUP_LIMIT` into UMA).
+            let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(bufs.len() + usize::from(!guards.is_empty()));
+            for b in &bufs {
+                post_barriers.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(Some(b.clone())),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            StateAfter: GUARDED_ARGS_STATE,
+                        }),
+                    },
+                });
+            }
+            if !guards.is_empty() {
+                post_barriers.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+                    },
+                });
+            }
+            list.ResourceBarrier(&post_barriers);
+            for b in post_barriers.iter_mut().take(bufs.len()) {
+                std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
+            }
         }
 
         list.Close().map_err(|e| format!("prelude list close: {e}"))?;
@@ -1782,13 +2016,23 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
             s.prelude_owned = Some((alloc, list.clone(), dev_key, ty.0));
             s.prelude_built = Some(list.clone());
         });
-        static BATCHES: AtomicU64 = AtomicU64::new(0);
-        static TOTAL_JOBS: AtomicU64 = AtomicU64::new(0);
-        let n_jobs = (guards.len() + scales.len()) as u64;
-        let b = BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
-        let tot = TOTAL_JOBS.fetch_add(n_jobs, Ordering::Relaxed) + n_jobs;
-        if b == 1 || (b.is_power_of_two() && b >= 16) {
-            crate::xlog_info!("D3D12.X: indirect prelude batch #{b} ({} guard + {} scale jobs, {tot} hoisted total)", guards.len(), scales.len());
+        if !guards.is_empty() || !scales.is_empty() {
+            static BATCHES: AtomicU64 = AtomicU64::new(0);
+            static TOTAL_JOBS: AtomicU64 = AtomicU64::new(0);
+            let n_jobs = (guards.len() + scales.len()) as u64;
+            let b = BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+            let tot = TOTAL_JOBS.fetch_add(n_jobs, Ordering::Relaxed) + n_jobs;
+            if b == 1 || (b.is_power_of_two() && b >= 16) {
+                crate::xlog_info!("D3D12.X: indirect prelude batch #{b} ({} guard + {} scale jobs, {tot} hoisted total)", guards.len(), scales.len());
+            }
+        }
+        if !io_copies.is_empty() {
+            static IO_BATCHES: AtomicU64 = AtomicU64::new(0);
+            let b = IO_BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+            if b == 1 || (b.is_power_of_two() && b >= 1024) {
+                let bytes: u64 = io_copies.iter().map(|(_, _, n)| *n).sum();
+                crate::xlog_info!("D3D12.X: VRAM io (u0) prelude upload #{b} ({} slabs, {bytes} B)", io_copies.len());
+            }
         }
         Ok(list)
     })();
@@ -2402,6 +2646,15 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             return;
         }
         if let Some(msig) = dispatch_mesh_sig_of(sig) {
+            // If an earlier compute dispatch blocked prelude hoisting on this segment, split once
+            // before the two-pass DispatchMesh burst so all consecutive indirect mesh draws hoist
+            // into one batched `PRELUDE_SCALE_*` dispatch instead of inline compute/barrier bubbles.
+            let mut this = this;
+            if max > 0 && args != 0 && indirect_prelude_on() && with(this, |s| s.prelude_blocked && s.allocator != 0 && s.prelude_built.is_none()) {
+                if let Some(next) = super::list_x::split_for_prelude(this) {
+                    this = next;
+                }
+            }
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
             let run = (|| -> Result<(), String> {
                 if max == 0 || args == 0 {
@@ -3515,6 +3768,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let real_ptr = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real_ptr).ok_or("pipeline")?;
 
+    let io_dev = vram_io_device(this);
     let (set_rs, uav_mask, views) = with(this, |s| -> Result<(bool, u8, [u64; 6]), String> {
         if s.uma_windows.as_ref().is_none_or(Vec::is_empty) {
             let w = super::real::uma_window_vas();
@@ -3535,9 +3789,14 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         // Runtime VS/PS/CS shaders never write to `u1` (`res`), so one zeroed 256-byte slot
         // per recording suffices across all `bind_abi` draws and dispatches.
         if s.dummy_res_va == 0 {
-            let p = s.arena.take(u, 256, 256, &mut s.uma).ok_or("unified memory is full")?;
-            std::ptr::write_bytes(p, 0, 256);
-            s.dummy_res_va = uma_va_in(u, windows, p as usize).unwrap_or(first);
+            s.dummy_res_va = match io_dev.as_ref().and_then(|dev| alloc_vram_io_in(&mut s.io_blocks, s.allocator, s.prelude_built.is_some(), dev, &[0u8; 256])) {
+                Some(va) => va,
+                None => {
+                    let p = s.arena.take(u, 256, 256, &mut s.uma).ok_or("unified memory is full")?;
+                    std::ptr::write_bytes(p, 0, 256);
+                    uma_va_in(u, windows, p as usize).unwrap_or(first)
+                }
+            };
         }
         let res_va = s.dummy_res_va;
 
@@ -3572,9 +3831,15 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
                 io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
                 io[crate::gpu::recomp::IO_GROUP_LIMIT] = group_limit;
                 let io_bytes = io.len() * 4;
-                let io_p = s.arena.take(u, io_bytes.max(16), 256, &mut s.uma).ok_or("unified memory is full")?;
-                std::ptr::copy_nonoverlapping(io.as_ptr().cast::<u8>(), io_p, io_bytes);
-                let va = uma_va_in(u, windows, io_p as usize).unwrap_or(first);
+                let io_slice = std::slice::from_raw_parts(io.as_ptr().cast::<u8>(), io_bytes);
+                let va = match io_dev.as_ref().and_then(|dev| alloc_vram_io_in(&mut s.io_blocks, s.allocator, s.prelude_built.is_some(), dev, io_slice)) {
+                    Some(va) => va,
+                    None => {
+                        let io_p = s.arena.take(u, io_bytes.max(16), 256, &mut s.uma).ok_or("unified memory is full")?;
+                        std::ptr::copy_nonoverlapping(io_slice.as_ptr(), io_p, io_bytes);
+                        uma_va_in(u, windows, io_p as usize).unwrap_or(first)
+                    }
+                };
                 if group_limit == 0 {
                     if gfx {
                         s.io_cache_gfx = Some((s.args_gen_gfx, va));
@@ -5181,12 +5446,20 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             assert!(!s.arg_order_clean);
             assert_eq!(s.prelude_guards.len(), 1);
         });
-        // Mid-list split (`from != to`) blocks hoisting on the continuation segment (Wait64 head).
+        // Mid-list split (`from != to`) blocks hoisting on the continuation segment (Wait64 head);
+        // `unblock_prelude` re-enables hoisting for splits without a head wait (`split_for_prelude`, `defer`).
         inherit_for_split(a, b, 0x7710_A001);
         with(b, |s| {
             assert!(s.prelude_blocked);
             assert!(s.prelude_guards.is_empty());
         });
+        unblock_prelude(b);
+        with(b, |s| {
+            assert!(!s.prelude_blocked);
+        });
+        assert!(io_pool_keeps(0, IO_BLOCK_BYTES));
+        assert!(io_pool_keeps(FREE_IO_CAP - IO_BLOCK_BYTES, IO_BLOCK_BYTES));
+        assert!(!io_pool_keeps(FREE_IO_CAP, IO_BLOCK_BYTES));
         // KickoffX non-split (`from == to`) starts a fresh post-kickoff segment and unblocks hoisting.
         inherit_for_split(a, a, 0x7710_A001);
         with(a, |s| {

@@ -3113,9 +3113,31 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
         }
         super::bind::inherit_for_split(list, seg, alloc);
         super::bind::pass_arena(list, next_pc);
+        // A deferred-dispatch split has no head fence wait on `next_pc` (`seg` executes on the
+        // same queue before `next_pc`'s prelude), so `next_pc` may hoist indirect clamps again.
+        super::bind::unblock_prelude(next_pc);
     }
     super::title_list::activate_segment(wrapper, list, next_pc);
     Some(next_pc)
+}
+
+/// Split `list` into a fresh continuation segment with an unblocked indirect-argument prelude
+/// (used right before a two-pass `ExecuteIndirect(DispatchMesh)` burst after earlier compute
+/// dispatches blocked hoisting on the current segment). Skips when predication or an occlusion
+/// query is active so D3D12 command-list invariants stay intact.
+pub(super) unsafe fn split_for_prelude(list: *mut c_void) -> Option<*mut c_void> {
+    let ok = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| {
+        s.allocator != 0
+            && s.predication.is_none()
+            && s.occlusion.active.is_none()
+            && matches!(s.list_type, Some(D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE))
+    });
+    if !ok {
+        return None;
+    }
+    let next = split(list, None)?;
+    super::bind::unblock_prelude(next);
+    Some(next)
 }
 
 /// A closed, empty segment of `wrapper`'s recording for a dispatch recorded at the submit, on the wrapper's own allocator.
