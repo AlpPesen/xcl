@@ -321,7 +321,23 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
             *MIRRORS.lock().unwrap().get_or_insert_with(Mirrors::default).extents.entry((first, n)).or_insert(w)
         }
     };
-    // (held: STATE, then MIRRORS, as in `sync`)
+    // Resolve every tile's CPU source and committed-page hole mask BEFORE locking `sparse::STATE`
+    // so `STATE` is never held across `kernelx::AWAY` / `mirrors` locks (preventing ABBA deadlock
+    // with `XMemMapPhysicalPages` / `CopyPageMappingsBatchX` which hold `AWAY` -> `STATE`).
+    let resolved: Vec<(usize, usize, u16)> = (t0..t1)
+        .step_by(TILE)
+        .map(|t| {
+            let src = super::super::title_textures::mirror_source(t) & !(TILE - 1);
+            let holes = unsafe { query_tile_holes(src) };
+            (t, src, holes)
+        })
+        .collect();
+    let resolved_of = |t: usize| -> (usize, u16) {
+        resolved
+            .binary_search_by_key(&t, |&(k, _, _)| k)
+            .map_or((t, 0xFFFF), |i| (resolved[i].1, resolved[i].2))
+    };
+    // (held: STATE, then MIRRORS, as in `apply_sync`)
     let mut g = lock_state();
     let s = g.as_mut()?;
     let mut mg = MIRRORS.lock().unwrap();
@@ -366,13 +382,13 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
             }
             let (a, b) = (new[i], win + (new[i] - first));
             // SAFETY: the tiles are address space of a window, with no CPU memory behind them
-            unsafe { s.ensure_mapped(b, (j - i) * TILE, |w| query_tile_holes(super::super::title_textures::mirror_source(a + (w - b)))) };
+            unsafe { s.ensure_mapped(b, (j - i) * TILE, |w| resolved_of(a + (w - b)).1) };
             for &t in &new[i..j] {
                 let w = win + (t - first);
                 if s.mapped.contains_key(&w) {
-                    let src = super::super::title_textures::mirror_source(t) & !(TILE - 1);
+                    let (src, holes) = resolved_of(t);
                     m.show(w, t, src);
-                    if unsafe { query_tile_holes(src) } != 0xFFFF {
+                    if holes != 0xFFFF {
                         m.backed.insert(t);
                     }
                 }
@@ -412,34 +428,59 @@ pub fn sources() -> Vec<(usize, usize)> {
     MIRRORS.lock().unwrap().as_ref().map_or(Vec::new(), |m| m.by_read.keys().map(|&r| (r, r + TILE)).collect())
 }
 
-/// `State::mirror_up` for a submit (`before_execute`; `s` is the locked state). A page the title
-/// mapped elsewhere or now has no mapping at all is looked at again when the mappings of a GPU
-/// view change, and a few tiles in turn otherwise.
-pub(super) unsafe fn sync(s: &mut State, dirty: &[usize]) {
+/// Pre-checked GPU-view tile liveness & backing-address updates collected outside `sparse::STATE`
+/// so `apply_sync` never acquires `kernelx::AWAY` / `mirrors` locks while holding `sparse::STATE`.
+pub(super) struct PreparedSync {
+    checked: Vec<(usize, bool, usize, u16)>,
+}
+
+/// Phase 1 of GPU-view sync (called BEFORE locking `sparse::STATE`): snapshot candidate tiles
+/// under `MIRRORS`, drop `MIRRORS`, and query `kernelx` backing mappings with no locks held.
+pub(super) unsafe fn prepare_sync() -> Option<PreparedSync> {
+    let look: Vec<(usize, bool)> = {
+        let mut g = MIRRORS.lock().unwrap();
+        let m = g.as_mut().filter(|m| m.tiles() != 0)?;
+        let gen = crate::hle::kernelx::gpu_view_map_gen();
+        let titles: Vec<usize> = m.read.keys().copied().collect();
+        let picked: Vec<usize> = if std::mem::replace(&mut m.gen, gen) != gen {
+            titles
+        } else {
+            let n = titles.len().max(1);
+            (0..SWEEP_PER_SUBMIT.min(titles.len())).map(|i| titles[(m.turn + i) % n]).collect()
+        };
+        m.turn = m.turn.wrapping_add(SWEEP_PER_SUBMIT);
+        picked.into_iter().map(|t| (t, m.backed.contains(&t))).collect()
+    };
+    let mut checked = Vec::with_capacity(look.len());
+    for (t, was_backed) in look {
+        let (dead, r) = check_title_tile(t, was_backed);
+        let holes = if !dead && !was_backed { query_tile_holes(r) } else { 0xFFFF };
+        checked.push((t, dead, r, holes));
+    }
+    Some(PreparedSync { checked })
+}
+
+/// Phase 2 of GPU-view sync (`before_execute`; `s` is the locked `sparse::STATE`): apply
+/// pre-checked liveness/remap updates and upload dirty mirrored pages with zero `kernelx` locks.
+pub(super) unsafe fn apply_sync(s: &mut State, dirty: &[usize], prepared: Option<PreparedSync>) {
     let mut g = MIRRORS.lock().unwrap();
     let Some(m) = g.as_mut().filter(|m| m.tiles() != 0) else { return };
     m.epoch = m.epoch.wrapping_add(1);
-    let gen = crate::hle::kernelx::gpu_view_map_gen();
-    let titles: Vec<usize> = m.read.keys().copied().collect();
-    let look: Vec<usize> = if std::mem::replace(&mut m.gen, gen) != gen {
-        titles
-    } else {
-        let n = titles.len().max(1);
-        (0..SWEEP_PER_SUBMIT.min(titles.len())).map(|i| titles[(m.turn + i) % n]).collect()
-    };
-    m.turn = m.turn.wrapping_add(SWEEP_PER_SUBMIT);
     let mut dead_wins: Vec<usize> = Vec::new();
-    for t in look {
-        let was_backed = m.backed.contains(&t);
-        let (dead, r) = check_title_tile(t, was_backed);
-        if dead {
-            dead_wins.extend(m.evict_title_if_idle(t));
-            continue;
+    if let Some(prep) = prepared {
+        for (t, dead, r, holes) in prep.checked {
+            if !m.read.contains_key(&t) {
+                continue;
+            }
+            if dead {
+                dead_wins.extend(m.evict_title_if_idle(t));
+                continue;
+            }
+            if holes != 0xFFFF {
+                m.backed.insert(t);
+            }
+            m.set_read(t, r);
         }
-        if !was_backed && query_tile_holes(r) != 0xFFFF {
-            m.backed.insert(t);
-        }
-        m.set_read(t, r);
     }
     if !dead_wins.is_empty() {
         let evicted = dead_wins.len();
@@ -633,5 +674,14 @@ mod tests {
             drop(s);
             VirtualFree(window as *mut c_void, 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn prepare_sync_does_not_require_state_lock() {
+        // Holding `sparse::STATE` on the current thread must not block `prepare_sync`, proving
+        // Phase 1 runs without `STATE` and cannot ABBA-deadlock against `kernelx::AWAY -> STATE`.
+        let _held = STATE.lock().unwrap();
+        let prep = unsafe { prepare_sync() };
+        let _ = prep;
     }
 }

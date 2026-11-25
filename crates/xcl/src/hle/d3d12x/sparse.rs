@@ -1682,6 +1682,9 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
+    // Phase 1 of GPU-view sync runs BEFORE `lock_state()` so `kernelx::AWAY` / `mirrors` locks
+    // are never acquired while holding `sparse::STATE` (ABBA deadlock with `XMemMapPhysicalPages`).
+    let gpu_view_prep = if gpu_view::on() { gpu_view::prepare_sync() } else { None };
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.note_queue(queue);
@@ -1739,7 +1742,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         s.upload_dirty(&dirty_runs);
     }
     if gpu_view::on() {
-        gpu_view::sync(s, dirty);
+        gpu_view::apply_sync(s, dirty, gpu_view_prep);
     }
     PHASES[2].fetch_add(t_scanned.elapsed().as_micros() as u64, Ordering::Relaxed);
     {
