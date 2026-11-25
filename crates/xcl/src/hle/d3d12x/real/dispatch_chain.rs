@@ -54,7 +54,21 @@ struct Chain {
     words: u32,
     whole_code: Vec<u8>,
     whole: OnceLock<ID3D12PipelineState>,
+    whole_started: AtomicBool,
+    whole_failed: AtomicBool,
     build_whole: Mutex<()>,
+}
+
+pub(in crate::hle::d3d12x) enum WholeStatus {
+    /// Not a split compute pipeline.
+    NotSplit,
+    /// Whole pipeline is built and ready to bind without blocking.
+    Ready(ID3D12PipelineState),
+    /// Whole pipeline is compiling on a background thread; skip this indirect dispatch to avoid
+    /// stalling the title thread past its watchdog.
+    Pending,
+    /// Background compilation of the whole pipeline failed.
+    Failed,
 }
 
 impl Chain {
@@ -66,6 +80,29 @@ impl Chain {
         super::super::dred::label_text(p.as_raw() as usize, || format!("cs {:016x} whole", self.builder.record));
         let _ = self.whole.set(p.clone());
         Ok(p)
+    }
+
+    fn start_whole_async(self: &Arc<Self>) {
+        if self.whole.get().is_some() || self.whole_failed.load(Ordering::Acquire) {
+            return;
+        }
+        if self.whole_started.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        let chain = Arc::clone(self);
+        let record = chain.builder.record;
+        if std::thread::Builder::new()
+            .name(format!("xcl-whole-{record:016x}"))
+            .spawn(move || {
+                if let Err(e) = unsafe { chain.whole() } {
+                    chain.whole_failed.store(true, Ordering::Release);
+                    crate::xlog_warn!("D3D12.X: background whole compute PSO for cs {record:016x} failed: {e}");
+                }
+            })
+            .is_err()
+        {
+            self.whole_started.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -96,7 +133,8 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = all.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
+        whole_code: whole.to_vec(), whole: OnceLock::new(), whole_started: AtomicBool::new(false),
+        whole_failed: AtomicBool::new(false), build_whole: Mutex::new(()) });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -109,9 +147,30 @@ pub(super) fn forget(pso: usize) {
     drop(gone); // releasing a tail PSO also goes through forget_pso
 }
 
-pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12PipelineState>, String> {
-    let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    chain.map(|c| c.whole()).transpose()
+/// Resolve the whole compute pipeline for an `ExecuteIndirect` without stalling the recording
+/// thread: when async PSO builds are enabled and the whole form is not compiled yet, kick off
+/// its build once on a background thread and return `Pending`.
+pub(in crate::hle::d3d12x) unsafe fn whole_nonblocking(pso: usize) -> WholeStatus {
+    let Some(chain) = CHAINS.lock().unwrap().get(&pso).cloned() else {
+        return WholeStatus::NotSplit;
+    };
+    if let Some(p) = chain.whole.get() {
+        return WholeStatus::Ready(p.clone());
+    }
+    if chain.whole_failed.load(Ordering::Acquire) {
+        return WholeStatus::Failed;
+    }
+    if !super::super::pso_async::enabled() {
+        return match chain.whole() {
+            Ok(p) => WholeStatus::Ready(p),
+            Err(_) => {
+                chain.whole_failed.store(true, Ordering::Release);
+                WholeStatus::Failed
+            }
+        };
+    }
+    chain.start_whole_async();
+    WholeStatus::Pending
 }
 
 struct Scratch {
@@ -253,5 +312,11 @@ mod tests {
         // one group always fits, whatever the bounds say
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, None, 400 * MB, 384 * MB), (9 * MB, true));
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, Some(MB), 400 * MB, 384 * MB), (9 * MB, true));
+    }
+
+    #[test]
+    fn whole_nonblocking_returns_not_split_for_unknown_pso() {
+        assert!(matches!(unsafe { super::whole_nonblocking(0) }, super::WholeStatus::NotSplit));
+        assert!(matches!(unsafe { super::whole_nonblocking(0x7800_0001) }, super::WholeStatus::NotSplit));
     }
 }

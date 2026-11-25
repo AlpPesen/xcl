@@ -1286,6 +1286,32 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    // For split compute pipelines, resolve the whole form without stalling the title thread
+    // (kicking off background compilation on first indirect use instead of blocking 15-60s).
+    let whole_pso = if compute {
+        match super::real::dispatch_chain::whole_nonblocking(pso) {
+            super::real::dispatch_chain::WholeStatus::NotSplit => None,
+            super::real::dispatch_chain::WholeStatus::Ready(whole) => Some(whole),
+            super::real::dispatch_chain::WholeStatus::Pending => {
+                count(DISPATCHES_SKIPPED);
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::xlog_info!("D3D12.X: ExecuteIndirect of split compute PSO ({pso:#x}) skipped while whole form builds in background");
+                }
+                return;
+            }
+            super::real::dispatch_chain::WholeStatus::Failed => {
+                count(DISPATCHES_SKIPPED);
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO ({pso:#x}) failed – skipped");
+                }
+                return;
+            }
+        }
+    } else {
+        None
+    };
     // (before the dispatch's own root signature and pipeline are bound)
     let mut guarded = None;
     if compute && max == 1 && indirect_guard() && signature_dispatches(sig) {
@@ -1309,16 +1335,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let (args, args_off) = guarded.as_ref().map_or((args, args_off), |(b, o)| (b.as_raw() as usize, *o));
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
-            if compute {
-                match super::real::dispatch_chain::whole(pso) {
-                    Ok(Some(whole)) => list.SetPipelineState(&whole),
-                    Ok(None) => {}
-                    Err(e) => {
-                        crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
-                        count(DISPATCHES_SKIPPED);
-                        return;
-                    }
-                }
+            if let Some(whole) = whole_pso {
+                list.SetPipelineState(&whole);
             }
             count(if gfx { DRAWS } else { DISPATCHES });
             // an indirect dispatch: its groups are in the argument buffer (`max` of them)
