@@ -1406,8 +1406,8 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
-/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
+/// `resolve`, waiting for a pipeline still being built within the per-frame wait window
+/// (`XCL_PSO_FRAME_BUDGET_MS`, default 12 s per kind per frame).
 pub fn resolve_wait(pso: usize) -> usize {
     resolve_wait_for(pso, wait_budget())
 }
@@ -1484,41 +1484,167 @@ fn set_submit_wait_for_test(most: Option<std::time::Duration>) {
     SUBMIT_WAIT_FOR_TEST.with(|b| b.set(most));
 }
 
-/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
+/// `resolve_wait`, waiting at most `budget` per pipeline (and at most the remaining
+/// per-frame window for this pipeline's kind).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     if p.spared.load(Ordering::Acquire) || p.bvh_traversal.load(Ordering::Acquire) {
         return resolve_spared(&p, pso);
     }
-    // (the title's thread is held from here until the pipeline is built or the budget is over)
-    let _held = (!*p.done.lock().unwrap()).then(Held::new);
-    if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
+    let frame = super::present::presents();
+    resolve_wait_in(&p, pso, budget, frame_budget(), frame, kind_frame_budget(p.compute))
+}
+
+/// Default per-frame pipeline wait window (`12 s`) for each kind (`graphics`, `compute`).
+const DEFAULT_FRAME_BUDGET_MS: u64 = 12_000;
+
+/// Parses `XCL_PSO_FRAME_BUDGET_MS`: unset/empty defaults to `12_000 ms` (`12 s`), `0` skips
+/// waiting immediately, `off` / `none` disables the per-frame cap, and a positive integer sets
+/// the per-frame window in milliseconds for each kind (`graphics`, `compute`).
+fn parse_frame_budget(val: Option<&str>) -> Option<std::time::Duration> {
+    let Some(raw) = val.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Some(std::time::Duration::from_millis(DEFAULT_FRAME_BUDGET_MS));
+    };
+    if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
+        return None;
     }
-    if p.deprioritized.load(Ordering::Acquire) && !building_here() {
-        // Heavy non-RT producer compute PSO: mark wanted BEFORE enqueueing so it jumps straight
-        // to the front of `PsoQueue` on `xcl-pso-*` workers (under `BIG_COMPILES`/`GIANT_COMPILES`
-        // gating) and wait until ready so the producer dispatch is NEVER skipped.
-        p.want();
+    match raw.parse::<u64>() {
+        Ok(ms) => Some(std::time::Duration::from_millis(ms)),
+        Err(_) => Some(std::time::Duration::from_millis(DEFAULT_FRAME_BUDGET_MS)),
+    }
+}
+
+fn frame_budget() -> Option<std::time::Duration> {
+    static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *B.get_or_init(|| parse_frame_budget(std::env::var("XCL_PSO_FRAME_BUDGET_MS").ok().as_deref()))
+}
+
+static FRAME_BUDGET_GFX: Mutex<FrameWaitBudget> = Mutex::new(FrameWaitBudget::new());
+static FRAME_BUDGET_CS: Mutex<FrameWaitBudget> = Mutex::new(FrameWaitBudget::new());
+
+fn kind_frame_budget(compute: bool) -> &'static Mutex<FrameWaitBudget> {
+    if compute { &FRAME_BUDGET_CS } else { &FRAME_BUDGET_GFX }
+}
+
+/// Waits for `p` within both an optional per-PSO cap (`budget`) and an optional per-frame
+/// per-kind window (`frame_cap` tracked in `frame_state` for `frame`). Builds run on
+/// `xcl-pso-*` workers (prioritized as `wanted`) so the caller always wakes when the window
+/// expires; once a frame's window is spent, remaining unready draws/dispatches return the
+/// stand-in for this frame and retry with a fresh window on the next frame.
+fn resolve_wait_in(
+    p: &Arc<Pending>,
+    pso: usize,
+    budget: Option<std::time::Duration>,
+    frame_cap: Option<std::time::Duration>,
+    frame: u64,
+    frame_state: &Mutex<FrameWaitBudget>,
+) -> usize {
+    let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
+        0 => p.stand(pso),
+        r => r,
+    };
+    let r = p.real.load(Ordering::Acquire);
+    if r != 0 {
+        return r;
+    }
+    if *p.done.lock().unwrap() {
+        return built(p);
+    }
+    if budget.is_some() && p.late.load(Ordering::Acquire) {
         if !p.sent.swap(true, Ordering::AcqRel) {
             enqueue(p.clone());
         }
-    } else {
+        return p.stand(pso);
+    }
+    // Recursive resolve on a worker thread: run inline to avoid worker-pool deadlock.
+    if building_here() {
         let job = p.job.lock().unwrap().take();
         if let Some(job) = job {
-            complete(&p, job());
+            complete(p, job());
         }
         p.want();
+        let mut done = p.done.lock().unwrap();
+        while !*done {
+            done = p.cv.wait(done).unwrap();
+        }
+        return built(p);
     }
-    let mut done = p.done.lock().unwrap();
-    while !*done {
-        done = p.cv.wait(done).unwrap();
+    // Mark wanted BEFORE enqueueing so `PsoQueue::pop` jumps this pipeline ahead of background
+    // and deprioritized builds and preload workers raise priority immediately.
+    p.want();
+    if !p.sent.swap(true, Ordering::AcqRel) {
+        enqueue(p.clone());
     }
-    match p.real.load(Ordering::Acquire) {
-        0 => p.stand(pso),
-        r => r,
+    let Some(fcap) = frame_cap else {
+        if !p.compute {
+            return p.stand(pso);
+        }
+        let _held = Held::new();
+        if let Some(b) = budget {
+            return resolve_within(p, pso, b);
+        }
+        if !p.deprioritized.load(Ordering::Acquire) {
+            let job = p.job.lock().unwrap().take();
+            if let Some(job) = job {
+                complete(p, job());
+            }
+        }
+        let mut done = p.done.lock().unwrap();
+        while !*done {
+            done = p.cv.wait(done).unwrap();
+        }
+        return built(p);
+    };
+    let rem = frame_state.lock().unwrap().remaining(frame, fcap);
+    if rem.is_zero() {
+        return p.stand(pso);
     }
+    let (wait_for, per_pso_binding) = match budget {
+        Some(b) if b <= rem => (b, true),
+        _ => (rem, false),
+    };
+    let _held = Held::new();
+    let t0 = std::time::Instant::now();
+    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), wait_for, |d| !*d).unwrap();
+    let finished = *done;
+    drop(done);
+    let elapsed = t0.elapsed();
+    if finished {
+        frame_state.lock().unwrap().record(frame, elapsed);
+        return built(p);
+    }
+    if per_pso_binding {
+        frame_state.lock().unwrap().record(frame, elapsed);
+        p.late.store(true, Ordering::Release);
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            crate::xlog_warn!(
+                "D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)",
+                wait_for.as_millis(),
+                n + 1
+            );
+        }
+    } else {
+        // Clamp recorded wait to `rem` on frame-budget timeout so OS timer jitter cannot leave a
+        // sub-millisecond sliver causing subsequent unready calls on this frame to spin.
+        // Do NOT set `p.late` so the pipeline is retried with a fresh window on the next frame.
+        frame_state.lock().unwrap().record(frame, elapsed.max(rem));
+        static N_GFX: AtomicUsize = AtomicUsize::new(0);
+        static N_CS: AtomicUsize = AtomicUsize::new(0);
+        let counter = if p.compute { &N_CS } else { &N_GFX };
+        let n = counter.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            let kind = if p.compute { "compute" } else { "graphics" };
+            crate::xlog_warn!(
+                "D3D12.X: {kind} pipeline wait window ({} ms) spent on frame {frame}: skipping remaining unready {kind} work until next frame ({} so far)",
+                fcap.as_millis(),
+                n + 1
+            );
+        }
+    }
+    p.stand(pso)
 }
 
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
@@ -1723,19 +1849,12 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     }
 }
 
-/// For binding: compute pipelines are waited for, graphics ones are not.
+/// For binding: both graphics and compute pipelines wait within their own per-frame wait window
+/// (`XCL_PSO_FRAME_BUDGET_MS`, default 12 s per kind per frame). Once a frame's window for that
+/// kind is spent, remaining unready draws/dispatches get the stand-in and retry on the next frame.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
-        Some(p) if p.compute => resolve_wait(pso),
-        Some(p) => {
-            let bound = resolve(pso);
-            // a draw needs it now and goes on without it (`bind::pso_for_draw`): its build does not
-            // wait for free commit, which the speculative ones do
-            if !*p.done.lock().unwrap() {
-                p.want();
-            }
-            bound
-        }
+        Some(_) => resolve_wait(pso),
         None => pso,
     }
 }
@@ -1774,9 +1893,11 @@ pub fn want(pso: usize) {
     }
 }
 
-/// A call with `pso` was put off to the submit: its build goes before the workers' queue.
+/// A call with `pso` was put off to the submit: its build goes before the workers' queue
+/// and is immediately marked wanted so DXC / big-compile gates and preload threads prioritize it.
 pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
+    p.want();
     if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
         NEEDED.lock().unwrap().push_back(p);
         queue().push(Box::new(|| ()), None);
@@ -1926,5 +2047,74 @@ mod pso_queue_tests {
         assert_eq!(resolve_for_bind(standin), driver);
         assert_eq!(released(standin), 0);
         assert_eq!(resolve(standin), standin);
+    }
+
+    #[test]
+    fn frame_budget_env_parsing() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(parse_frame_budget(None), Some(ms(12_000)));
+        assert_eq!(parse_frame_budget(Some("")), Some(ms(12_000)));
+        assert_eq!(parse_frame_budget(Some("0")), Some(ms(0)));
+        assert_eq!(parse_frame_budget(Some("5000")), Some(ms(5000)));
+        assert_eq!(parse_frame_budget(Some("off")), None);
+        assert_eq!(parse_frame_budget(Some("none")), None);
+        assert_eq!(parse_frame_budget(Some("bad")), Some(ms(12_000)));
+    }
+
+    #[test]
+    fn frame_budget_waits_within_window_skips_rest_of_frame_and_retries_next_frame() {
+        use std::time::{Duration, Instant};
+
+        let gfx_budget = Mutex::new(FrameWaitBudget::new());
+        let cs_budget = Mutex::new(FrameWaitBudget::new());
+        let cap = Some(Duration::from_millis(60));
+
+        let (g_fast, g_slow1, g_slow2, c_fast) = (0x7E57_F001usize, 0x7E57_F002usize, 0x7E57_F003usize, 0x7E57_F004usize);
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (go2_tx, go2_rx) = mpsc::channel::<()>();
+        submit_lazy(g_fast, false, Box::new(|| {
+            std::thread::sleep(Duration::from_millis(10));
+            0xF101
+        }), 0);
+        submit_lazy(g_slow1, false, Box::new(move || {
+            let _ = go_rx.recv();
+            0xF102
+        }), 0);
+        submit_lazy(g_slow2, false, Box::new(move || {
+            let _ = go2_rx.recv();
+            0xF103
+        }), 0);
+        submit_lazy(c_fast, true, Box::new(|| {
+            std::thread::sleep(Duration::from_millis(10));
+            0xF104
+        }), 0);
+
+        // Frame 1: fast graphics PSO finishes within the 60 ms graphics window.
+        let p_fast = entry(g_fast).unwrap();
+        assert_eq!(resolve_wait_in(&p_fast, g_fast, None, cap, 1, &gfx_budget), 0xF101);
+
+        // Frame 1: slow graphics PSO spends the rest of frame 1's graphics window and skips.
+        let p_slow1 = entry(g_slow1).unwrap();
+        assert_eq!(resolve_wait_in(&p_slow1, g_slow1, None, cap, 1, &gfx_budget), g_slow1);
+
+        // Frame 1: second unready graphics PSO sees 0 ms remaining and skips immediately.
+        let p_slow2 = entry(g_slow2).unwrap();
+        let t0 = Instant::now();
+        assert_eq!(resolve_wait_in(&p_slow2, g_slow2, None, cap, 1, &gfx_budget), g_slow2);
+        assert!(t0.elapsed() < Duration::from_millis(25), "spent frame budget must skip immediately ({:?})", t0.elapsed());
+
+        // Frame 1: compute has its own independent per-frame window and completes cleanly!
+        let p_cs = entry(c_fast).unwrap();
+        assert_eq!(resolve_wait_in(&p_cs, c_fast, None, cap, 1, &cs_budget), 0xF104);
+
+        // Release both slow graphics workers and retry on Frame 2: both resolve (not stuck `late`)!
+        go_tx.send(()).unwrap();
+        go2_tx.send(()).unwrap();
+        assert_eq!(resolve_wait_in(&p_slow1, g_slow1, None, Some(Duration::from_secs(5)), 2, &gfx_budget), 0xF102);
+        assert_eq!(resolve_wait_in(&p_slow2, g_slow2, None, Some(Duration::from_secs(5)), 2, &gfx_budget), 0xF103);
+
+        for s in [g_fast, g_slow1, g_slow2, c_fast] {
+            let _ = released(s);
+        }
     }
 }

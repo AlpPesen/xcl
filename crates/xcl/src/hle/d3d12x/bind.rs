@@ -3976,11 +3976,10 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
 }
 
-/// The pipeline a draw (or an ExecuteIndirect) uses now: a graphics pipeline still being built
-/// is not waited for – its build goes to the workers and its stand-in, which draws nothing, is
-/// used until it is built (`pso_async`). A compute one is waited for. Waiting held a retail
-/// title's threads 1 – 5 s per draw in the driver's compiler (33 s in all as its world loaded,
-/// on an NVIDIA GPU), and its hang watchdog ended it.
+/// The pipeline a draw (or an ExecuteIndirect) uses now: both graphics and compute pipelines wait
+/// within their own per-frame wait window (`XCL_PSO_FRAME_BUDGET_MS`, default 12 s per kind per
+/// frame); once a frame's window is spent, remaining unready draws/dispatches get the stand-in
+/// for this frame and retry on the next frame (`pso_async`).
 fn pso_for_draw(pso: usize) -> usize {
     super::pso_async::resolve_for_bind(pso)
 }
@@ -4926,27 +4925,18 @@ void main(uint t : SV_GroupIndex) {
         }
     }
 
-    /// A draw does not wait for a graphics pipeline still being built: its build goes to the
-    /// workers and the draw gets the stand-in at once; once built, the real one. A compute
-    /// pipeline is still waited for.
+    /// Both graphics and compute draws wait within their per-frame pipeline wait window
+    /// (`XCL_PSO_FRAME_BUDGET_MS`) so cold compiles that finish in time render on their first use.
     #[test]
-    fn a_draw_does_not_wait_for_a_graphics_pipeline_still_being_built() {
+    fn a_draw_waits_for_a_graphics_pipeline_within_the_frame_window() {
         let (graphics, compute) = (0x7E57_6101usize, 0x7E57_6102usize);
         pso_async::submit_lazy(graphics, false, Box::new(|| {
-            std::thread::sleep(std::time::Duration::from_millis(1500));
+            std::thread::sleep(std::time::Duration::from_millis(50));
             0x1301
         }), 0);
         pso_async::submit_lazy(compute, true, Box::new(|| 0x1302), 0);
-        let t = std::time::Instant::now();
-        assert_eq!(pso_for_draw(graphics), graphics, "the stand-in, not the real one");
-        assert!(t.elapsed() < std::time::Duration::from_millis(500), "a draw waited {:?}", t.elapsed());
-        // the draw sent it to the workers: it is built with no further draw
-        let start = std::time::Instant::now();
-        while pso_async::is_pending(graphics) && start.elapsed() < std::time::Duration::from_secs(10) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert_eq!(pso_for_draw(graphics), 0x1301, "built by a worker");
-        assert_eq!(pso_for_draw(compute), 0x1302, "a compute pipeline is waited for");
+        assert_eq!(pso_for_draw(graphics), 0x1301, "graphics waited within frame window");
+        assert_eq!(pso_for_draw(compute), 0x1302, "compute waited within frame window");
         pso_async::released(graphics);
         pso_async::released(compute);
     }
