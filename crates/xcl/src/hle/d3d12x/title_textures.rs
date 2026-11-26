@@ -444,6 +444,80 @@ static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
 // The dirty-page scan consumes write-watch state for every submission thread.
 // Keep the scan, pending-list update and GPU uploads together.
 static REFRESH: Mutex<()> = Mutex::new(());
+
+/// `XCL_LOOK_SKIP` (on by default, `0`: off): a submit whose lists were all closed before the last
+/// write-watch look began, and not submitted since, takes no look of its own.
+///
+/// The look (`GetWriteWatch` over the title's memory XCL keeps in step) was 60 % of a retail
+/// title's frame in its world: ~6 ms at each of 80–100 submits a second. What the title wrote
+/// for a list it wrote before closing it, and a look that began after the close took those
+/// pages already; the next look takes the rest. A list submitted again (a recording the title
+/// runs twice, its data written anew in between) always looks, and so does the first submit of
+/// each frame.
+fn look_skip_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_LOOK_SKIP").map_or(true, |v| v.trim() != "0"))
+}
+
+fn now_us() -> u64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64 + 1
+}
+
+/// When the last finished look began (µs, `now_us`; 0: none yet), and the frame it was in.
+static LOOK_BEGAN_US: AtomicU64 = AtomicU64::new(0);
+static LOOK_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Each title list's last Close (µs) and whether it was submitted since.
+static CLOSED: Mutex<Option<std::collections::HashMap<usize, (u64, bool)>>> = Mutex::new(None);
+
+/// The title closed `list` (the object it submits).
+pub(super) fn note_list_closed(list: *mut c_void) {
+    if !look_skip_on() || list.is_null() {
+        return;
+    }
+    CLOSED.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(list as usize, (now_us(), false));
+}
+
+thread_local! {
+    /// The next `refresh` on this thread may leave its look out (`look_needed_for` said so).
+    static SKIP_LOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Before a submit of `lists`: whether its refresh needs a look of its own (then `refresh` looks;
+/// else it is told to leave it out). The lists count as submitted from here on.
+pub(super) fn decide_look(lists: &[*mut c_void]) {
+    if !look_skip_on() {
+        return;
+    }
+    let began = LOOK_BEGAN_US.load(Ordering::Acquire);
+    let same_frame = LOOK_FRAME.load(Ordering::Acquire) == super::present::presents();
+    let mut g = CLOSED.lock().unwrap();
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    let mut skip = began != 0 && same_frame && !lists.is_empty();
+    for &l in lists {
+        match m.get_mut(&(l as usize)) {
+            Some((closed, submitted)) => {
+                if *submitted || *closed >= began {
+                    skip = false;
+                }
+                *submitted = true;
+            }
+            None => skip = false,
+        }
+    }
+    drop(g);
+    SKIP_LOOK.with(|c| c.set(skip));
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+    static ALL: AtomicU64 = AtomicU64::new(0);
+    let all = ALL.fetch_add(1, Ordering::Relaxed) + 1;
+    if skip {
+        SKIPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    if all.is_power_of_two() && all >= 256 {
+        crate::xlog_info!("title textures: {} of {all} submits took no write-watch look of their own (XCL_LOOK_SKIP)", SKIPPED.load(Ordering::Relaxed));
+    }
+}
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen,
@@ -456,6 +530,14 @@ static UPLOADS: AtomicU64 = AtomicU64::new(0);
 /// Number of textures kept in title memory and uploads done so far.
 pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
+}
+
+/// The title textures kept in step that are committed resources of their own (not on shared
+/// `vram::Pages` tiles): how many, and their console size in bytes (memory accounting, #2688;
+/// the PC resource can take somewhat more).
+pub fn committed_bytes() -> (usize, u64) {
+    let t = TEXTURES.lock().unwrap();
+    t.by_res.values().chain(t.shadowed.values()).filter(|e| !e.placed).fold((0, 0), |(n, b), e| (n + 1, b + e.tex.size()))
 }
 
 /// Whether a non-depth render target / UAV texture is small enough to be a CPU-filled glyph or UI
@@ -906,6 +988,8 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
 
 unsafe fn refresh_once(queue: *mut c_void) {
     reclaim_completed_on_queue(queue as usize);
+    // (taken first: a return below must not leave it for the next submit on this thread)
+    let skip_look = SKIP_LOOK.with(|c| c.replace(false));
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
@@ -913,6 +997,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     recheck_gpu_view_sources();
     let watch_t0 = std::time::Instant::now();
+    let look_began = now_us();
+    let look_frame = super::present::presents();
     let mut page = 0x1000u32;
     super::sparse::drain_lazy_commits_if_pending();
     let ranges = cached_watch_ranges(u);
@@ -924,9 +1010,11 @@ unsafe fn refresh_once(queue: *mut c_void) {
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
-            super::list_x::mirror_look_begin();
-            for &(base, size) in ranges.iter() {
-                take_written(base, size, &mut buf, &mut dirty, &mut page);
+            if !skip_look {
+                super::list_x::mirror_look_begin();
+                for &(base, size) in ranges.iter() {
+                    take_written(base, size, &mut buf, &mut dirty, &mut page);
+                }
             }
         });
         // views of physical pages are not write-watched: their writes are caught by guards
@@ -938,6 +1026,12 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    if !skip_look {
+        // what later submits compare their lists' closes with
+        LOOK_BEGAN_US.store(look_began, Ordering::Release);
+        LOOK_FRAME.store(look_frame, Ordering::Release);
+    }
+    super::prof::add(super::prof::Kind::SubmitWatch, watch_t0.elapsed());
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -970,6 +1064,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     // the title's own memory: what the CPU wrote goes to its video memory first
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         DIRTY_BUF.with(|dcell| {
+            let _prof = super::prof::span(super::prof::Kind::SubmitSparse);
             let dirty = dcell.borrow();
             super::sparse::before_execute(q, &dirty, page as usize);
             super::vram::before_execute(q);
@@ -1023,7 +1118,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
     });
     seed_stream_recheck(&todo, &ranges, recheck_frame);
     let uploaded = !todo.is_empty();
+    let upload_prof = super::prof::span(super::prof::Kind::SubmitTextures);
     upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
+    drop(upload_prof);
     // Ensure the submitting queue waits for any `vram::map_levels` tile mappings queued inside
     // `upload_all`, even if an upload batch fell back to the upload queue or exited early.
     if uploaded {
@@ -1548,6 +1645,7 @@ unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, 
         drop(f);
         return Err(e.to_string());
     }
+    super::flight::signaled("texture uploads", key, &q.fence, q.value);
     q.bytes = q.bytes.saturating_add(f.bytes);
     let v = q.value;
     q.in_flight.push_back((v, f));

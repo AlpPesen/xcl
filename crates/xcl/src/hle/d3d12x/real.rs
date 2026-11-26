@@ -175,6 +175,13 @@ pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
 static UMA_BUFFER: std::sync::RwLock<Vec<(usize, u64)>> = std::sync::RwLock::new(Vec::new());
 /// the committed UMA windows opened as D3D12 heaps (indexed by window `k`; `None` for sparse windows)
 static UMA_HEAPS: Mutex<Vec<Option<usize>>> = Mutex::new(Vec::new());
+
+/// Bytes of the coherent windows imported into D3D12 (`OpenExistingHeapFromAddress`): those DXGI
+/// counts. 0 before, or when the import failed (the windows are then CPU memory only).
+pub fn uma_imported_bytes() -> u64 {
+    let Some(u) = crate::gpu::uma::get() else { return 0 };
+    UMA_HEAPS.lock().unwrap().iter().enumerate().filter(|(_, h)| h.is_some()).map(|(k, _)| u.window(k).1 as u64).sum()
+}
 /// console buffers placed in unified memory: resource → (address, bytes)
 /// address, bytes, whether XCL allocated the memory (not: the title's own, CreatePlacedResourceX)
 type UmaBuffer = (usize, usize, bool);
@@ -442,6 +449,23 @@ pub fn video_memory() -> Option<(u64, u64)> {
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
         Some((local.CurrentUsage, non_local.CurrentUsage))
+    }
+}
+
+/// The process's video memory on the device's adapter against its budget: (local, non-local).
+pub fn video_budget() -> Option<(windows::Win32::Graphics::Dxgi::DXGI_QUERY_VIDEO_MEMORY_INFO, windows::Win32::Graphics::Dxgi::DXGI_QUERY_VIDEO_MEMORY_INFO)> {
+    use windows::Win32::Graphics::Dxgi::*;
+    let raw = device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
+    unsafe {
+        let luid = dev.GetAdapterLuid();
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(luid).ok()?;
+        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
+        Some((local, non_local))
     }
 }
 
@@ -2076,6 +2100,26 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     };
     let mut uma_to_free: Option<(usize, bool)> = None;
     if n == 0 {
+        uma_to_free = forget_released_resource(this, held);
+    }
+    if held {
+        super::late_release::hold(this as usize);
+    }
+    if let Some((p, sparse)) = uma_to_free {
+        super::late_release::hold_uma(p, sparse);
+    }
+    n
+}
+
+/// What XCL keeps of a resource the title released for good, forgotten; its unified memory, if
+/// any, to give back (address, whether in a sparse window).
+unsafe fn forget_released_resource(this: *mut c_void, held: bool) -> Option<(usize, bool)> {
+    let mut uma_to_free: Option<(usize, bool)> = None;
+    {
+        if let Some((k, bytes)) = LIVE_COMMITTED.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))) {
+            LIVE_BYTES[k].fetch_sub(bytes, Ordering::Relaxed);
+            LIVE_COUNT[k].fetch_sub(1, Ordering::Relaxed);
+        }
         if let Some(s) = UNMAPPABLE.write().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
@@ -2107,13 +2151,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             uma_to_free = Some((p, u.is_sparse(p)));
         }
     }
-    if held {
-        super::late_release::hold(this as usize);
-    }
-    if let Some((p, sparse)) = uma_to_free {
-        super::late_release::hold_uma(p, sparse);
-    }
-    n
+    uma_to_free
 }
 
 /// A stand-in that is no driver object (`standin`) was released for good.
@@ -3893,6 +3931,9 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
     let hr = f(this) as HRESULT;
     preserve_vtable(this, ext);
+    if hr >= 0 && !super::title_textures::is_own_work() {
+        super::title_textures::note_list_closed(this);
+    }
     if hr < 0 {
         let ty: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "GetType")));
         crate::xlog_warn!("D3D12.X: command list {this:p} (type {}) Close → {:#x}", ty(this), hr as u32);
@@ -4059,7 +4100,9 @@ macro_rules! creator {
             if IN_CREATOR.with(|c| c.replace(true)) {
                 return f(this, $($a,)* riid, ppv);
             }
+            let made_at = std::time::Instant::now();
             let mut hr = f(this, $($a,)* riid, ppv);
+            super::flight::made($method, 0, made_at.elapsed());
             IN_CREATOR.with(|c| c.set(false));
             if hr == E_NOINTERFACE {
                 let iid = pc_iid($kind);
@@ -4098,7 +4141,45 @@ unsafe fn note_committed(dev: *mut c_void, res: *mut c_void) {
     e.0 += 1;
     if bytes != u64::MAX {
         e.1 += bytes;
+        // (live: until its last release, `forget_released_resource`)
+        let k = live_kind(props.Type.0, props.MemoryPoolPreference.0, d.Dimension.0);
+        LIVE_COMMITTED.lock().unwrap().get_or_insert_with(HashMap::new).insert(res as usize, (k, bytes));
+        LIVE_BYTES[k].fetch_add(bytes, Ordering::Relaxed);
+        LIVE_COUNT[k].fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// The title's committed resources alive, by kind (`live_kind`): resource → (kind, bytes).
+static LIVE_COMMITTED: Mutex<Option<HashMap<usize, (usize, u64)>>> = Mutex::new(None);
+static LIVE_BYTES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static LIVE_COUNT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+const LIVE_NAMES: [&str; 6] = ["in title memory", "video buffers", "video textures", "upload", "readback", "custom system"];
+
+/// What a committed resource is for the memory line: one XCL placed in the title's memory (no
+/// heap of its own), a buffer or texture in video memory, an upload or readback heap, or a
+/// custom heap in system memory.
+fn live_kind(heap_type: i32, pool: i32, dimension: i32) -> usize {
+    match (heap_type, pool) {
+        (0, _) => 0,
+        (1, _) | (4, 2) => {
+            if dimension == 1 {
+                1
+            } else {
+                2
+            }
+        }
+        (2, _) => 3,
+        (3, _) => 4,
+        _ => 5,
+    }
+}
+
+/// The title's committed resources alive (`note_committed`), by kind: "name MB (count)".
+pub fn live_committed_line() -> String {
+    (0..6)
+        .map(|k| format!("{} {} ({})", LIVE_NAMES[k], LIVE_BYTES[k].load(Ordering::Relaxed) >> 20, LIVE_COUNT[k].load(Ordering::Relaxed)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// local: the committed shapes that were made since the last report, biggest first
@@ -5165,6 +5246,7 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     let started = std::time::Instant::now();
     let r = build();
     let took = started.elapsed();
+    super::prof::add(super::prof::Kind::DriverCompile, took);
     if log {
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_bytes || gated, gated, waited));
     }
@@ -6900,9 +6982,47 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
 /// The root signature pointer is kept as is (the translated paths replace it).
 #[allow(dead_code)] // the vectors only keep the copies alive
 enum OwnedDesc {
-    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<Vec<u8>>),
-    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<Vec<u8>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
-    Stream(Box<[usize; 2]>, Vec<u8>, Vec<Vec<u8>>),
+    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<Blob>),
+    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<Blob>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
+    Stream(Box<[usize; 2]>, Vec<u8>, Vec<Blob>),
+}
+
+/// A pipeline's copy of one of its console shaders, shared with every pipeline that copied the
+/// same bytes (`intern_blob`).
+type Blob = std::sync::Arc<[u8]>;
+
+/// The copies kept: (title address, length) → the copy, while a pipeline holds it.
+static BLOBS: Mutex<Option<(HashMap<(usize, usize), std::sync::Weak<[u8]>>, usize)>> = Mutex::new(None);
+
+/// The copy of the shader `bytes` a pipeline keeps until it is built: the one an earlier
+/// pipeline made of the same bytes at the same address, or a new one. A retail title makes
+/// ~80 000 pipelines in its first minute from a few thousand shaders, and every one waiting to
+/// be built (`pso_async::lazy`) held copies of its own. (Equal bytes are checked: an address
+/// the title used again for another shader gets a copy of its own.)
+fn intern_blob(bytes: &[u8]) -> Blob {
+    let key = (bytes.as_ptr() as usize, bytes.len());
+    let mut g = BLOBS.lock().unwrap();
+    let (m, since_prune) = g.get_or_insert_with(|| (HashMap::new(), 0));
+    if let Some(b) = m.get(&key).and_then(std::sync::Weak::upgrade) {
+        if *b == *bytes {
+            return b;
+        }
+    }
+    let b: Blob = std::sync::Arc::from(bytes);
+    m.insert(key, std::sync::Arc::downgrade(&b));
+    *since_prune += 1;
+    if *since_prune >= 4096 {
+        *since_prune = 0;
+        m.retain(|_, w| w.strong_count() > 0);
+    }
+    b
+}
+
+/// The shader copies pipelines hold (`intern_blob`): how many and their bytes.
+pub fn pipeline_blob_bytes() -> (usize, usize) {
+    BLOBS.lock().unwrap().as_ref().map_or((0, 0), |(m, _)| {
+        m.values().filter_map(std::sync::Weak::upgrade).fold((0, 0), |(n, b), x| (n + 1, b + x.len()))
+    })
 }
 
 unsafe impl Send for OwnedDesc {}
@@ -6914,10 +7034,10 @@ pub(crate) fn shader_key(blob: &[u8]) -> u64 {
     ((0xcbf2_9ce4_8422_2325u64 ^ crate::gpu::shader::fnv64(blob)).wrapping_mul(0x0000_0100_0000_01b3)) | 1
 }
 
-pub(crate) fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
+pub(crate) fn shaders_key<B: AsRef<[u8]>>(blobs: &[B]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in blobs {
-        h = (h ^ crate::gpu::shader::fnv64(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        h = (h ^ crate::gpu::shader::fnv64(b.as_ref())).wrapping_mul(0x0000_0100_0000_01b3);
     }
     h | 1
 }
@@ -6939,7 +7059,7 @@ mod shaders_key_tests {
         assert_ne!(key, super::shaders_key(&[b.clone(), a.clone()]));
         assert_ne!(key, super::shaders_key(&[a.clone()]));
         assert_ne!(key, super::shaders_key(&[a, vec![4u8, 6]]));
-        assert_ne!(super::shaders_key(&[]), 0);
+        assert_ne!(super::shaders_key::<Vec<u8>>(&[]), 0);
     }
 }
 
@@ -6983,10 +7103,10 @@ impl OwnedDesc {
     }
 }
 
-/// Copy a shader blob into `blobs` and point `b` at the copy.
-unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Vec<u8>>) {
+/// Copy a shader blob into `blobs` (`intern_blob`) and point `b` at the copy.
+unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Blob>) {
     if let Some(bytes) = shader_bytes(b) {
-        blobs.push(bytes.to_vec());
+        blobs.push(intern_blob(bytes));
         let v = blobs.last().unwrap();
         *b = bytecode(v);
     } else {
@@ -7039,7 +7159,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
         return None;
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut blobs: Vec<Blob> = Vec::new();
     let mut off = 0usize;
     while off + 8 <= size {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
@@ -7056,7 +7176,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
                 if p == 0 || n == 0 {
                     buf[at..at + 16].fill(0);
                 } else if crate::gpu::shader::readable(p, n) {
-                    blobs.push(std::slice::from_raw_parts(p as *const u8, n).to_vec());
+                    blobs.push(intern_blob(std::slice::from_raw_parts(p as *const u8, n)));
                     buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
                 } else {
                     return None;
@@ -9419,11 +9539,15 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // own work in the submission. Where that takes long, it is not the title's time
     // (`pso_async::title_held`)
     let _in_pc = super::pso_async::pc_call();
+    let _prof = super::prof::span(super::prof::Kind::Submit);
+    // whether these lists need a write-watch look of their own (`title_textures::decide_look`)
+    super::title_textures::decide_look(std::slice::from_raw_parts(lists, n as usize));
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
+    let record_prof = super::prof::span(super::prof::Kind::SubmitRecord);
     for &l in std::slice::from_raw_parts(lists, n as usize) {
         if let Some(pc) = super::console_list::pc_list(l) {
             mapped.push(pc);
@@ -9434,6 +9558,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
             }
         }
     }
+    drop(record_prof);
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         // a list still on the GPU from its previous submit: that one first (the PC does not take
@@ -9441,7 +9566,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         if super::alloc_pool::note_resubmits(this, chunk) > 0 {
             super::alloc_pool::wait_for_previous_submits(chunk);
         }
+        let driver_prof = super::prof::span(super::prof::Kind::SubmitDriver);
         f(this, chunk.len() as u32, chunk.as_ptr());
+        drop(driver_prof);
+        let _after = super::prof::span(super::prof::Kind::SubmitAfter);
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
@@ -9623,6 +9751,8 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    // which of XCL's queues stopped first, and what went before (`flight`)
+    super::flight::dump("device removed");
     unsafe {
         let mut pf_logged = false;
         if let Ok(dred1) = dev.cast::<ID3D12DeviceRemovedExtendedData1>() {
@@ -10667,7 +10797,7 @@ mod mesh_stream_tests {
             let owned = own_stream(d_valid.as_ptr() as *const c_void).expect("valid stream");
             let OwnedDesc::Stream(_, buf, blobs) = owned else { panic!("expected Stream") };
             assert_eq!(blobs.len(), 1);
-            assert_eq!(blobs[0], shader);
+            assert_eq!(&*blobs[0], &shader[..]);
             let rebased = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
             assert_eq!(rebased, blobs[0].as_ptr() as usize);
             assert_ne!(rebased, shader.as_ptr() as usize);

@@ -52,6 +52,7 @@ static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
 /// the frame; S_OK always (a console present does not fail for the title).
 pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
+    let _prof = super::prof::span(super::prof::Kind::Present);
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
     }

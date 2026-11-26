@@ -161,8 +161,19 @@ impl Chain {
         }
     }
 
+    /// After a whole build that ran out of memory, before its retry. Never waits: `whole` holds
+    /// `retry_at` for the whole driver compile (tens of seconds for the biggest programs), and a
+    /// title thread asking here (an allocator reset dropping a recording, a dispatch) stood that
+    /// long – a retail title's own GPU watchdog then ended it (`mov [0], 0x4d8bd421`). A build
+    /// going on is no cooldown: `start_whole_async` sees it by `whole_started` or starts the
+    /// async one, which waits for it on a worker.
     fn whole_in_cooldown(&self) -> bool {
-        self.retry_at.lock().unwrap().is_some_and(|t| std::time::Instant::now() < t)
+        let in_cooldown = |at: &Option<std::time::Instant>| at.is_some_and(|t| std::time::Instant::now() < t);
+        match self.retry_at.try_lock() {
+            Ok(g) => in_cooldown(&g),
+            Err(std::sync::TryLockError::WouldBlock) => false,
+            Err(std::sync::TryLockError::Poisoned(p)) => in_cooldown(&p.into_inner()),
+        }
     }
 
     fn start_whole_async(self: &Arc<Self>) {
@@ -324,7 +335,11 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
-    CHAINS.lock().unwrap().insert(*result as usize, chain);
+    // a chain this one replaces (the same address made again) is dropped after the lock: its
+    // pipelines' release goes back into this module, which takes `CHAINS` (a self-deadlock that
+    // held a retail title's thread for good)
+    let replaced = CHAINS.lock().unwrap().insert(*result as usize, chain);
+    drop(replaced);
     HAS_CHAINS.store(true, Ordering::Release);
     Some(rs)
 }

@@ -1324,6 +1324,7 @@ impl Pages {
             let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() };
             let region = D3D12_TILE_REGION_SIZE { NumTiles: num_tiles, UseBox: false.into(), ..Default::default() };
             let _timer = step(Step::Map);
+            let flight_t = std::time::Instant::now();
             self.queue.UpdateTileMappings(
                 res,
                 1,
@@ -1336,6 +1337,7 @@ impl Pages {
                 Some(self.scratch_counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
+            super::flight::tile_map("vram", windows::core::Interface::as_raw(&self.queue) as usize, (num_tiles) as u64, flight_t.elapsed());
         }
         self.dirty_signal = true;
     }
@@ -1349,6 +1351,7 @@ impl Pages {
         let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
         let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        let flight_t = std::time::Instant::now();
         self.queue.UpdateTileMappings(
             res,
             1,
@@ -1361,6 +1364,7 @@ impl Pages {
             Some(&total),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        super::flight::tile_map("vram", windows::core::Interface::as_raw(&self.queue) as usize, (total) as u64, flight_t.elapsed());
         self.dirty_signal = true;
     }
 
@@ -1460,6 +1464,7 @@ impl Pages {
         if ok {
             self.value += 1;
             let _ = self.queue.Signal(&self.fence, self.value);
+            super::flight::signaled("vram pages", windows::core::Interface::as_raw(&self.queue) as usize, &self.fence, self.value);
             self.dirty_signal = false;
             slot.fence_val = self.value;
         }
@@ -1471,6 +1476,7 @@ impl Pages {
             let _timer = step(Step::Signal);
             self.value += 1;
             let _ = self.queue.Signal(&self.fence, self.value);
+            super::flight::signaled("vram pages", windows::core::Interface::as_raw(&self.queue) as usize, &self.fence, self.value);
             self.dirty_signal = false;
         }
     }
@@ -1489,6 +1495,7 @@ impl Pages {
         let flags: Vec<D3D12_TILE_RANGE_FLAGS> = ranges.iter().map(|r| r.0).collect();
         let offsets: Vec<u32> = ranges.iter().map(|r| r.1).collect();
         let counts: Vec<u32> = ranges.iter().map(|r| r.2).collect();
+        let flight_t = std::time::Instant::now();
         self.queue.UpdateTileMappings(
             res,
             1,
@@ -1501,6 +1508,7 @@ impl Pages {
             Some(counts.as_ptr()),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        super::flight::tile_map("vram", windows::core::Interface::as_raw(&self.queue) as usize, (region.NumTiles) as u64, flight_t.elapsed());
         self.dirty_signal = true;
     }
 
@@ -1868,6 +1876,7 @@ impl Pages {
                 let flags: Vec<D3D12_TILE_RANGE_FLAGS> = ranges.iter().map(|r| r.0).collect();
                 let offsets: Vec<u32> = ranges.iter().map(|r| r.1).collect();
                 let counts: Vec<u32> = ranges.iter().map(|r| r.2).collect();
+                let flight_t = std::time::Instant::now();
                 self.queue.UpdateTileMappings(
                     res,
                     1,
@@ -1880,6 +1889,7 @@ impl Pages {
                     Some(counts.as_ptr()),
                     D3D12_TILE_MAPPING_FLAG_NONE,
                 );
+                super::flight::tile_map("vram", windows::core::Interface::as_raw(&self.queue) as usize, (total) as u64, flight_t.elapsed());
             }
         }
         self.dirty_signal = true;
@@ -2515,6 +2525,9 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let mut do_reclaim = false;
     let mut need_unmap_work = false;
     let mut unmap_mark: Option<(ID3D12Fence, u64)> = None;
+    // the page mappings this queue waits for, waited on the CPU after the lock (as the sparse
+    // windows' are: `sparse::cpu_waited_for_mappings`)
+    let mut mapping_wait: Option<(ID3D12Fence, u64)> = None;
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
@@ -2528,8 +2541,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
             pages.flush_signal();
             let key = queue.as_raw() as usize;
             if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
-                let _ = queue.Wait(&pages.fence, pages.value);
-                super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
+                mapping_wait = Some((pages.fence.clone(), pages.value));
                 pages.waited.insert(key, pages.value);
             }
             let low_commit = commit_low();
@@ -2548,6 +2560,12 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
                 || pages.cool_probe.is_some()
                 || !pages.pool.cooling.is_empty()
                 || !pages.idle.is_empty();
+        }
+    }
+    if let Some((fence, value)) = mapping_wait {
+        if !super::sparse::cpu_waited_for_mappings(&fence, value, "texture page mappings") {
+            let _ = queue.Wait(&fence, value);
+            super::list_x::note_internal_wait(queue.as_raw() as usize, "texture page mappings", &fence, value);
         }
     }
     if need_unmap_work {

@@ -494,11 +494,15 @@ fn mem_throttle_enabled() -> bool {
     *ON.get_or_init(|| !cfg!(test) && !std::env::var("XCL_PSO_MEM_THROTTLE").is_ok_and(|v| v.trim() == "0"))
 }
 
+/// The system's free commit: what a driver compile can still allocate. (Free physical memory is
+/// not it: a retail title's world entry dropped it to 1.3 GB for a few seconds with 12 GB of
+/// commit free – the pages go to the page file – and the throttle on it held every pipeline
+/// worker idle while the title waited 14 s for a compute pipeline.)
 fn avail_commit_bytes() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPhys.min(m.ullAvailPageFile))
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile)
 }
 
 /// Maximum concurrent top-level PSO worker builds allowed for the current available RAM/commit:
@@ -2212,6 +2216,7 @@ pub fn wait_for_submit(pso: usize) {
     }
     p.note_use();
     let _held = Held::new();
+    let _prof = super::prof::span(super::prof::Kind::ComputePipelineWait);
     if !p.sent.swap(true, Ordering::AcqRel) {
         enqueue(p.clone());
     }
@@ -2354,6 +2359,7 @@ fn resolve_wait_in(
     }
     let Some(fcap) = frame_cap else {
         let _held = Held::new();
+        let _prof = super::prof::span(if p.compute { super::prof::Kind::ComputePipelineWait } else { super::prof::Kind::GraphicsPipelineWait });
         if let Some(b) = budget {
             return resolve_within(p, pso, b);
         }
@@ -2385,6 +2391,7 @@ fn resolve_wait_in(
         _ => (rem, false),
     };
     let _held = Held::new();
+    let _prof = super::prof::span(if p.compute { super::prof::Kind::ComputePipelineWait } else { super::prof::Kind::GraphicsPipelineWait });
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), wait_for, |d| !*d).unwrap();
     let finished = *done;
     drop(done);

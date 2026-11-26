@@ -285,6 +285,10 @@ struct State {
     rb_last_fence: u64,
     /// the fence value each title queue last waited for
     waited: FxHashMap<usize, u64>,
+    /// tile mappings were queued since the last `signal` (`map_tiles` / `unmap_tiles`)
+    mapping_queued: std::sync::atomic::AtomicBool,
+    /// the fence value of the last `signal` that came after tile mappings
+    mapped_value: u64,
     /// `mapped` as sorted (start, end) runs (None: to be made again)
     runs: Option<Vec<(usize, usize)>>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
@@ -760,6 +764,18 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
+/// Bytes of the pool heaps given back but not released yet (titles' queues may still read
+/// them): memory accounting, #2688.
+pub fn retired_bytes() -> usize {
+    lock_state().as_ref().map_or(0, |s| s.retired.len() * POOL_TILES as usize * TILE)
+}
+
+/// Bytes of the title's pages committed in the sparse windows (their CPU side): memory
+/// accounting, #2688.
+pub fn committed_bytes() -> usize {
+    lock_state().as_ref().map_or(0, |s| s.committed_bytes())
+}
+
 pub fn pool_bytes() -> (usize, usize) {
     let g = lock_state();
     let Some(s) = g.as_ref() else { return (0, 0) };
@@ -930,6 +946,8 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             rb_list,
             rb_last_fence: 0,
             waited: FxHashMap::default(),
+            mapping_queued: std::sync::atomic::AtomicBool::new(false),
+            mapped_value: 0,
             runs: None,
             scratch_runs: Vec::new(),
         })
@@ -1045,6 +1063,7 @@ impl State {
         if tiles.is_empty() {
             return;
         }
+        self.mapping_queued.store(true, Ordering::Relaxed);
         let mut by_heap: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
         for &(a, (h, t)) in tiles {
             by_heap.entry(h).or_default().push((((a - res_base) / TILE) as u32, t));
@@ -1075,6 +1094,7 @@ impl State {
                 counts.push(run);
                 i += run as usize;
             }
+            let flight_t = std::time::Instant::now();
             self.queue.UpdateTileMappings(
                 res,
                 coords.len() as u32,
@@ -1087,6 +1107,7 @@ impl State {
                 Some(counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
+            super::flight::tile_map("sparse", windows::core::Interface::as_raw(&self.queue) as usize, (counts.iter().map(|&c| c as u64).sum::<u64>()) as u64, flight_t.elapsed());
         }
     }
 
@@ -1094,6 +1115,7 @@ impl State {
         if tiles.is_empty() {
             return;
         }
+        self.mapping_queued.store(true, Ordering::Relaxed);
         let mut xs: Vec<u32> = tiles.iter().map(|&a| ((a - res_base) / TILE) as u32).collect();
         xs.sort_unstable();
         let mut coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = Vec::with_capacity(xs.len());
@@ -1113,6 +1135,7 @@ impl State {
             counts.push(run);
             i += run as usize;
         }
+        let flight_t = std::time::Instant::now();
         self.queue.UpdateTileMappings(
             res,
             coords.len() as u32,
@@ -1125,6 +1148,14 @@ impl State {
             Some(counts.as_ptr()),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        super::flight::tile_map("sparse", windows::core::Interface::as_raw(&self.queue) as usize, (counts.iter().map(|&c| c as u64).sum::<u64>()) as u64, flight_t.elapsed());
+    }
+
+    /// Bytes of the title's pages committed in the windows: the pages of the mapped tiles that
+    /// are not holes. A tile the title decommitted whole is not mapped any more, though its pool
+    /// tile may still be parked (memory accounting, #2688).
+    fn committed_bytes(&self) -> usize {
+        self.mapped.values().map(|e| PAGES_PER_TILE - e.holes.count_ones() as usize).sum::<usize>() * PAGE
     }
 
     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
@@ -1186,6 +1217,10 @@ impl State {
     unsafe fn signal(&mut self) {
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+        if self.mapping_queued.swap(false, Ordering::Relaxed) {
+            self.mapped_value = self.value;
+        }
+        super::flight::signaled("sparse", windows::core::Interface::as_raw(&self.queue) as usize, &self.fence, self.value);
     }
 
     #[inline]
@@ -1212,6 +1247,7 @@ impl State {
     unsafe fn signal_rb(&mut self) {
         self.rb_done_value += 1;
         let _ = self.rb_queue.Signal(&self.rb_done_fence, self.rb_done_value);
+        super::flight::signaled("sparse readback", windows::core::Interface::as_raw(&self.rb_queue) as usize, &self.rb_done_fence, self.rb_done_value);
     }
 
     #[inline]
@@ -2597,12 +2633,83 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     dirty_runs.clear();
     s.scratch_runs = dirty_runs;
-    let q = queue.as_raw() as usize;
-    if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
-        let _ = queue.Wait(&s.fence, s.value);
-        super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &s.fence, s.value);
-        s.waited.insert(q, s.value);
+    // the tile mappings of buffers placed since the last signal (`place_buffer`)
+    if s.mapping_queued.load(Ordering::Relaxed) {
+        s.signal();
     }
+    let q = queue.as_raw() as usize;
+    let waited_before = s.waited.get(&q).copied().unwrap_or(0);
+    if s.value > 0 && waited_before < s.value {
+        let (fence, value) = (s.fence.clone(), s.value);
+        // new tile mappings since this queue last waited: on the CPU (`sparse_cpu_wait`); only
+        // copies: the GPU wait as before (a CPU wait there would hold every submit for them)
+        let mappings = s.mapped_value > waited_before;
+        s.waited.insert(q, value);
+        // (the wait below is without the state lock: the sparse queue's own work needs no lock to
+        // finish, and other submits must not stand behind this one meanwhile)
+        drop(g);
+        if !(mappings && cpu_waited_for_mappings(&fence, value, "sparse uploads and tile mappings")) {
+            let _ = queue.Wait(&fence, value);
+            super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &fence, value);
+        }
+    }
+}
+
+/// `XCL_SPARSE_CPU_WAIT_MS` (1 000 by default, 0: off): how long a title submit waits on the
+/// CPU for a mapping queue's tile mappings (the sparse windows', the video memory pages') before
+/// its lists go, instead of the title's queue waiting for them on the GPU.
+///
+/// With the GPU wait every queue of a retail title held its queued work behind the sparse
+/// queue's tile mappings. On an AMD RX 9070 (16 GB, at its memory budget) the sparse queue's
+/// fence then stopped short of the value they waited for, for 15 s – while AMD's crash analysis
+/// found no command buffer in flight – and the device was removed (five runs in a row, 63–140 s
+/// into the world). A tile mapping is the video memory manager's work: it can have to evict, and
+/// it cannot take memory from queues whose work is already queued behind that very mapping. With
+/// the wait on the CPU no queue holds work behind a mapping; past the limit the GPU wait is used
+/// as before (logged).
+fn sparse_cpu_wait() -> std::time::Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("XCL_SPARSE_CPU_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1000)
+    }))
+}
+
+/// Whether `fence` (of the mapping queue `what`) reached `value` within `sparse_cpu_wait`.
+pub(super) unsafe fn cpu_waited_for_mappings(fence: &ID3D12Fence, value: u64, what: &str) -> bool {
+    let most = sparse_cpu_wait();
+    if most.is_zero() {
+        return false;
+    }
+    if fence.GetCompletedValue() >= value {
+        return true;
+    }
+    thread_local! {
+        static EVENT: HANDLE = unsafe { windows::Win32::System::Threading::CreateEventW(None, false, false, None).unwrap_or_default() };
+    }
+    let t = std::time::Instant::now();
+    let reached = EVENT.with(|&ev| {
+        if ev.is_invalid() || fence.SetEventOnCompletion(value, ev).is_err() {
+            return false;
+        }
+        windows::Win32::System::Threading::WaitForSingleObject(ev, most.as_millis() as u32);
+        fence.GetCompletedValue() >= value
+    });
+    let waited = t.elapsed();
+    super::flight::event("mapping cpu wait", value, waited.as_micros() as u64, reached as u64);
+    static SLOW: AtomicU64 = AtomicU64::new(0);
+    if !reached {
+        crate::xlog_warn!(
+            "D3D12.X: {what} did not reach {value} in {} ms (at {}): the title's queue waits for it on the GPU",
+            waited.as_millis(),
+            fence.GetCompletedValue()
+        );
+    } else if waited >= std::time::Duration::from_millis(50) {
+        let n = SLOW.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: a submit waited {} ms for {what} ({n} such waits)", waited.as_millis());
+        }
+    }
+    reached
 }
 
 /// A buffer the title places at `va` in a sparse window (`bytes` long, `desc` the PC
@@ -2653,7 +2760,9 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
         *s.pinned.entry(tile).or_default() += 1;
     }
     s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
-    s.signal();
+    // (no signal of its own: the next submit's `before_execute` gives one for all the mappings
+    // queued since – a retail title placed 165 buffers in 6 ms, each with a mapping and a signal,
+    // right before its GPU stopped)
     Some((hr, delta))
 }
 
@@ -2847,6 +2956,8 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
+            mapping_queued: std::sync::atomic::AtomicBool::new(false),
+            mapped_value: 0,
                 runs: None,
                 scratch_runs: Vec::new(),
             };
@@ -3166,6 +3277,8 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
+            mapping_queued: std::sync::atomic::AtomicBool::new(false),
+            mapped_value: 0,
                 runs: None,
                 scratch_runs: Vec::new(),
             };
@@ -3272,6 +3385,8 @@ mod tests {
                 rb_list,
                 rb_last_fence: 0,
                 waited: FxHashMap::default(),
+            mapping_queued: std::sync::atomic::AtomicBool::new(false),
+            mapped_value: 0,
                 runs: None,
                 scratch_runs: Vec::new(),
             };
@@ -3408,6 +3523,8 @@ mod tests {
             rb_list,
             rb_last_fence: 0,
             waited: FxHashMap::default(),
+            mapping_queued: std::sync::atomic::AtomicBool::new(false),
+            mapped_value: 0,
             runs: None,
             scratch_runs: Vec::new(),
         };

@@ -1686,7 +1686,15 @@ unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_v
         if completed == u64::MAX || target.armed_waits.is_empty() {
             return false;
         }
-        target.armed_waits.iter().filter(|aw| aw.val <= sig_val).map(|aw| (aw.waiting_queue, aw.wait_seq)).collect()
+        // A wait an earlier signal of this cell already satisfies (GPU or CPU) does not wait on
+        // this one: counting it made every pipelined frame (wait N armed, signal N+1 next) a cycle.
+        let covered = target.submitted_max.max(target.cpu_signaled_max);
+        target
+            .armed_waits
+            .iter()
+            .filter(|aw| aw.val <= sig_val && aw.val > covered)
+            .map(|aw| (aw.waiting_queue, aw.wait_seq))
+            .collect()
     };
     if target_waiters.is_empty() {
         return false;
@@ -1825,7 +1833,10 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         let Some(graph) = g.as_mut() else { return };
         let Some(tf) = graph.title_fences.get_mut(&title_fence) else { return };
         prune_title_fence(title_fence, tf);
-        let target_waiters: Vec<(usize, u64)> = tf.waits.iter().filter(|&&(v, _, _)| v <= sig_val).map(|&(_, wq, wseq)| (wq, wseq)).collect();
+        // (a wait an earlier signal of the fence satisfies does not wait on this one, as for the
+        // cells in `would_signal_close_cycle`)
+        let covered = tf.signals.iter().map(|s| s.val).max().unwrap_or(0);
+        let target_waiters: Vec<(usize, u64)> = tf.waits.iter().filter(|&&(v, _, _)| v <= sig_val && v > covered).map(|&(_, wq, wseq)| (wq, wseq)).collect();
         if target_waiters.is_empty() {
             return;
         }
@@ -4012,6 +4023,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let q_raw = queue as *mut c_void;
+    // (a submit as `ExecuteCommandLists` is, for `prof`: the refresh, the waits and the driver)
+    let _prof = super::prof::span(super::prof::Kind::Submit);
     super::title_textures::refresh(q_raw);
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
@@ -5252,6 +5265,9 @@ pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
     let ext = *(this as *const usize);
     let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9)(this);
     real::preserve_vtable(this, ext);
+    if hr >= 0 && !super::title_textures::is_own_work() {
+        super::title_textures::note_list_closed(this);
+    }
     if hr < 0 {
         let ty = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_GET_TYPE)(this);
         crate::xlog_warn!("D3D12.X: DMA list Close → {:#x} (PC list type {ty})", hr as u32);
@@ -7989,6 +8005,123 @@ mod tests {
                 !would_signal_close_cycle(&mut g3, 0xD001, 0x3000, 0x78d),
                 "pipelined 3-queue chain with wait_seq > sig_seq must NOT be treated as a cycle"
             );
+
+            // 3. Next frame's signal on a cell whose armed wait an earlier signal already covers
+            //    (a retail title, frame 0x6dc): C (0xC001) signalled A=0x6db, Direct (0xD001)
+            //    waits A >= 0x6db (seq 3544) and later signals B=0x6dc (seq 3572); C waits on
+            //    B >= 0x6dc (seq 34) and now signals A=0x6dc. Direct's wait is satisfied by C's
+            //    0x6db signal, not by this one: no cycle.
+            let fa: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let fb: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut gp = SyncGraph::default();
+            gp.cells.insert(
+                0x4000,
+                SyncCell {
+                    fence: Some(fa),
+                    device: dev.as_raw() as usize,
+                    recorded_max: 0x6dc,
+                    submitted_max: 0x6db,
+                    submitted_queue: Some(0xC001),
+                    armed_waits: vec![ArmedGpuWait {
+                        val: 0x6db,
+                        waiting_queue: 0xD001,
+                        waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+                        wait_seq: 3544,
+                        armed_at: Instant::now(),
+                        after_write64: false,
+                    }],
+                    submitted_signals: vec![SubmittedSignal { val: 0x6db, queue: 0xC001, seq: 16 }],
+                    ..Default::default()
+                },
+            );
+            gp.cells.insert(
+                0x5000,
+                SyncCell {
+                    fence: Some(fb),
+                    device: dev.as_raw() as usize,
+                    recorded_max: 0x6dc,
+                    submitted_max: 0x6dc,
+                    submitted_queue: Some(0xD001),
+                    armed_waits: vec![ArmedGpuWait {
+                        val: 0x6dc,
+                        waiting_queue: 0xC001,
+                        waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_COMPUTE.0,
+                        wait_seq: 34,
+                        armed_at: Instant::now(),
+                        after_write64: false,
+                    }],
+                    submitted_signals: vec![SubmittedSignal { val: 0x6dc, queue: 0xD001, seq: 3572 }],
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !would_signal_close_cycle(&mut gp, 0xC001, 0x4000, 0x6dc),
+                "a wait an earlier signal already satisfies must NOT make the next frame's signal a cycle"
+            );
+            // Direct waiting on A >= 0x6dc instead (only this signal satisfies it): a true cycle.
+            gp.cells.get_mut(&0x4000).unwrap().armed_waits[0].val = 0x6dc;
+            assert!(
+                would_signal_close_cycle(&mut gp, 0xC001, 0x4000, 0x6dc),
+                "a wait only this signal satisfies, armed before the waiter's own signal, MUST be a cycle"
+            );
+        }
+    }
+
+    /// The next frame's Signal of a title fence does not break a "cycle" through a wait an earlier
+    /// signal of that fence satisfies; one that only the new signal satisfies is a cycle, broken
+    /// by releasing the cell's wait.
+    #[test]
+    fn a_title_fence_wait_an_earlier_signal_covers_is_no_cycle() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let title: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let cell: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (q0, q1, va, f) = (0xC0F0usize, 0xC0F1usize, 0x7E57_C0F0u64, title.as_raw() as usize);
+            // q1 signalled the fence at 1; q0 waits for that and signals the cell later, which q1
+            // waits for; q1 is about to signal the fence at 2
+            let set = |wait: u64| {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let gr = g.get_or_insert_with(SyncGraph::default);
+                let mut tf = TitleFenceSync::default();
+                tf.waits.push((wait, q0, 5));
+                tf.signals.push(SubmittedSignal { val: 1, queue: q1, seq: 3 });
+                gr.title_fences.insert(f, tf);
+                if !gr.cells.contains_key(&va) {
+                    ARMED_GPU_WAITS.fetch_add(1, Ordering::AcqRel);
+                    gr.cells.insert(
+                        va,
+                        SyncCell {
+                            fence: Some(cell.clone()),
+                            device: dev.as_raw() as usize,
+                            recorded_max: 9,
+                            submitted_max: 9,
+                            submitted_queue: Some(q0),
+                            armed_waits: vec![ArmedGpuWait { val: 9, waiting_queue: q1, waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_COMPUTE.0, wait_seq: 4, armed_at: Instant::now(), after_write64: false }],
+                            submitted_signals: vec![SubmittedSignal { val: 9, queue: q0, seq: 7 }],
+                            ..Default::default()
+                        },
+                    );
+                }
+            };
+            set(1);
+            break_cycles_before_title_signal(q1, f, 2);
+            assert_eq!(cell.GetCompletedValue(), 0, "the wait is the earlier signal's: nothing is released");
+            set(2);
+            break_cycles_before_title_signal(q1, f, 2);
+            assert_eq!(cell.GetCompletedValue(), 9, "a wait only the new signal satisfies: released");
+            let mut g = SYNC_GRAPH.lock().unwrap();
+            let gr = g.as_mut().unwrap();
+            gr.title_fences.remove(&f);
+            let left = gr.cells.remove(&va).map_or(0, |c| c.armed_waits.len());
+            if left > 0 {
+                ARMED_GPU_WAITS.fetch_sub(left, Ordering::AcqRel);
+            }
         }
     }
 
