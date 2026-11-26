@@ -6259,12 +6259,33 @@ fn forget_graphics_blob(key: (u64, usize)) {
     }
 }
 
-unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) {
-    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || graphics_blob(key).is_some() {
-        return;
+/// The driver's blob of the graphics pipeline just built, for its caller (the disk cache), and
+/// in memory while `GRAPHICS_BLOBS_MAX` has room (as `remember_compute_blob`: one the store has
+/// no room for must still reach the disk).
+unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) -> Option<std::sync::Arc<Vec<u8>>> {
+    let preparing = PREPARING.load(Ordering::Relaxed);
+    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && !preparing) || pso.is_null() {
+        return None;
     }
-    let Some(bytes) = read_pso_cached_blob(pso) else { return };
-    insert_cached_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, key, bytes);
+    if let Some(b) = graphics_blob(key) {
+        return Some(b);
+    }
+    let bytes = read_pso_cached_blob(pso)?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let bytes = std::sync::Arc::new(bytes);
+    // (a preparation worker builds each pipeline once: for the disk only)
+    if preparing {
+        return Some(bytes);
+    }
+    let mut g = GRAPHICS_BLOBS.lock().unwrap();
+    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
+    if *total + bytes.len() <= GRAPHICS_BLOBS_MAX {
+        *total += bytes.len();
+        m.insert(key, bytes.clone());
+    }
+    Some(bytes)
 }
 
 /// Deterministic FNV-1a digest of every field in a translated PC graphics PSO (shaders, static
@@ -6727,7 +6748,15 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, |v| v.len()) + rect_gs.as_ref().map_or(0, Vec::len);
     let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref().map(Vec::as_slice), rect_gs.as_deref(), &samplers);
     let mut cached = graphics_blob(gkey);
-    let disk = driver_cache::graphics_path(gkey.0, gkey.1);
+    let driver = driver_identity(this);
+    let disk = driver.and_then(|id| {
+        let mut h = Fnv64::new();
+        h.u64(gkey.0);
+        h.u64(gkey.1 as u64);
+        h.u64(id);
+        h.u32(crate::gpu::recomp::pso::mem_windows());
+        driver_cache::graphics_path(h.finish(), bytes)
+    });
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk
@@ -6755,9 +6784,14 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     );
     let hr = build.hr;
     if build.cache_eligible {
-        keep_graphics_blob(gkey, *ppv, bytes);
-        if let (Some(p), Some(b)) = (disk.as_deref(), graphics_blob(gkey)) {
-            driver_cache::keep(p, &b, build.in_driver);
+        if let Some(b) = keep_graphics_blob(gkey, *ppv, bytes) {
+            if let Some(p) = disk.as_deref() {
+                if PREPARING.load(Ordering::Relaxed) {
+                    driver_cache::write(p, &b);
+                } else {
+                    driver_cache::keep(p, &b, build.in_driver);
+                }
+            }
         }
     } else if build.reused && from_disk {
         driver_cache::note(true, None);
@@ -7207,6 +7241,33 @@ unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool
     matches!(translated_graphics_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(hr) if hr >= 0)
 }
 
+/// This process is a shader preparation worker (`prepare_device`): it keeps the driver's blob of
+/// every graphics pipeline it builds on disk, whatever its size and time, and none in memory.
+static PREPARING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A shader preparation worker's device (`shaders::graphics_worker`), made on the title's adapter:
+/// adopted as the title's is, so `prepare_graphics` takes the title's path. Raw, kept for the
+/// process.
+pub(crate) fn prepare_device(device: ID3D12Device) -> usize {
+    PREPARING.store(true, Ordering::Relaxed);
+    let raw = device.into_raw();
+    unsafe { adopt(raw, Kind::Device) };
+    raw as usize
+}
+
+/// A title's graphics pipeline `desc` (`gfx_records::Record::desc`) built on `device`
+/// (`prepare_device`) as the title's background build makes it (`build_graphics`): the
+/// translation, DXC and driver blob caches on disk get what the title will ask for. The pipeline
+/// is released; false: not made (noted in the log as the title's would be).
+pub(crate) unsafe fn prepare_graphics(device: usize, desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> bool {
+    let this = device as *mut c_void;
+    let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let made = matches!(translated_graphics_pso(this, f, desc as *const _ as *const c_void, &pc_iid(Kind::PipelineState), &mut out), Some(hr) if hr >= 0) && !out.is_null();
+    super::pso_async::release(out as usize);
+    made
+}
+
 unsafe fn build_compute(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
     matches!(translated_compute_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(Ok(hr)) if hr >= 0)
@@ -7595,6 +7656,34 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
 
 #[allow(dead_code)] // Consumed by the stacked driver-cache integration.
 mod two_pass_identity;
+use two_pass_identity::Fnv64;
+
+/// The adapter of `device` and its driver (vendor, device, subsystem, revision, user-mode
+/// driver version), for the names of the driver blobs kept on disk: the driver refuses another
+/// one's blob (it is compiled again), and two adapters sharing the cache (a GPU and the
+/// software one) would take turns overwriting each other's files. None: not known (no blob of
+/// its pipelines is kept on disk).
+fn driver_identity(device: *mut c_void) -> Option<u64> {
+    use windows::Win32::Graphics::Dxgi::*;
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&device) }?;
+    let luid = unsafe { dev.GetAdapterLuid() };
+    let key = (luid.HighPart, luid.LowPart);
+    static IDS: OnceLock<Mutex<HashMap<(i32, u32), Option<u64>>>> = OnceLock::new();
+    let mut ids = IDS.get_or_init(Default::default).lock().unwrap();
+    *ids.entry(key).or_insert_with(|| unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter = factory.EnumAdapterByLuid(luid).ok()?;
+        let desc = adapter.GetDesc().ok()?;
+        let version = adapter.CheckInterfaceSupport(&IDXGIDevice::IID).ok()?;
+        let mut h = Fnv64::new();
+        h.u32(desc.VendorId);
+        h.u32(desc.DeviceId);
+        h.u32(desc.SubSysId);
+        h.u32(desc.Revision);
+        h.u64(version as u64);
+        Some(h.finish())
+    })
+}
 
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).

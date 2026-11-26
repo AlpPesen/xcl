@@ -77,9 +77,34 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 /// Memory windows of the title's unified memory (1 without it), with `HEAP_WINDOWS` when
 /// shaders take them from the descriptor heap (`heap_windows`).
 pub fn mem_windows() -> u32 {
+    let title = TITLE_WINDOWS.load(std::sync::atomic::Ordering::Relaxed);
+    if title != 0 {
+        return windows_for(
+            title & !(super::HEAP_WINDOWS | super::HEAP_FLAT),
+            title & super::HEAP_WINDOWS != 0 && !SWITCH_FORM.with(|s| s.get()),
+            title & super::HEAP_FLAT != 0,
+        );
+    }
     let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
-    if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
-        n | super::HEAP_WINDOWS | if heap_flat() { super::HEAP_FLAT } else { 0 }
+    windows_for(n, heap_windows() && !SWITCH_FORM.with(|s| s.get()), heap_flat())
+}
+
+/// The title's windows (`mem_windows` with `HEAP_WINDOWS`) for a process without its memory: a
+/// shader preparation worker builds the title's pipelines with them (0: none given).
+static TITLE_WINDOWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `mem_windows` is `windows` from here on (a preparation worker: `uma::leave_out`).
+pub fn set_title_windows(windows: u32) {
+    TITLE_WINDOWS.store(windows, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `n` windows as shaders take them: from the descriptor heap (`heap`), or in the switch form
+/// over the root UAVs – of which there are `MAX_WINDOWS`, so never more there (the HLSL path
+/// refused a wider switch, and DXIL quietly made it 4: a 16-window run whose heap views could
+/// not be made, or a pipeline the driver refused with them, lost every shader on HLSL).
+fn windows_for(n: u32, heap: bool, flat: bool) -> u32 {
+    if n > 1 && heap {
+        n | super::HEAP_WINDOWS | if flat { super::HEAP_FLAT } else { 0 }
     } else {
         n
     }
