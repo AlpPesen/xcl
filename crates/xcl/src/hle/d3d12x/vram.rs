@@ -608,6 +608,10 @@ struct TilePool {
     free_by_heap: Vec<Vec<u32>>,
     /// Whether `free_by_heap[h]` must be sorted descending before popping.
     dirty_sort: Vec<bool>,
+    /// Per-heap bitmap of recycled tiles (`1` = previously allocated & returned, holds stale VRAM
+    /// contents that must be zeroed before handing to a new texture under `XCL_ZERO_TARGET_PAGES`).
+    /// Freshly created heaps start all `0` (already zeroed by D3D12).
+    dirty_bits: Vec<[u64; (POOL_PAGES as usize).div_ceil(64)]>,
     /// Total free tiles currently available across all heaps.
     free_total: usize,
     /// Tiles given back, reusable after `COOL`.
@@ -619,9 +623,34 @@ impl TilePool {
         TilePool {
             free_by_heap: Vec::new(),
             dirty_sort: Vec::new(),
+            dirty_bits: Vec::new(),
             free_total: 0,
             cooling: std::collections::VecDeque::new(),
         }
+    }
+
+    #[inline]
+    fn mark_dirty(&mut self, h: usize, t: u32) {
+        let word = (t as usize) >> 6;
+        if let Some(bits) = self.dirty_bits.get_mut(h) {
+            if let Some(w) = bits.get_mut(word) {
+                *w |= 1u64 << (t & 63);
+            }
+        }
+    }
+
+    #[inline]
+    fn take_dirty(&mut self, h: usize, t: u32) -> bool {
+        let word = (t as usize) >> 6;
+        if let Some(bits) = self.dirty_bits.get_mut(h) {
+            if let Some(w) = bits.get_mut(word) {
+                let mask = 1u64 << (t & 63);
+                let was = (*w & mask) != 0;
+                *w &= !mask;
+                return was;
+            }
+        }
+        false
     }
 
     fn add_heap_at(&mut self, slot: u32, pool_pages: u32) {
@@ -629,10 +658,12 @@ impl TilePool {
         if idx >= self.free_by_heap.len() {
             self.free_by_heap.resize_with(idx + 1, Vec::new);
             self.dirty_sort.resize(idx + 1, false);
+            self.dirty_bits.resize(idx + 1, [0u64; (POOL_PAGES as usize).div_ceil(64)]);
         }
         debug_assert!(self.free_by_heap[idx].is_empty());
         self.free_by_heap[idx] = (0..pool_pages).rev().collect();
         self.dirty_sort[idx] = false;
+        self.dirty_bits[idx] = [0u64; (POOL_PAGES as usize).div_ceil(64)];
         self.free_total += pool_pages as usize;
     }
 
@@ -655,6 +686,7 @@ impl TilePool {
             self.free_by_heap[h].clear();
             self.free_by_heap[h].shrink_to_fit();
             self.dirty_sort[h] = false;
+            self.dirty_bits[h] = [0u64; (POOL_PAGES as usize).div_ceil(64)];
             self.free_total -= full;
             reclaimed.push(h as u32);
         }
@@ -677,6 +709,7 @@ impl TilePool {
             if idx < self.free_by_heap.len() {
                 self.free_by_heap[idx].push(t);
                 self.dirty_sort[idx] = true;
+                self.mark_dirty(idx, t);
                 self.free_total += 1;
             }
         }
@@ -694,8 +727,23 @@ impl TilePool {
             if idx < self.free_by_heap.len() {
                 self.free_by_heap[idx].push(t);
                 self.dirty_sort[idx] = true;
+                self.mark_dirty(idx, t);
                 self.free_total += 1;
             }
+        }
+    }
+
+    fn return_rollback_tiles(&mut self, tiles: &[Tile], dirty: &[Tile]) {
+        for &(h, t) in tiles {
+            let idx = h as usize;
+            if idx < self.free_by_heap.len() {
+                self.free_by_heap[idx].push(t);
+                self.dirty_sort[idx] = true;
+                self.free_total += 1;
+            }
+        }
+        for &(h, t) in dirty {
+            self.mark_dirty(h as usize, t);
         }
     }
 
@@ -746,6 +794,7 @@ impl TilePool {
         self.take_batch_fenced(count, preferred, now, None, pool_pages, make_heap)
     }
 
+    #[cfg(test)]
     fn take_batch_fenced(
         &mut self,
         count: usize,
@@ -753,6 +802,20 @@ impl TilePool {
         now: std::time::Instant,
         safe_before: Option<std::time::Instant>,
         pool_pages: u32,
+        make_heap: impl FnMut() -> Option<u32>,
+    ) -> Option<Vec<Tile>> {
+        let mut ignored = Vec::new();
+        self.take_batch_fenced_recycled(count, preferred, now, safe_before, pool_pages, &mut ignored, make_heap)
+    }
+
+    fn take_batch_fenced_recycled(
+        &mut self,
+        count: usize,
+        preferred: Option<u32>,
+        now: std::time::Instant,
+        safe_before: Option<std::time::Instant>,
+        pool_pages: u32,
+        recycled_out: &mut Vec<Tile>,
         mut make_heap: impl FnMut() -> Option<u32>,
     ) -> Option<Vec<Tile>> {
         if count == 0 {
@@ -760,13 +823,15 @@ impl TilePool {
         }
         self.drain_cooling_before(now, safe_before);
         let mut out = Vec::with_capacity(count);
+        let recycled_start = recycled_out.len();
         while out.len() < count {
             let rem = count - out.len();
             let h = match self.pick_heap(rem, preferred) {
                 Some(h) => h,
                 None => {
                     let Some(new_h) = make_heap() else {
-                        self.return_tiles(&out);
+                        let rolled_dirty = recycled_out.split_off(recycled_start);
+                        self.return_rollback_tiles(&out, &rolled_dirty);
                         return None;
                     };
                     self.add_heap_at(new_h, pool_pages);
@@ -777,16 +842,44 @@ impl TilePool {
                 self.free_by_heap[h].sort_unstable_by(|a, b| b.cmp(a));
                 self.dirty_sort[h] = false;
             }
-            let free = &mut self.free_by_heap[h];
-            let take = rem.min(free.len());
+            let take = rem.min(self.free_by_heap[h].len());
             for _ in 0..take {
-                let t = free.pop().unwrap();
+                let t = self.free_by_heap[h].pop().unwrap();
+                if self.take_dirty(h, t) {
+                    recycled_out.push((h as u32, t));
+                }
                 out.push((h as u32, t));
             }
             self.free_total -= take;
         }
         Some(out)
     }
+}
+
+/// Coalesce recycled `(heap, tile_idx)` pairs into sorted, deduplicated `(heap, start_tile, count)`
+/// runs so GPU zero-fills issue one `CopyBufferRegion` per contiguous tile span.
+fn coalesce_tile_runs(tiles: &mut Vec<Tile>) -> Vec<(u32, u32, u32)> {
+    if tiles.is_empty() {
+        return Vec::new();
+    }
+    tiles.sort_unstable();
+    tiles.dedup();
+    let mut runs: Vec<(u32, u32, u32)> = Vec::new();
+    for &(h, t) in tiles.iter() {
+        match runs.last_mut() {
+            Some(last) if last.0 == h && last.1 + last.2 == t => last.2 += 1,
+            _ => runs.push((h, t, 1)),
+        }
+    }
+    runs
+}
+
+/// Zero recycled page-pool tiles on the mapping queue before handing them to newly mapped
+/// textures so stale render-target/depth/UAV bytes never bleed into new targets (`#505`/`#1833`).
+/// Enabled by default (`XCL_ZERO_TARGET_PAGES=0` disables).
+fn zero_target_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_ZERO_TARGET_PAGES").map_or(true, |v| v.trim() != "0"))
 }
 
 /// Allocate one 64 MiB default heap for `Pages`.
@@ -815,13 +908,16 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
 /// are reclaimed back to local VRAM. `len()` reports the count of live heaps.
 struct PoolHeaps {
     slots: Vec<Option<ID3D12Heap>>,
+    /// Aliased 64 MiB `BUFFER` placed at offset 0 of each pool heap for GPU zero-fills of recycled
+    /// tiles (0 bytes of extra VRAM; lazily created on first recycled tile in that heap).
+    zero_bufs: Vec<Option<ID3D12Resource>>,
     free_slots: Vec<u32>,
     live: usize,
 }
 
 impl PoolHeaps {
     fn new() -> Self {
-        Self { slots: Vec::new(), free_slots: Vec::new(), live: 0 }
+        Self { slots: Vec::new(), zero_bufs: Vec::new(), free_slots: Vec::new(), live: 0 }
     }
 
     fn len(&self) -> usize {
@@ -833,19 +929,112 @@ impl PoolHeaps {
         if let Some(idx) = self.free_slots.pop() {
             debug_assert!(self.slots[idx as usize].is_none());
             self.slots[idx as usize] = Some(heap);
+            self.zero_bufs[idx as usize] = None;
             idx
         } else {
             let idx = self.slots.len() as u32;
             self.slots.push(Some(heap));
+            self.zero_bufs.push(None);
             idx
         }
     }
 
     fn take_heap(&mut self, idx: u32) -> Option<ID3D12Heap> {
+        self.zero_bufs.get_mut(idx as usize).map(|b| b.take());
         let h = self.slots.get_mut(idx as usize)?.take()?;
         self.live -= 1;
         self.free_slots.push(idx);
         Some(h)
+    }
+
+    unsafe fn zero_buffer(&mut self, dev: &ID3D12Device, idx: usize) -> Option<ID3D12Resource> {
+        if let Some(b) = self.zero_bufs.get(idx)?.as_ref() {
+            return Some(b.clone());
+        }
+        let heap = self.slots.get(idx)?.as_ref()?;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Alignment: 0,
+            Width: POOL_PAGES as u64 * PAGE as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        let mut res: Option<ID3D12Resource> = None;
+        let ok = super::title_textures::own_work(|| {
+            dev.CreatePlacedResource(heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res)
+        })
+        .is_ok();
+        if !ok {
+            return None;
+        }
+        let buf = res?;
+        if super::real::dred_on() {
+            super::real::name_resource(buf.as_raw(), &format!("xcl vram zero_alias h={idx}"));
+        }
+        self.zero_bufs[idx] = Some(buf.clone());
+        Some(buf)
+    }
+}
+
+/// Reusable 4-slot command ring + 1 MiB pre-zeroed upload buffer for asynchronous GPU zero-fills
+/// of recycled VRAM pool tiles on `Pages::queue`.
+const ZERO_BUF_BYTES: u64 = 1 << 20;
+const ZERO_SLOTS: usize = 4;
+
+struct ZeroSlot {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence_val: u64,
+    kept_bufs: Vec<ID3D12Resource>,
+}
+
+struct ZeroRing {
+    zero_src: ID3D12Resource,
+    slots: Vec<ZeroSlot>,
+}
+
+impl ZeroRing {
+    unsafe fn new(dev: &ID3D12Device) -> Option<Self> {
+        let mut src: Option<ID3D12Resource> = None;
+        let hp = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Alignment: 0,
+            Width: ZERO_BUF_BYTES,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        super::title_textures::own_work(|| {
+            dev.CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut src)
+        })
+        .ok()?;
+        let zero_src = src?;
+        let mut mapped = std::ptr::null_mut();
+        zero_src.Map(0, None, Some(&mut mapped)).ok()?;
+        std::ptr::write_bytes(mapped as *mut u8, 0, ZERO_BUF_BYTES as usize);
+        zero_src.Unmap(0, None);
+        let mut slots = Vec::with_capacity(ZERO_SLOTS);
+        for _ in 0..ZERO_SLOTS {
+            let (alloc, list) = super::title_textures::own_work(|| -> windows::core::Result<_> {
+                let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                let l: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a, None)?;
+                l.Close()?;
+                Ok((a, l))
+            })
+            .ok()?;
+            slots.push(ZeroSlot { alloc, list, fence_val: 0, kept_bufs: Vec::new() });
+        }
+        Some(ZeroRing { zero_src, slots })
     }
 }
 
@@ -985,6 +1174,12 @@ struct Pages {
     scratch_flags: Vec<D3D12_TILE_RANGE_FLAGS>,
     scratch_offsets: Vec<u32>,
     scratch_counts: Vec<u32>,
+    /// recycled tiles awaiting batched GPU zero-fill on `self.queue` before next `before_execute`
+    pending_zero_tiles: Vec<Tile>,
+    /// lazily initialized command ring + 1 MiB zero source for `flush_zero_tiles`
+    zero_ring: Option<ZeroRing>,
+    /// true once `ZeroRing::new` failed so we don't retry every submit
+    zero_ring_failed: bool,
 }
 
 // D3D12 objects are free-threaded
@@ -1036,6 +1231,9 @@ impl Pages {
             scratch_flags: Vec::new(),
             scratch_offsets: Vec::new(),
             scratch_counts: Vec::new(),
+            pending_zero_tiles: Vec::new(),
+            zero_ring: None,
+            zero_ring_failed: false,
         })
     }
 
@@ -1162,6 +1360,107 @@ impl Pages {
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
         self.dirty_signal = true;
+    }
+
+    /// Asynchronously zero all queued recycled pool tiles on `self.queue` in one batched command
+    /// list, then emit an aliasing barrier + `self.fence` signal so any title queue waiting in
+    /// `before_execute` sees zeroed tiles before reading or writing newly mapped textures.
+    unsafe fn flush_zero_tiles(&mut self, dev: &ID3D12Device) {
+        if self.pending_zero_tiles.is_empty() {
+            return;
+        }
+        if !zero_target_pages() || self.zero_ring_failed {
+            self.pending_zero_tiles.clear();
+            return;
+        }
+        let runs = coalesce_tile_runs(&mut self.pending_zero_tiles);
+        self.pending_zero_tiles.clear();
+        if runs.is_empty() {
+            return;
+        }
+        if self.zero_ring.is_none() {
+            match ZeroRing::new(dev) {
+                Some(r) => self.zero_ring = Some(r),
+                None => {
+                    self.zero_ring_failed = true;
+                    return;
+                }
+            }
+        }
+        // Resolve aliased 64 MiB buffers for every touched live heap before borrowing `zero_ring`.
+        let mut heap_bufs: std::collections::HashMap<u32, ID3D12Resource> = std::collections::HashMap::new();
+        for &(h, _, _) in &runs {
+            if !heap_bufs.contains_key(&h) {
+                if let Some(buf) = self.pools.zero_buffer(dev, h as usize) {
+                    heap_bufs.insert(h, buf);
+                }
+            }
+        }
+        if heap_bufs.is_empty() {
+            return;
+        }
+        let done = self.fence.GetCompletedValue();
+        let ring = self.zero_ring.as_mut().unwrap();
+        let slot_idx = match ring.slots.iter().position(|s| s.fence_val <= done) {
+            Some(i) => i,
+            None => {
+                let (oldest_idx, oldest_val) = ring
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, s)| s.fence_val)
+                    .map(|(i, s)| (i, s.fence_val))
+                    .unwrap();
+                let _ = crate::gpu::fence::wait(&self.fence, oldest_val, dev, None, 5_000);
+                oldest_idx
+            }
+        };
+        let zero_src = ring.zero_src.clone();
+        let slot = &mut ring.slots[slot_idx];
+        slot.kept_bufs.clear();
+        let ok = super::title_textures::own_work(|| -> windows::core::Result<()> {
+            slot.alloc.Reset()?;
+            slot.list.Reset(&slot.alloc, None)?;
+            for &(h, start, count) in &runs {
+                let Some(dst) = heap_bufs.get(&h) else { continue };
+                let mut offset = start as u64 * PAGE as u64;
+                let mut rem = count as u64 * PAGE as u64;
+                while rem > 0 {
+                    let chunk = rem.min(ZERO_BUF_BYTES);
+                    slot.list.CopyBufferRegion(dst, offset, &zero_src, 0, chunk);
+                    offset += chunk;
+                    rem -= chunk;
+                }
+            }
+            let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(heap_bufs.len());
+            for buf in heap_bufs.values() {
+                slot.kept_bufs.push(buf.clone());
+                barriers.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                            pResourceBefore: std::mem::transmute_copy(buf),
+                            pResourceAfter: std::mem::zeroed(),
+                        }),
+                    },
+                });
+            }
+            if !barriers.is_empty() {
+                slot.list.ResourceBarrier(&barriers);
+            }
+            slot.list.Close()?;
+            let cmd: ID3D12CommandList = slot.list.cast()?;
+            self.queue.ExecuteCommandLists(&[Some(cmd)]);
+            Ok(())
+        })
+        .is_ok();
+        if ok {
+            self.value += 1;
+            let _ = self.queue.Signal(&self.fence, self.value);
+            self.dirty_signal = false;
+            slot.fence_val = self.value;
+        }
     }
 
     /// Emit one `queue.Signal` covering all batched `map()` / `unmap()` calls since the last flush.
@@ -1366,7 +1665,8 @@ impl Pages {
         let safe_before = self.cool_bound();
         let pools = &mut self.pools;
         let pool = &mut self.pool;
-        let fresh = pool.take_batch_fenced(missing, preferred, now, safe_before, POOL_PAGES, || {
+        let pending_zero = &mut self.pending_zero_tiles;
+        let fresh = pool.take_batch_fenced_recycled(missing, preferred, now, safe_before, POOL_PAGES, pending_zero, || {
             let _timer = step(Step::Heap);
             let heap = alloc_pool_heap(dev)?;
             Some(pools.push_heap(heap))
@@ -1430,6 +1730,9 @@ impl Pages {
             }
         }
         self.map(res, sub, &tiles);
+        if self.pending_zero_tiles.len() >= 256 {
+            self.flush_zero_tiles(dev);
+        }
         Some((used, used_extra, follows))
     }
 
@@ -1494,7 +1797,8 @@ impl Pages {
                     None => {
                         let pools = &mut self.pools;
                         let pool = &mut self.pool;
-                        let Some(mut fresh) = pool.take_batch_fenced(1, None, now, safe_before, POOL_PAGES, || {
+                        let pending_zero = &mut self.pending_zero_tiles;
+                        let Some(mut fresh) = pool.take_batch_fenced_recycled(1, None, now, safe_before, POOL_PAGES, pending_zero, || {
                             let _timer = step(Step::Heap);
                             let heap = alloc_pool_heap(dev)?;
                             Some(pools.push_heap(heap))
@@ -2180,6 +2484,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
             if !changed.is_empty() && !pages.follow.is_empty() {
                 pages.apply_backing(&dev, &changed);
             }
+            pages.flush_zero_tiles(&dev);
             pages.flush_signal();
             let key = queue.as_raw() as usize;
             if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
@@ -3508,5 +3813,50 @@ mod tests {
             drop(res);
             VirtualFree(va as *mut c_void, 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn tile_pool_tracks_dirty_bits_only_for_recycled_tiles() {
+        let mut pool = TilePool::new();
+        let now = std::time::Instant::now();
+        let mut recycled = Vec::new();
+        let mut next_h = 0u32;
+
+        // Fresh heap tiles are never marked recycled (D3D12 guarantees fresh heaps are zeroed).
+        let first = pool
+            .take_batch_fenced_recycled(4, None, now, None, POOL_PAGES, &mut recycled, || {
+                let h = next_h;
+                next_h += 1;
+                Some(h)
+            })
+            .unwrap();
+        assert_eq!(first, vec![(0, 0), (0, 1), (0, 2), (0, 3)]);
+        assert!(recycled.is_empty(), "freshly allocated heap tiles must not need GPU zeroing");
+
+        // Returned tiles are marked dirty and reported in `recycled` when re-taken.
+        pool.return_tiles(&[(0, 1), (0, 2)]);
+        let again = pool
+            .take_batch_fenced_recycled(3, Some(0), now, None, POOL_PAGES, &mut recycled, || None)
+            .unwrap();
+        assert_eq!(again, vec![(0, 1), (0, 2), (0, 4)]);
+        assert_eq!(recycled, vec![(0, 1), (0, 2)], "only previously returned tiles require zeroing");
+
+        // Cooled tiles also mark dirty when drained back into free_by_heap.
+        recycled.clear();
+        pool.push_cooling((0, 0), now);
+        let later = now + COOL + std::time::Duration::from_millis(1);
+        let cooled = pool
+            .take_batch_fenced_recycled(1, Some(0), later, None, POOL_PAGES, &mut recycled, || None)
+            .unwrap();
+        assert_eq!(cooled, vec![(0, 0)]);
+        assert_eq!(recycled, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn coalesce_tile_runs_merges_adjacent_tiles_per_heap() {
+        let mut tiles = vec![(1, 5), (0, 3), (0, 2), (1, 6), (0, 3), (0, 10), (1, 4)];
+        assert_eq!(coalesce_tile_runs(&mut tiles), vec![(0, 2, 2), (0, 10, 1), (1, 4, 3)]);
+        let mut empty = Vec::new();
+        assert!(coalesce_tile_runs(&mut empty).is_empty());
     }
 }
