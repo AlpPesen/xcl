@@ -3619,6 +3619,7 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
 /// writes become visible, parses any readable `D3D12_BARRIER_GROUP` texture barriers targeting
 /// tracked depth+UAV resources, and notifies `depth_uav` / `format_alias` of global UAV barriers.
 pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, n: u32, barriers: *const c_void) {
+    super::bind::note_gpu_write(this);
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -5089,7 +5090,11 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
         super::title_textures::note_transitions(this as usize, &t);
     }
     if !out.is_empty() {
-        super::bind::invalidate_inline_guard(this);
+        if any_uav || uav_transition {
+            super::bind::note_gpu_write(this);
+        } else {
+            super::bind::invalidate_inline_guard(this);
+        }
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
         if super::cpu_writes::has_water_readback() {
             const WRITE_STATES: u32 = UNORDERED_ACCESS | 0x4; // UNORDERED_ACCESS | RENDER_TARGET

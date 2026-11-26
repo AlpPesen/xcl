@@ -1601,9 +1601,11 @@ const PRELUDE_DRAW_DRED_LABEL: &str = "xcl prelude_guard_draw_args";
 
 /// Exclusive upper bound on vertices/indices per instance in indirect Draw/DrawIndexed (`2^23` =
 /// `8,388,608`): any record with `verts >= 2^23` is zeroed to prevent garbage indirect-draw hangs.
+#[cfg(test)]
 const DRAW_VERTS_PER_INST_LIMIT: u32 = 1 << 23;
 /// Inclusive upper bound on total vertices (`verts_per_inst * instances`, `2^26` = `67,108,864`):
 /// any record with `verts * instances > 2^26` is zeroed.
+#[cfg(test)]
 const DRAW_TOTAL_VERTS_MAX: u32 = 1 << 26;
 
 /// Pure check matching `GUARD_DRAW_ARGS_*` / `PRELUDE_DRAW_GUARD_*`: true when an indirect
@@ -3306,7 +3308,10 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
             super::culprit::after_dispatch(list, m2);
             emit_uav_barrier(list, Some(&res_buf));
-            with(this, |s| s.arg_order_clean = false);
+            with(this, |s| {
+                s.arg_order_clean = false;
+                s.inline_guard = None;
+            });
             Ok(())
         })();
         match run {
@@ -3663,7 +3668,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 with(this, |s| {
                     s.arg_order_clean = false;
                     s.prelude_blocked = true;
+                    s.inline_guard = None;
                 });
+            } else {
+                with(this, |s| s.inline_guard = None);
             }
         }
         Err(e) => {
@@ -3983,6 +3991,7 @@ fn pso_for_draw(pso: usize) -> usize {
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let (pso, cached_gfx) = with(this, |s| {
+        s.inline_guard = None;
         let hit = s.pso_abi_cache.is_some_and(|c| c.query_pso == s.pso && c.is_gfx);
         (s.pso, hit)
     });
