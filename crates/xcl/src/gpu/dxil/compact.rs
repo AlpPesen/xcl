@@ -254,9 +254,18 @@ pub fn wanted(cfg: &Cfg, p: &Plan) -> bool {
     large(cfg) && once * 10 < all * 3 && p.words() <= MAX_TABLE_WORDS
 }
 
+/// Reachable non-terminator instruction count threshold for trying the compact form.
+const LARGE_INSTS: usize = 10_000;
+/// Reachable basic-block count threshold for trying the compact form: branch-heavy
+/// unrolled programs with thousands of small blocks (even below `LARGE_INSTS`
+/// non-terminator instructions) expand into tens of thousands of DXIL blocks and PHIs
+/// in plain form, causing excessive driver-compiler memory commit spikes.
+const LARGE_BLOCKS: usize = 2_000;
+
 /// Whether a program is large enough for `wanted` to be asked.
 pub fn large(cfg: &Cfg) -> bool {
-    cfg.rpo.iter().map(|&b| cfg.blocks[b].insts.len()).sum::<usize>() >= 20_000
+    cfg.rpo.len() >= LARGE_BLOCKS
+        || cfg.rpo.iter().map(|&b| cfg.blocks[b].insts.len()).sum::<usize>() >= LARGE_INSTS
 }
 
 pub const END: u32 = u32::MAX;
