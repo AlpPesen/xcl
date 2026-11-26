@@ -755,6 +755,28 @@ fn plan_ring_chunk(ring_write: u64, want: usize, cap: usize) -> (u64, usize) {
 // D3D12 objects are free-threaded; staging pointers and event handle are only used under STATE lock
 unsafe impl Send for State {}
 
+/// Wait for `fence` to reach `target` using a reusable auto-reset `event`, bounded by `timeout`.
+/// Resets `event` before arming and loops until `GetCompletedValue() >= target` or the deadline
+/// expires, so a late completion from an earlier timed-out wait cannot satisfy a newer wait early.
+/// (As in #1419 by gridoe and #2821 for `main`, same signature, so the two merge as one.)
+unsafe fn wait_fence_until(fence: &ID3D12Fence, event: HANDLE, target: u64, timeout: std::time::Duration) -> bool {
+    if target == 0 || fence.GetCompletedValue() >= target {
+        return true;
+    }
+    let _ = windows::Win32::System::Threading::ResetEvent(event);
+    let _ = fence.SetEventOnCompletion(target, event);
+    let deadline = std::time::Instant::now() + timeout;
+    while fence.GetCompletedValue() < target {
+        let rem = deadline.saturating_duration_since(std::time::Instant::now());
+        if rem.is_zero() {
+            return false;
+        }
+        let ms = rem.as_millis().clamp(1, u32::MAX as u128) as u32;
+        windows::Win32::System::Threading::WaitForSingleObject(event, ms);
+    }
+    true
+}
+
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
 /// The state's queue again, outside `STATE` (`queue`). `STATE` is held around D3D12 calls (an
@@ -1228,9 +1250,7 @@ impl State {
         if target == 0 || self.fence.GetCompletedValue() >= target {
             return;
         }
-        let _ = self.fence.SetEventOnCompletion(target, self.event);
-        windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-        if self.fence.GetCompletedValue() < target {
+        if !wait_fence_until(&self.fence, self.event, target, std::time::Duration::from_secs(5)) {
             crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
             super::real::stop_if_device_removed();
         }
@@ -1250,20 +1270,19 @@ impl State {
         super::flight::signaled("sparse readback", windows::core::Interface::as_raw(&self.rb_queue) as usize, &self.rb_done_fence, self.rb_done_value);
     }
 
+    /// Whether `rb_done_fence` reached `target` within 5 s: if not, the staging bytes are not the
+    /// readback yet and must not be copied out.
     #[inline]
-    unsafe fn wait_for_rb(&self, target: u64) {
-        if target == 0 || self.rb_done_fence.GetCompletedValue() >= target {
-            return;
+    unsafe fn wait_for_rb(&self, target: u64) -> bool {
+        if wait_fence_until(&self.rb_done_fence, self.event, target, std::time::Duration::from_secs(5)) {
+            return true;
         }
-        let _ = self.rb_done_fence.SetEventOnCompletion(target, self.event);
-        windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-        if self.rb_done_fence.GetCompletedValue() < target {
-            crate::xlog_warn!(
-                "sparse: the readback queue has not reached fence value {target} after 5 s (at {})",
-                self.rb_done_fence.GetCompletedValue()
-            );
-            super::real::stop_if_device_removed();
-        }
+        crate::xlog_warn!(
+            "sparse: the readback queue has not reached fence value {target} after 5 s (at {})",
+            self.rb_done_fence.GetCompletedValue()
+        );
+        super::real::stop_if_device_removed();
+        false
     }
 
     #[inline]
@@ -1473,8 +1492,12 @@ impl State {
                 }
                 s.signal_rb();
                 s.rb_last_fence = s.rb_done_value;
-                s.wait_for_rb(s.rb_done_value);
+                let done = s.wait_for_rb(s.rb_done_value);
                 s.reclaim_ring();
+                if !done {
+                    // the GPU copy has not run: nothing to copy back yet
+                    pending.clear();
+                }
             }
             for (dst, off, len, snap) in pending.iter() {
                 let (dst, off, len) = (*dst, *off, *len);
@@ -1852,9 +1875,45 @@ const MAX_RB_JOBS: usize = 16;
 const MIN_RB_JOB_BYTES: usize = 256 << 10;
 static FREE_RB_JOBS: Mutex<Vec<ReadbackJob>> = Mutex::new(Vec::new());
 
+/// A job whose readback was still queued on the GPU when `readback_now` gave up waiting: its
+/// buffer, allocator and list stay alive until `fence` reaches `value`. Dropped earlier, the copy
+/// still runs later and writes into freed memory (under RADV: a GPU page fault, CPG write).
+struct InFlightRbJob {
+    job: ReadbackJob,
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+// SAFETY: ID3D12Fence is a free-threaded COM object; `ReadbackJob` is `Send`.
+unsafe impl Send for InFlightRbJob {}
+
+static IN_FLIGHT_RB_JOBS: Mutex<Vec<InFlightRbJob>> = Mutex::new(Vec::new());
+
+/// Keep `job` until its GPU readback (`fence` >= `value`) is done.
+fn keep_in_flight_readback_job(job: ReadbackJob, fence: ID3D12Fence, value: u64) {
+    IN_FLIGHT_RB_JOBS.lock().unwrap().push(InFlightRbJob { job, fence, value });
+}
+
+/// Jobs kept by `keep_in_flight_readback_job` whose readback has finished go back to the pool.
+unsafe fn reclaim_in_flight_readback_jobs() {
+    let done: Vec<ReadbackJob> = {
+        let mut v = IN_FLIGHT_RB_JOBS.lock().unwrap();
+        if v.is_empty() {
+            return;
+        }
+        let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *v).into_iter().partition(|j| j.fence.GetCompletedValue() >= j.value);
+        *v = keep;
+        done.into_iter().map(|j| j.job).collect()
+    };
+    for job in done {
+        return_readback_job(job);
+    }
+}
+
 unsafe fn take_readback_job(dev: &ID3D12Device, need: usize) -> Option<ReadbackJob> {
     let dev_key = dev.as_raw() as usize;
     let want = need.max(MIN_RB_JOB_BYTES).min(READBACK_STAGING);
+    reclaim_in_flight_readback_jobs();
     {
         let mut free = FREE_RB_JOBS.lock().unwrap();
         if let Some(i) = free.iter().position(|j| j.dev_key == dev_key && j.cap >= want) {
@@ -2048,7 +2107,6 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     let mut idx = 0usize;
     let mut sub_off = 0usize;
     let mut pending: Vec<(usize, usize, usize)> = Vec::new();
-    let mut job_idle = true;
     let mut waited_title_queues = false;
     while idx < spans.len() {
         let mut used = 0usize;
@@ -2092,17 +2150,16 @@ pub unsafe fn readback_now(va: usize, len: usize) {
             (s.rb_done_fence.clone(), s.rb_done_value)
         };
         if wait_target.1 > 0 && wait_target.0.GetCompletedValue() < wait_target.1 {
-            let _ = wait_target.0.SetEventOnCompletion(wait_target.1, job.event);
-            windows::Win32::System::Threading::WaitForSingleObject(job.event, 5000);
-            if wait_target.0.GetCompletedValue() < wait_target.1 {
+            if !wait_fence_until(&wait_target.0, job.event, wait_target.1, std::time::Duration::from_secs(5)) {
                 crate::xlog_warn!(
                     "sparse: readback_now queue has not reached fence value {} after 5 s (at {})",
                     wait_target.1,
                     wait_target.0.GetCompletedValue()
                 );
                 super::real::stop_if_device_removed();
-                job_idle = false;
-                break;
+                // the copy is still queued: keep its buffer alive until it has run
+                keep_in_flight_readback_job(job, wait_target.0.clone(), wait_target.1);
+                return;
             }
         }
         // 3. Copy only still-committed non-hole 64-byte chunks that were NOT modified by the CPU
@@ -2115,9 +2172,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         }
         s.reclaim_ring();
     }
-    if job_idle {
-        return_readback_job(job);
-    }
+    return_readback_job(job);
 }
 
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
@@ -3863,6 +3918,77 @@ mod tests {
         early_add(&mut early, a, a + 4 * TILE);
         early_remove(&mut early, a + TILE, a + 2 * TILE);
         assert_eq!(early.into_iter().collect::<Vec<_>>(), vec![(a, a + TILE), (a + 2 * TILE, a + 4 * TILE)]);
+    }
+
+    /// A late completion from an earlier timed-out `SetEventOnCompletion` leaves the reusable
+    /// auto-reset event signalled (or fires it mid-wait). `wait_fence_until` must ignore both
+    /// and wait until the fence actually reaches `target`. (The test of #2821, for `main`.)
+    #[test]
+    fn wait_fence_until_ignores_stale_event_signal() {
+        use std::time::{Duration, Instant};
+        use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+        unsafe {
+            let Some(dev) = test_device() else { return };
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let event = CreateEventW(None, false, false, None).expect("event");
+            // a stale signal already set, then an earlier completion (2) firing mid-wait for 5
+            SetEvent(event).expect("stale SetEvent");
+            fence.SetEventOnCompletion(2, event).expect("stale completion arm");
+            let f2 = fence.clone();
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = f2.Signal(2);
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = f2.Signal(5);
+            });
+            let start = Instant::now();
+            let ok = wait_fence_until(&fence, event, 5, Duration::from_secs(2));
+            let elapsed = start.elapsed();
+            t.join().unwrap();
+            let _ = CloseHandle(event);
+            assert!(ok, "wait_fence_until timed out instead of observing Signal(5)");
+            assert!(fence.GetCompletedValue() >= 5, "returned early at {}", fence.GetCompletedValue());
+            assert!(elapsed >= Duration::from_millis(50), "returned too early ({elapsed:?}) on a stale event signal");
+        }
+    }
+
+    /// A `readback_now` job that timed out with its copy still queued must not be handed out
+    /// (or freed) before that copy has run, then goes back to the pool.
+    #[test]
+    fn a_timed_out_readback_job_is_kept_until_its_copy_ran() {
+        unsafe {
+            let Some(dev) = test_device() else { return };
+            let job = take_readback_job(&dev, 1).expect("readback job");
+            let buf = job.buf.as_raw() as usize;
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            keep_in_flight_readback_job(job, fence.clone(), 1);
+            let other = take_readback_job(&dev, 1).expect("another job");
+            assert_ne!(other.buf.as_raw() as usize, buf, "a job whose copy is queued was handed out again");
+            assert!(IN_FLIGHT_RB_JOBS.lock().unwrap().iter().any(|j| j.job.buf.as_raw() as usize == buf), "the queued job was dropped");
+            return_readback_job(other);
+            fence.Signal(1).expect("signal");
+            reclaim_in_flight_readback_jobs();
+            assert!(!IN_FLIGHT_RB_JOBS.lock().unwrap().iter().any(|j| j.job.buf.as_raw() as usize == buf), "the job stayed in flight after its copy");
+            assert!(FREE_RB_JOBS.lock().unwrap().iter().any(|j| j.buf.as_raw() as usize == buf), "the job did not go back to the pool");
+        }
+    }
+
+    /// A D3D12 device for the tests above (hardware, else WARP), or `None` after a skip notice.
+    unsafe fn test_device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_ok() {
+            return dev;
+        }
+        let warp = CreateDXGIFactory1::<IDXGIFactory4>().ok().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>().ok());
+        if let Some(warp) = warp {
+            if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_ok() {
+                return dev;
+            }
+        }
+        crate::gpu::recomp::runner::skip_test("no GPU");
+        None
     }
 
     /// Time for n 64 KiB pages committed one at a time and decommitted one at a time in
