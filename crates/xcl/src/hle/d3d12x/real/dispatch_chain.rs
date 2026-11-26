@@ -1117,9 +1117,10 @@ mod tests {
         let plan_a = Arc::new(super::DispatchChain { pieces: vec![shared.clone(), tail_a.clone()], dwords_per_group: 4 });
         let plan_b = Arc::new(super::DispatchChain { pieces: vec![shared.clone(), tail_b.clone()], dwords_per_group: 4 });
 
+        let whole = Arc::new(whole);
         unsafe {
             let mut raw_a: *mut c_void = std::ptr::null_mut();
-            let rs_a = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_a, 1, &whole, &[], plan_a.clone()).expect("build Program A");
+            let rs_a = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_a, 1, whole.clone(), &[], plan_a.clone()).expect("build Program A");
             cleanup.psos.push(ID3D12PipelineState::from_raw(raw_a));
             cleanup.blob_keys.push(super::super::compute_blob_key(&shared, rs_a, 0));
             cleanup.blob_keys.push(super::super::compute_blob_key(&tail_a, rs_a, 0));
@@ -1137,7 +1138,7 @@ mod tests {
 
             let plib_hits_before_b = super::PLIB_HITS.load(Ordering::Relaxed);
             let mut raw_b: *mut c_void = std::ptr::null_mut();
-            let rs_b = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_b, 2, &whole, &[], plan_b).expect("build Program B");
+            let rs_b = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_b, 2, whole.clone(), &[], plan_b).expect("build Program B");
             cleanup.psos.push(ID3D12PipelineState::from_raw(raw_b));
             cleanup.blob_keys.push(super::super::compute_blob_key(&tail_b, rs_b, 0));
             let b_calls = std::mem::take(&mut *SPY_CALLS.lock().unwrap());
@@ -1158,7 +1159,7 @@ mod tests {
             drop(pso_a);
             let plib_hits_before_a2 = super::PLIB_HITS.load(Ordering::Relaxed);
             let mut raw_a2: *mut c_void = std::ptr::null_mut();
-            let rs_a2 = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_a2, 3, &whole, &[], plan_a).expect("rebuild Program A");
+            let rs_a2 = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_a2, 3, whole.clone(), &[], plan_a).expect("rebuild Program A");
             cleanup.psos.push(ID3D12PipelineState::from_raw(raw_a2));
             let a2_calls = std::mem::take(&mut *SPY_CALLS.lock().unwrap());
             assert_eq!(rs_a2, rs_a);
@@ -1205,7 +1206,7 @@ mod tests {
                 builder,
                 tail: Vec::new(),
                 words: 4,
-                whole_code: vec![0; 16],
+                whole_code: Arc::new(vec![0; 16]),
                 whole: OnceLock::new(),
                 whole_started: AtomicBool::new(false),
                 retry_at: Mutex::new(None),
@@ -1249,7 +1250,7 @@ mod tests {
                 builder,
                 tail: Vec::new(),
                 words: 4,
-                whole_code: vec![0; 16],
+                whole_code: Arc::new(vec![0; 16]),
                 whole: OnceLock::new(),
                 whole_started: AtomicBool::new(false),
                 retry_at: Mutex::new(None),

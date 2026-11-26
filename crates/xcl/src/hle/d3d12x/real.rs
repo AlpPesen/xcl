@@ -6677,7 +6677,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     // Large translated graphics pipelines (>= huge_pso_bytes) defer off the title thread when
     // `dxc::defer()` is active, matching `translated_compute_pso_once` so cold >= 256 KiB graphics
     // PSOs never stall title threads even when `XCL_LAZY_PSO=0`.
-    let big = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) >= huge_pso_bytes();
+    let big = vs_dxil.len() + ps_dxil.as_ref().map_or(0, |v| v.len()) >= huge_pso_bytes();
     if big && crate::gpu::recomp::dxc::defer() {
         return None;
     }
@@ -6700,7 +6700,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     pc_topology_type(&mut copy);
     let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
     let debug_override = debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) || debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash);
-    let lib_key = (!debug_override).then(|| pso_lib::graphics_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers));
+    let lib_key = (!debug_override).then(|| pso_lib::graphics_key(&copy, &vs_dxil, ps_dxil.as_deref().map(Vec::as_slice), rect_gs.as_deref(), &samplers));
     if let Some(key) = lib_key.as_deref() {
         if pso_lib::try_load_graphics(this, key, &copy, riid, ppv) {
             let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
@@ -6776,7 +6776,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if let Some(key) = lib_key {
         let final_key = if rect_gs.is_some() && copy.GS.pShaderBytecode.is_null() {
-            pso_lib::graphics_key(&copy, &vs_dxil, ps_dxil.as_deref(), None, &samplers)
+            pso_lib::graphics_key(&copy, &vs_dxil, ps_dxil.as_deref().map(Vec::as_slice), None, &samplers)
         } else {
             key
         };
@@ -7895,7 +7895,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             return Some(E_INVALIDARG);
         }
     };
-    let big = tp.ms.len() + tp.cs.len() + ps.as_ref().map_or(0, Vec::len) >= huge_pso_bytes();
+    let big = tp.ms.len() + tp.cs.len() + ps.as_ref().map_or(0, |v| v.len()) >= huge_pso_bytes();
     if big && crate::gpu::recomp::dxc::defer() {
         return None;
     }

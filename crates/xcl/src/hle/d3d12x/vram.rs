@@ -3937,7 +3937,7 @@ mod tests {
             assert!(total >= 1 && (total as usize) * PAGE <= span);
 
             let (used, extra, follows) = pages
-                .bind_with_follow(&dev, &res, None, va, Some(total as u64 * PAGE as u64), total)
+                .bind_with_follow(&dev, &res, None, va, Some(total as u64 * PAGE as u64), total, &[])
                 .expect("GPU-owned bind must map every tile even when title VA is uncommitted");
             assert_eq!(used.len() + extra.len(), total as usize);
             assert!(follows.is_empty(), "GPU-owned target must not register FollowSkip entries");
