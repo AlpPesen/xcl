@@ -1835,7 +1835,7 @@ fn gpu_wave32_pixel_carry_preserves_adjacent_mask_at_triangle_edges() {
     ];
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let ps = super::PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 15)],
-        outputs: vec![el("SV_Target", 0, 64, 3, 0, 15)], input_ena: 0x300, attrs: None };
+        outputs: vec![el("SV_Target", 0, 64, 3, 0, 15)], input_ena: 0x300, attrs: None, early_depth: false };
     let t = translate(&code, &Options { wave64: false, mode: Mode::Pixel(ps), ..Default::default() }).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let ps = super::dxc::compile(&t.hlsl, "main", "ps_6_6", &[]).unwrap();
