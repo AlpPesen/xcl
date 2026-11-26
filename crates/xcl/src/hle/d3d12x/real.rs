@@ -2087,6 +2087,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         }
         super::depth_uav::forget(this as usize);
         super::format_alias::forget(this as usize);
+        super::cpu_writes::unregister_water_readback(this as usize);
         super::ambient::forget_resource(this as usize);
         forget_outside_resource(this as usize);
         let gone = UMA_BUFFERS.write().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
