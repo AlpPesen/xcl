@@ -51,13 +51,13 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             mode: Mode::Auto,
-            gain: 0.55,
+            gain: 0.22,
             power: 0.65,
-            least: 0.025,
+            least: 0.02,
             ao: 0.55,
-            reflect: 0.50,
+            reflect: 1.50,
             settle_ms: 250.0,
-            air: 1.5,
+            air: 0.0,
         }
     }
 }
@@ -240,8 +240,8 @@ static VIEW_SLOTS: RwLock<Option<ViewSlots>> = RwLock::new(None);
 static HAS_VIEW_SLOTS: AtomicBool = AtomicBool::new(false);
 
 fn is_ambient_uav_format(fmt: i32) -> bool {
-    // R16G16B16A16_FLOAT (10), R11G11B10_FLOAT (26), R32G32B32A32_FLOAT (2)
-    matches!(fmt, 10 | 26 | 2)
+    // R16G16B16A16_FLOAT (10), R11G11B10_FLOAT (26), R32G32B32A32_FLOAT (2), R32_UINT (42, R9G9B9E5 packed)
+    matches!(fmt, 10 | 26 | 2 | 42)
 }
 
 fn is_depth_srv_format(fmt: i32) -> bool {
@@ -356,7 +356,19 @@ fn is_sky_dome_target(rd: &D3D12_RESOURCE_DESC) -> bool {
 
 /// Match a screen-space resolve/reflection output UAV against dispatch grid dimensions, returning
 /// a lower-is-better score when compatible (`None` if incompatible).
-/// Uses the UAV view's concrete `view_fmt` so typeless resources (`R16G16B16A16_TYPELESS`) match.
+/// `TemporalResolve` writes diffuse screen-probe light as packed `R9G9B9E5` in `R32_UINT` (`fmt 42`);
+/// restricting `TemporalResolve` to `R32_UINT` avoids accidentally overwriting a `R11G11B10_FLOAT`
+/// (`fmt 26`) HDR scene color buffer bound in the same descriptor heap.
+fn score_dispatch_target_for_role(role: PassRole, rd: &D3D12_RESOURCE_DESC, view_fmt: i32, groups: [u32; 3]) -> Option<u64> {
+    if role == PassRole::TemporalResolve && view_fmt != 42 {
+        return None;
+    }
+    if role == PassRole::ReflectionHistory && view_fmt == 42 {
+        return None;
+    }
+    score_dispatch_target(rd, view_fmt, groups)
+}
+
 fn score_dispatch_target(rd: &D3D12_RESOURCE_DESC, view_fmt: i32, groups: [u32; 3]) -> Option<u64> {
     if rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
         || rd.DepthOrArraySize != 1
@@ -475,6 +487,7 @@ struct AmbientDevice {
     reduce_pso: ID3D12PipelineState,
     fill_pso: ID3D12PipelineState,
     fill_write_pso: ID3D12PipelineState,
+    fill_r9_pso: ID3D12PipelineState,
     reflect_pso: ID3D12PipelineState,
     air_pso: ID3D12PipelineState,
     sky_copy: ID3D12Resource,
@@ -641,6 +654,88 @@ void main(uint3 tid : SV_DispatchThreadID) {
 }
 "#;
 
+/// Screen-space diffuse probe radiance floor + 8-tap IGN-rotated horizon crease AO for
+/// `CS_ScreenProbes_TemporalResolve` targets stored as `R9G9B9E5_SHAREDEXP` packed in `R32_UINT`.
+const AMBIENT_FILL_R9G9B9E5_HLSL: &str = r#"
+Texture2D<float> depth_tex : register(t0);
+RWTexture2D<uint> out_uav : register(u0);
+RWStructuredBuffer<float4> sky_level : register(u1);
+cbuffer C : register(b0) {
+    uint width;
+    uint height;
+    uint depth_w;
+    uint depth_h;
+    uint has_depth;
+    float ao_strength;
+    uint sky_ready;
+    float fallback_level;
+};
+float3 unpack_r9g9b9e5(uint v) {
+    float scale = exp2(float(v >> 27) - 24.0);
+    return float3(float(v & 511u), float((v >> 9) & 511u), float((v >> 18) & 511u)) * scale;
+}
+uint pack_r9g9b9e5(float3 c) {
+    c = clamp(c, 0.0, 65408.0);
+    float top = max(c.r, max(c.g, c.b));
+    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
+    float inv_s = exp2(float(24 - e));
+    uint3 m = min(uint3(floor(c * inv_s + 0.5)), uint3(511u, 511u, 511u));
+    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
+float horizon_crease_ao(uint2 tid, int2 dc, int2 maxc) {
+    float d0 = depth_tex.Load(int3(dc, 0));
+    if (!isfinite(d0) || d0 <= 1e-5 || d0 >= 0.99999) {
+        return 1.0;
+    }
+    float ign = frac(52.9829189 * frac(dot(float2(tid), float2(0.06711056, 0.00583715))));
+    float base_ang = ign * 6.2831853;
+    float max_rad = clamp(float(depth_w) * 0.012, 4.0, 16.0);
+    float inv_d0 = 1.0 / max(d0, 1e-5);
+    float occ = 0.0;
+    [unroll]
+    for (uint i = 0; i < 4; ++i) {
+        float ang = base_ang + float(i) * 0.78539816;
+        float t = frac(ign * 0.61803399 + (float(i) + 0.5) * 0.25);
+        float rad = clamp(max_rad * sqrt(t), 1.5, 16.0);
+        int2 ofs = int2(int(round(cos(ang) * rad)), int(round(sin(ang) * rad)));
+        float dp = depth_tex.Load(int3(clamp(dc + ofs, int2(0, 0), maxc), 0));
+        float dn = depth_tex.Load(int3(clamp(dc - ofs, int2(0, 0), maxc), 0));
+        float rp = (dp - d0) * inv_d0;
+        float rn = (dn - d0) * inv_d0;
+        float wp = (isfinite(dp) && dp > 1e-6 && dp < 0.99999) ? (1.0 - smoothstep(0.15, 0.45, abs(rp))) : 0.0;
+        float wn = (isfinite(dn) && dn > 1e-6 && dn < 0.99999) ? (1.0 - smoothstep(0.15, 0.45, abs(rn))) : 0.0;
+        float conc = max(0.0, rp * wp + rn * wn);
+        occ += saturate((conc - 0.003) * 4.5);
+    }
+    return saturate(1.0 - ao_strength * saturate(occ * 0.25));
+}
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= width || tid.y >= height) return;
+    float3 raw_amb = (sky_ready != 0) ? sky_level[0].rgb : float3(fallback_level, fallback_level, fallback_level);
+    float3 amb = clamp(raw_amb, 0.0, 0.65);
+    float ao = 1.0;
+    if (has_depth != 0 && depth_w > 0 && depth_h > 0) {
+        int2 dc = int2(
+            int(min((tid.x * depth_w) / max(width, 1u), depth_w - 1)),
+            int(min((tid.y * depth_h) / max(height, 1u), depth_h - 1))
+        );
+        int2 maxc = int2(int(depth_w) - 1, int(depth_h) - 1);
+        ao = horizon_crease_ao(tid.xy, dc, maxc);
+    }
+    float3 amb_ao = amb * ao;
+    float3 existing = unpack_r9g9b9e5(out_uav[tid.xy]);
+    if (!all(isfinite(existing))) existing = float3(0.0, 0.0, 0.0);
+    float amb_lum = max(dot(amb, float3(0.2126, 0.7152, 0.0722)), 0.02);
+    float cap_lum = 6.0 * amb_lum;
+    float cur_lum = dot(existing, float3(0.2126, 0.7152, 0.0722));
+    if (cur_lum > cap_lum) {
+        existing *= (cap_lum / max(cur_lum, 1e-6));
+    }
+    out_uav[tid.xy] = pack_r9g9b9e5(max(existing, amb_ao));
+}
+"#;
+
 /// Write-only fallback for `TemporalResolve` when typed UAV load is unsupported on `out_uav`.
 const AMBIENT_FILL_WRITE_HLSL: &str = r#"
 Texture2D<float> depth_tex : register(t0);
@@ -764,6 +859,7 @@ unsafe fn build_device(dev: &ID3D12Device) -> Option<AmbientDevice> {
     let reduce_bc = compile_cs_sm5(SKY_REDUCE_HLSL)?;
     let fill_bc = compile_cs_sm5(AMBIENT_FILL_HLSL)?;
     let fill_write_bc = compile_cs_sm5(AMBIENT_FILL_WRITE_HLSL)?;
+    let fill_r9_bc = compile_cs_sm5(AMBIENT_FILL_R9G9B9E5_HLSL)?;
     let reflect_bc = compile_cs_sm5(REFLECT_CLAMP_HLSL)?;
     let air_bc = compile_cs_sm5(AIR_CAP_HLSL)?;
 
@@ -856,6 +952,7 @@ unsafe fn build_device(dev: &ID3D12Device) -> Option<AmbientDevice> {
     let reduce_pso = make_cs(&reduce_bc)?;
     let fill_pso = make_cs(&fill_bc)?;
     let fill_write_pso = make_cs(&fill_write_bc)?;
+    let fill_r9_pso = make_cs(&fill_r9_bc)?;
     let reflect_pso = make_cs(&reflect_bc)?;
     let air_pso = make_cs(&air_bc)?;
 
@@ -927,6 +1024,7 @@ unsafe fn build_device(dev: &ID3D12Device) -> Option<AmbientDevice> {
         reduce_pso,
         fill_pso,
         fill_write_pso,
+        fill_r9_pso,
         reflect_pso,
         air_pso,
         sky_copy,
@@ -1154,6 +1252,7 @@ unsafe fn scan_cbv_indices(va: usize, max_bytes: usize, push_idx: &mut impl FnMu
 /// (`view_heap_base`), and root/table CBVs to locate its output float UAV (2D screen-space or
 /// 3D froxel volume when `want_3d` is true) and optional depth SRV for crease AO.
 unsafe fn find_dispatch_views(
+    role: PassRole,
     layout: &Layout,
     args: &[u8],
     groups: [u32; 3],
@@ -1259,7 +1358,7 @@ unsafe fn find_dispatch_views(
             let scored = if want_3d {
                 score_volume_target(&rd, ve.fmt, groups).map(|s| (s, rd.DepthOrArraySize as u32))
             } else {
-                score_dispatch_target(&rd, ve.fmt, groups).map(|s| (s, 1u32))
+                score_dispatch_target_for_role(role, &rd, ve.fmt, groups).map(|s| (s, 1u32))
             };
             if let Some((score, depth)) = scored {
                 if uav_hit.is_none_or(|(best, _, _, _, _, _)| score < best) {
@@ -1352,7 +1451,7 @@ pub(super) unsafe fn after_compute_dispatch(
     }
 
     let want_3d = role == PassRole::InscatteringVolume;
-    let (uav_opt, depth_opt, n_tables, n_indices, n_cbvs) = find_dispatch_views(layout, args, groups, view_heap_base, want_3d);
+    let (uav_opt, depth_opt, n_tables, n_indices, n_cbvs) = find_dispatch_views(role, layout, args, groups, view_heap_base, want_3d);
     let Some((uav_res, uav_fmt, w, h, d)) = uav_opt else {
         static MISS: AtomicU64 = AtomicU64::new(0);
         if MISS.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1431,7 +1530,13 @@ pub(super) unsafe fn after_compute_dispatch(
 
     let (pso, consts, disp) = match role {
         PassRole::TemporalResolve => (
-            if can_typed_load { ad.fill_pso.as_raw() } else { ad.fill_write_pso.as_raw() },
+            if uav_fmt == 42 {
+                ad.fill_r9_pso.as_raw()
+            } else if can_typed_load {
+                ad.fill_pso.as_raw()
+            } else {
+                ad.fill_write_pso.as_raw()
+            },
             [w, h, depth_w, depth_h, has_depth, cfg.ao.to_bits(), sky_ready as u32, cfg.least.to_bits()],
             (w.div_ceil(8), h.div_ceil(8), 1),
         ),
@@ -1543,8 +1648,33 @@ mod tests {
         assert!(compile_cs_sm5(SKY_REDUCE_HLSL).is_some(), "SKY_REDUCE_HLSL failed D3DCompile");
         assert!(compile_cs_sm5(AMBIENT_FILL_HLSL).is_some(), "AMBIENT_FILL_HLSL failed D3DCompile");
         assert!(compile_cs_sm5(AMBIENT_FILL_WRITE_HLSL).is_some(), "AMBIENT_FILL_WRITE_HLSL failed D3DCompile");
+        assert!(compile_cs_sm5(AMBIENT_FILL_R9G9B9E5_HLSL).is_some(), "AMBIENT_FILL_R9G9B9E5_HLSL failed D3DCompile");
         assert!(compile_cs_sm5(REFLECT_CLAMP_HLSL).is_some(), "REFLECT_CLAMP_HLSL failed D3DCompile");
         assert!(compile_cs_sm5(AIR_CAP_HLSL).is_some(), "AIR_CAP_HLSL failed D3DCompile");
+    }
+
+    #[test]
+    fn temporal_resolve_targets_r32_uint_and_never_hdr_scene_color() {
+        let hdr_scene = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 2560,
+            Height: 1440,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R11G11B10_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let r9_probe = D3D12_RESOURCE_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ..hdr_scene
+        };
+        assert!(score_dispatch_target_for_role(PassRole::TemporalResolve, &hdr_scene, DXGI_FORMAT_R11G11B10_FLOAT.0, [320, 360, 1]).is_none());
+        assert!(score_dispatch_target_for_role(PassRole::TemporalResolve, &hdr_scene, DXGI_FORMAT_R16G16B16A16_FLOAT.0, [320, 360, 1]).is_none());
+        assert!(score_dispatch_target_for_role(PassRole::TemporalResolve, &r9_probe, DXGI_FORMAT_R32_UINT.0, [320, 360, 1]).is_some());
+        assert!(score_dispatch_target_for_role(PassRole::ReflectionHistory, &r9_probe, DXGI_FORMAT_R32_UINT.0, [320, 360, 1]).is_none());
+        assert!(score_dispatch_target_for_role(PassRole::ReflectionHistory, &hdr_scene, DXGI_FORMAT_R11G11B10_FLOAT.0, [320, 360, 1]).is_some());
     }
 
     #[test]
@@ -1557,7 +1687,7 @@ mod tests {
 
         let def = Config::default();
         assert!((def.settle_ms - 250.0).abs() < 1e-6);
-        assert!((def.air - 1.5).abs() < 1e-6);
+        assert!((def.air - 0.0).abs() < 1e-6);
 
         // First capture or settle_ms == 0 snaps immediately; subsequent samples follow 1 - exp(-dt/tau).
         assert_eq!(settle_alpha(0.016, 250.0, true), 1.0);

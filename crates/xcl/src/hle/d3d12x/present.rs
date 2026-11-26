@@ -1276,15 +1276,36 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
 }
 
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
-/// n > 1: every n-th; a title loading at a few frames a second shows few)
+/// n > 1: every n-th; a title loading at a few frames a second shows few).
+/// `XCL_FRAME_DUMP_FROM=k`: suppress dumps before frame `k`; when set alongside `XCL_FRAME_DUMP=1`,
+/// dumps every frame from `k` onward so world frames can be inspected without dumping loading screens.
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
 fn frame_dump_due() -> bool {
+    static FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let from = *FROM.get_or_init(|| std::env::var("XCL_FRAME_DUMP_FROM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let every = *EVERY.get_or_init(|| match std::env::var("XCL_FRAME_DUMP") {
-        Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
+        Ok(v) => {
+            let n = v.trim().parse::<u64>().ok();
+            if from > 0 && n == Some(1) {
+                1
+            } else {
+                n.filter(|&n| n > 1).unwrap_or(120)
+            }
+        }
         Err(_) => 0,
     });
-    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+    if every == 0 {
+        return false;
+    }
+    let cur = PRESENTS.load(Ordering::Relaxed);
+    if cur < from {
+        return false;
+    }
+    if every == 1 {
+        return true;
+    }
+    cur % every == 20.min(every - 1)
 }
 
 /// Frames shown so far.
