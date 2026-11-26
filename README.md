@@ -244,6 +244,7 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   the shader cache, at most `XCL_GFX_RECORDS_MB`, default 64) and built before the title starts
   on the next launch, with their driver blobs kept, so the title makes them from those in
   milliseconds. `XCL_PREPARE_GRAPHICS=0` leaves that pass out. Later launches reuse matching cache entries.
+  If a preparation worker fails, XCL retries its batch once after the other workers finish.
   Closing the window cancels the launch. A compiler or driver failure stops it and reports
   the cause. Null-renderer runs skip shader preparation. With presentation disabled, the gate runs without a window.
 - **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved

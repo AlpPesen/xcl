@@ -1939,6 +1939,12 @@ fn worker_command(me: &Path) -> std::process::Command {
 /// own part) the count of `records` in all on the screen while they run: whether preparation was
 /// cancelled (they are ended then), how many failed, and the summary line each wrote last
 /// (`graphics_summary`).
+///
+/// A worker that fails has its part done again once the others are through, and counts as failed
+/// only when that fails too. A driver gives only so many processes a device at once (an AMD one:
+/// nine; the tenth `D3D12CreateDevice` and every one after it returns 0x887A0005), so with ten
+/// workers beside the title's own device two ended at once, every start, and the title built
+/// their fifth of the pipelines itself while it loaded its world.
 fn in_workers(workers: usize, records: usize, progress: &LaunchPreparation, mut command: impl FnMut(usize) -> std::process::Command) -> (bool, usize, Vec<String>) {
     use std::io::BufRead;
     // the workers' pass has its own count on the screen: the records they have passed
@@ -1948,14 +1954,21 @@ fn in_workers(workers: usize, records: usize, progress: &LaunchPreparation, mut 
     progress.workers.store(workers, Ordering::Relaxed);
     let counts: Vec<AtomicUsize> = (0..workers).map(|_| AtomicUsize::new(0)).collect();
     let summaries: Vec<Mutex<String>> = (0..workers).map(|_| Mutex::new(String::new())).collect();
+    let mut parts: Vec<usize> = (0..workers).collect();
+    let (mut cancelled, mut failed) = (false, Vec::new());
+    for again in [false, true] {
+    failed.clear();
     let mut children = Vec::new();
-    for i in 0..workers {
+    for &i in &parts {
         match command(i).spawn() {
             Ok(child) => children.push((i, child)),
-            Err(e) => crate::xlog_warn!("Shader preparation: worker {i} did not start: {e}"),
+            Err(e) => {
+                failed.push(i);
+                crate::xlog_warn!("Shader preparation: worker {i} did not start: {e}");
+            }
         }
     }
-    let cancelled = std::thread::scope(|s| {
+    cancelled = std::thread::scope(|s| {
         for (i, child) in children.iter_mut() {
             let Some(err) = child.stderr.take() else { continue };
             let (count, summary) = (&counts[*i], &summaries[*i]);
@@ -1984,18 +1997,50 @@ fn in_workers(workers: usize, records: usize, progress: &LaunchPreparation, mut 
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     });
-    let mut failed = 0;
+    let note = if again || cancelled { "" } else { " – its part is done again after the others" };
     for (i, child) in children.iter_mut() {
         match child.wait() {
             Ok(st) if st.success() => {}
-            Ok(st) => { failed += 1; crate::xlog_warn!("Shader preparation: worker {i} ended with {st}"); }
-            Err(e) => { failed += 1; crate::xlog_warn!("Shader preparation: worker {i}: {e}"); }
+            Ok(st) => { failed.push(*i); crate::xlog_warn!("Shader preparation: worker {i} ended with {st}{note}"); }
+            Err(e) => { failed.push(*i); crate::xlog_warn!("Shader preparation: worker {i}: {e}{note}"); }
         }
+    }
+    if cancelled || failed.is_empty() {
+        break;
+    }
+    parts = failed.clone();
     }
     progress.workers.store(0, Ordering::Relaxed);
     progress.total.store(total_before, Ordering::Relaxed);
     progress.done.store(done_before, Ordering::Relaxed);
-    (cancelled, failed, summaries.into_iter().map(|s| s.into_inner().unwrap()).collect())
+    (cancelled, failed.len(), summaries.into_iter().map(|s| s.into_inner().unwrap()).collect())
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    /// A worker that fails has its part done again once the others are through, and only a part
+    /// that fails twice counts as failed.
+    #[test]
+    fn a_failed_workers_part_is_done_again() {
+        let exits = |code: i32| {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/c", "exit", &code.to_string()]).stderr(std::process::Stdio::piped());
+            c
+        };
+        let progress = LaunchPreparation::default();
+        // worker 1 fails the first time (as one a driver gave no device), worker 2 both times
+        let mut started = [0usize; 3];
+        let (cancelled, failed, summaries) = in_workers(3, 30, &progress, |i| {
+            started[i] += 1;
+            exits(if i == 2 || (i == 1 && started[1] == 1) { 3 } else { 0 })
+        });
+        assert!(!cancelled);
+        assert_eq!(started, [1, 2, 2], "the parts of the workers that failed are started again, the other is not");
+        assert_eq!(failed, 1, "only the part that failed twice");
+        assert_eq!(summaries.len(), 3);
+    }
 }
 
 /// The graphics pipelines earlier runs used (`gfx_records`), built before the title starts by
