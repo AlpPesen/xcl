@@ -1219,6 +1219,8 @@ struct Pipelines {
     reused: AtomicUsize,
     lib_reused: AtomicUsize,
     lib_stored: AtomicUsize,
+    /// pipelines another process of the same preparation was building (`Claim`): left to it
+    elsewhere: AtomicUsize,
     split_programs: AtomicUsize,
     split_pieces: AtomicUsize,
     /// programs over `max_dxil` with no blob yet, and their DXIL bytes
@@ -1460,27 +1462,22 @@ impl Pipelines {
         use windows::Win32::Graphics::Dxgi::*;
         unsafe {
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
-<<<<<<< HEAD
-            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
-            let (adapter, desc) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
-            crate::hle::d3d12x::real::driver_cache::note_vendor(desc.VendorId);
-            let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
-            // Match `real::init`'s adapter string verbatim so offline `--precompile --pipelines`
-            // opens and populates the exact same `pso-library/<hash>/gen-*.plib` directory.
-            let adapter_name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
-            let library = (!cfg!(test))
-                .then(|| crate::hle::d3d12x::pso_library::MmapPipelineLibrary::open_or_create(&dev, &adapter_name))
-                .flatten();
-=======
             let sel = crate::gpu::adapter::Selector::from_env_or(adapter);
-            let dev = if sel == crate::gpu::adapter::Selector::Warp {
+            let (dev, library) = if sel == crate::gpu::adapter::Selector::Warp {
                 let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| e.to_string())?;
-                crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?
+                (crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?, None)
             } else {
-                let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
-                crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?
+                let (adapter, desc) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+                crate::hle::d3d12x::real::driver_cache::note_vendor(desc.VendorId);
+                let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
+                // Match `real::init`'s adapter string verbatim so offline `--precompile --pipelines`
+                // opens and populates the exact same `pso-library/<hash>/gen-*.plib` directory.
+                let adapter_name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+                let library = (!cfg!(test))
+                    .then(|| crate::hle::d3d12x::pso_library::MmapPipelineLibrary::open_or_create(&dev, &adapter_name))
+                    .flatten();
+                (dev, library)
             };
->>>>>>> 7d9e8111 (xcl run: prepare supported shader records before starting the title)
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
             let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
             Ok(Pipelines {
@@ -1492,6 +1489,7 @@ impl Pipelines {
                 reused: AtomicUsize::new(0),
                 lib_reused: AtomicUsize::new(0),
                 lib_stored: AtomicUsize::new(0),
+                elsewhere: AtomicUsize::new(0),
                 split_programs: AtomicUsize::new(0),
                 split_pieces: AtomicUsize::new(0),
                 capped: AtomicUsize::new(0),
@@ -1607,7 +1605,7 @@ impl Pipelines {
             }
             driver_cache::path_for(dxil, desc.Flags.0, chained)
         });
-        let cached = path.as_deref().and_then(driver_cache::load);
+        let mut cached = path.as_deref().and_then(driver_cache::load);
         let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
         // tens of minutes and gigabytes; the pass finishes without it, and the runtime builds it
@@ -1625,6 +1623,26 @@ impl Pipelines {
             }
             *n += 1;
         }
+        // (another process may have written the blob while this one waited for its turn)
+        if cached.is_none() {
+            cached = path.as_deref().and_then(driver_cache::load);
+        }
+        // not in the cache: the one process that claims the pipeline builds it. Records with the
+        // same program are in several workers' slices, and the driver's compile of one took
+        // twice as long in each of four workers that built it at once.
+        let claim = match (&cached, path.as_deref()) {
+            (None, Some(path)) => match Claim::take(path) {
+                Some(c) => Some(c),
+                None => {
+                    *self.running.0.lock().unwrap() -= 1;
+                    self.running.1.notify_one();
+                    self.elsewhere.fetch_add(1, Ordering::Relaxed);
+                    drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                    return;
+                }
+            },
+            _ => None,
+        };
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
             // a driver that cannot use the blob may compile from the DXIL itself and still
@@ -1682,6 +1700,7 @@ impl Pipelines {
             }
             pso
         };
+        drop(claim);
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
@@ -1807,6 +1826,62 @@ fn progress_count(line: &str) -> Option<usize> {
     n.parse::<usize>().ok()?;
     if !rest.starts_with('(') { return None; }
     d.parse().ok()
+}
+
+/// A pipeline one process builds: a file beside the driver blob it will write (`<blob>.claim`),
+/// made when the build starts and gone when it ends. A second process that finds it leaves the
+/// pipeline to the first. One left behind by a process that died is taken over after `STALE`.
+struct Claim(PathBuf);
+
+impl Claim {
+    const STALE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+    /// None: another process has it.
+    fn take(blob: &std::path::Path) -> Option<Claim> {
+        let mut name = blob.as_os_str().to_owned();
+        name.push(".claim");
+        let path = PathBuf::from(name);
+        let make = || std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
+        match make() {
+            Ok(_) => Some(Claim(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let old = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Self::STALE);
+                (old && std::fs::remove_file(&path).is_ok() && make().is_ok()).then(|| Claim(path))
+            }
+            // (the folder cannot be written: nothing is shared through it either)
+            Err(_) => Some(Claim(PathBuf::new())),
+        }
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::Claim;
+
+    /// The first process to ask builds a pipeline, a second one leaves it, and it is free again
+    /// when the first is done.
+    #[test]
+    fn a_pipeline_is_claimed_by_one_builder_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("xcl-claim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blob = dir.join("0123.pso");
+        let first = Claim::take(&blob).expect("free");
+        assert!(dir.join("0123.pso.claim").exists());
+        assert!(Claim::take(&blob).is_none(), "claimed");
+        assert!(Claim::take(&dir.join("4567.pso")).is_some(), "another pipeline is free");
+        drop(first);
+        assert!(!dir.join("0123.pso.claim").exists());
+        assert!(Claim::take(&blob).is_some(), "free again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// The compute pipelines of `pack` built by `workers` processes of this program, each on its own
@@ -2113,6 +2188,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 saved_plib.as_ref().map_or_else(String::new, |path| format!(" -> {}", path.display()))
             );
         }
+        println!("pipelines left to another process that was building them {}", p.elsewhere.load(Ordering::Relaxed));
         let split_programs = p.split_programs.load(Ordering::Relaxed);
         if split_programs != 0 {
             println!("split compute programs: {} ({} pieces)", split_programs, p.split_pieces.load(Ordering::Relaxed));
