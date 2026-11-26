@@ -8838,26 +8838,53 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
 }
 
 unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
-    release_taking_first(
-        this,
-        || {
-            let a = this as usize;
-            let deferred = super::alloc_pool::release_when_done(
-                a,
-                Box::new(move || {
-                    dispatch_chain::allocator_reset(a);
-                    super::console_list::allocator_reset(a as *mut c_void);
-                    super::list_x::on_allocator_release(a);
-                }),
-            );
-            if !deferred {
+    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+    let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    if add_ref(this) == 2 {
+        let a = this as usize;
+        let deferred = super::alloc_pool::release_when_done(
+            a,
+            Box::new(move || {
                 dispatch_chain::allocator_reset(a);
-                super::console_list::allocator_reset(this);
+                super::console_list::allocator_reset(a as *mut c_void);
                 super::list_x::on_allocator_release(a);
-            }
-        },
-        drop,
-    )
+                // Drop the final PC ID3D12CommandAllocator reference only after all GPU
+                // fences on its backing complete so the D3D12 command pool is never freed
+                // while still in flight on the GPU.
+                rel(a as *mut c_void);
+            }),
+        );
+        if deferred {
+            // Drop our temporary probe ref, keeping 1 ref alive for the deferred cleanup above,
+            // and report 0 to the title since its ownership of the allocator has ended.
+            rel(this);
+            return 0;
+        }
+        dispatch_chain::allocator_reset(a);
+        super::console_list::allocator_reset(this);
+        super::list_x::on_allocator_release(a);
+        rel(this);
+        return rel(this);
+    }
+    rel(this);
+    let n = rel(this);
+    if n == 0 {
+        let a = this as usize;
+        // Rare race: two threads reached final release concurrently; object is already freed.
+        if !super::alloc_pool::release_when_done(
+            a,
+            Box::new(move || {
+                dispatch_chain::allocator_reset(a);
+                super::console_list::allocator_reset(a as *mut c_void);
+                super::list_x::on_allocator_release(a);
+            }),
+        ) {
+            dispatch_chain::allocator_reset(a);
+            super::console_list::allocator_reset(this);
+            super::list_x::on_allocator_release(a);
+        }
+    }
+    n
 }
 
 /// Reset the (adopted) PC allocator `raw` itself.
