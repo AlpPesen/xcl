@@ -741,7 +741,26 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(
     if slicer_pso != 0 && SLICER_LABELED.swap(slicer_pso, Ordering::Relaxed) != slicer_pso {
         super::super::dred::label_text(slicer_pso, || "xcl dispatch_chain_slicer".into());
     }
-    bind()?;
+    if let Err(e) = bind() {
+        // `record_slicer` already recorded a dispatch writing into `buffer` and `scratch`:
+        // keep both alive until `allocator` resets so the GPU never page-faults on a freed buffer.
+        if let Some(first) = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)) {
+            let indirect = Indirect {
+                commands: buffer,
+                at: pso::chain_predicate_offset(rounds, pieces),
+                rounds,
+                whole: false,
+                checked: false,
+            };
+            RECORDINGS
+                .lock()
+                .unwrap()
+                .entry(allocator)
+                .or_default()
+                .push(Arc::new(Recording { scratch, first: first.clone(), chain, indirect: Some(indirect) }));
+        }
+        return Err(e);
+    }
     // under the title's own predication XCL's cannot be set: the slabs past the rounds are lost
     let full = if predicated { None } else { chain.whole.get().and_then(|o| o.clone()) };
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();

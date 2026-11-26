@@ -593,7 +593,7 @@ unsafe extern "system" fn cl_allocate_upload_memory(this: *mut c_void, size: usi
     let Some(u) = crate::gpu::uma::get() else { return std::ptr::null_mut() };
     let size = size.max(16);
     let align = align.max(16);
-    if size <= crate::gpu::uma::ARENA_BLOCK / 2 {
+    if size <= crate::gpu::uma::UPLOAD_IN_ARENA_MOST {
         if let Some(p) = with_list(this as usize, |st| st.arena.take(u, size, align, &mut st.uma)).flatten() {
             return p;
         }

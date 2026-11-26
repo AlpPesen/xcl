@@ -8841,10 +8841,20 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     release_taking_first(
         this,
         || {
-            dispatch_chain::allocator_reset(this as usize);
-            super::console_list::allocator_reset(this);
-            super::alloc_pool::forget(this as usize);
-            super::list_x::on_allocator_release(this as usize);
+            let a = this as usize;
+            let deferred = super::alloc_pool::release_when_done(
+                a,
+                Box::new(move || {
+                    dispatch_chain::allocator_reset(a);
+                    super::console_list::allocator_reset(a as *mut c_void);
+                    super::list_x::on_allocator_release(a);
+                }),
+            );
+            if !deferred {
+                dispatch_chain::allocator_reset(a);
+                super::console_list::allocator_reset(this);
+                super::list_x::on_allocator_release(a);
+            }
         },
         drop,
     )

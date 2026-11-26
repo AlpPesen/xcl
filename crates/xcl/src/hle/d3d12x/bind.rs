@@ -212,6 +212,8 @@ struct State {
     prelude_draws: Vec<PreludeDrawJob>,
     prelude_owned: Option<PreludeEntry>,
     prelude_built: Option<ID3D12GraphicsCommandList>,
+    /// Dedicated non-pooled CUSTOM write-back L0 buffers backing prelude job tables when UMA is full
+    prelude_job_bufs: Vec<ID3D12Resource>,
     /// true after an `INDIRECT_ARGUMENT` transition has ordered prior writes on this list and
     /// no compute/mesh dispatch has run since (skips redundant `fresh_indirect_arguments` barriers
     /// across runs of consecutive indirect graphics draws).
@@ -315,6 +317,7 @@ static ALLOC_IO: Mutex<Option<HashMap<usize, Vec<IoBlock>>>> = Mutex::new(None);
 static FREE_IO: Mutex<Vec<IoBlock>> = Mutex::new(Vec::new());
 static ALLOC_PRELUDE: Mutex<Option<HashMap<usize, Vec<PreludeEntry>>>> = Mutex::new(None);
 static FREE_PRELUDE: Mutex<Vec<PreludeEntry>> = Mutex::new(Vec::new());
+static ALLOC_PRELUDE_JOBS: Mutex<Option<HashMap<usize, Vec<ID3D12Resource>>>> = Mutex::new(None);
 
 fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, usize)>) {
     if bufs.is_empty() || allocator == 0 {
@@ -336,6 +339,13 @@ fn hold_prelude_until_reset(allocator: usize, entry: Option<PreludeEntry>) {
         return;
     }
     ALLOC_PRELUDE.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().push(entry);
+}
+
+fn hold_prelude_jobs_until_reset(allocator: usize, mut bufs: Vec<ID3D12Resource>) {
+    if bufs.is_empty() || allocator == 0 {
+        return;
+    }
+    ALLOC_PRELUDE_JOBS.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().append(&mut bufs);
 }
 
 /// Return `items` into `free` whenever `keep(&pool, &item)` holds, dropping overflow items
@@ -382,6 +392,9 @@ pub(super) fn release_allocator_res(allocator: usize) {
     if let Some(entries) = entries {
         recycle_into_pool(&FREE_PRELUDE, entries, |pool, _| pool.len() < FREE_PRELUDE_CAP);
     }
+    // Never pooled: drop outside lock so COM Release hooks cannot re-enter `ALLOC_PRELUDE_JOBS`.
+    let job_bufs = ALLOC_PRELUDE_JOBS.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
+    drop(job_bufs);
 }
 
 /// Whether `FREE_RES`, holding `count` buffers of `held` bytes, keeps one of `bytes` more.
@@ -590,7 +603,7 @@ fn backing_allocator(list: *mut c_void, allocator: usize) -> usize {
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     let backing = backing_allocator(list, allocator);
-    let (old, blocks, res_bufs, io_blocks, prelude) = with(list, |s| {
+    let (old, blocks, res_bufs, io_blocks, prelude, job_bufs) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
         s.pso = initial_pso;
@@ -613,6 +626,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.prelude_draws.clear();
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
+        let job_bufs = std::mem::take(&mut s.prelude_job_bufs);
         s.inline_guard = None;
         s.root_va_cache = [(0, 0); 16];
         s.root_va_next = 0;
@@ -637,12 +651,13 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         }
         let io_blocks = std::mem::take(&mut s.io_blocks);
         s.rs_cs = 0;
-        (old, std::mem::take(&mut s.uma), res_bufs, io_blocks, prelude)
+        (old, std::mem::take(&mut s.uma), res_bufs, io_blocks, prelude, job_bufs)
     });
     console_list::hold_until_reset(old, blocks);
     hold_res_until_reset(old, res_bufs);
     hold_io_until_reset(old, io_blocks);
     hold_prelude_until_reset(old, prelude);
+    hold_prelude_jobs_until_reset(old, job_bufs);
 }
 
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
@@ -675,7 +690,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// recording buffers on the old allocator first.
 pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
     let backing = backing_allocator(list, allocator);
-    let (old, blocks, res_bufs, io_blocks, prelude) = with(list, |s| {
+    let (old, blocks, res_bufs, io_blocks, prelude, job_bufs) = with(list, |s| {
         s.heaps_ensured = false;
         s.pc_abi_gfx = AbiBound::default();
         s.pc_abi_cs = AbiBound::default();
@@ -688,11 +703,12 @@ pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
         s.prelude_draws.clear();
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
+        let job_bufs = std::mem::take(&mut s.prelude_job_bufs);
         if s.allocator == backing {
             for sl in &mut s.scratch {
                 sl.state = D3D12_RESOURCE_STATE_COMMON;
             }
-            return (backing, Vec::new(), Vec::new(), Vec::new(), prelude);
+            return (backing, Vec::new(), Vec::new(), Vec::new(), prelude, job_bufs);
         }
         let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
@@ -710,12 +726,13 @@ pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
             res_bufs.push(b);
         }
         let io_blocks = std::mem::take(&mut s.io_blocks);
-        (old, std::mem::take(&mut s.uma), res_bufs, io_blocks, prelude)
+        (old, std::mem::take(&mut s.uma), res_bufs, io_blocks, prelude, job_bufs)
     });
     console_list::hold_until_reset(old, blocks);
     hold_res_until_reset(old, res_bufs);
     hold_io_until_reset(old, io_blocks);
     hold_prelude_until_reset(old, prelude);
+    hold_prelude_jobs_until_reset(old, job_bufs);
 }
 
 /// Carry bound pipeline and root-signature / root-argument state from `from` to `to` across a
@@ -726,7 +743,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     let (layout, args, layout_gfx, args_gfx, rs_gfx, rs_cs, pso, heaps) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.rs_cs, s.pso, s.heaps)
     });
-    let (old, blocks, res_bufs, io_blocks, prelude) = with(to, |s| {
+    let (old, blocks, res_bufs, io_blocks, prelude, job_bufs) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
         s.layout = layout;
@@ -751,6 +768,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.prelude_draws.clear();
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
+        let job_bufs = std::mem::take(&mut s.prelude_job_bufs);
         s.inline_guard = None;
         s.root_va_cache = [(0, 0); 16];
         s.root_va_next = 0;
@@ -774,12 +792,13 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
             res_bufs.push(b);
         }
         let io_blocks = std::mem::take(&mut s.io_blocks);
-        (old, std::mem::take(&mut s.uma), res_bufs, io_blocks, prelude)
+        (old, std::mem::take(&mut s.uma), res_bufs, io_blocks, prelude, job_bufs)
     });
     console_list::hold_until_reset(old, blocks);
     hold_res_until_reset(old, res_bufs);
     hold_io_until_reset(old, io_blocks);
     hold_prelude_until_reset(old, prelude);
+    hold_prelude_jobs_until_reset(old, job_bufs);
 }
 
 /// A submit is about to wait for the pipeline `this` has bound.
@@ -815,6 +834,7 @@ pub(super) fn forget(list: *mut c_void) {
         hold_res_until_reset(s.allocator, s.res_retired);
         hold_io_until_reset(s.allocator, s.io_blocks);
         hold_prelude_until_reset(s.allocator, s.prelude_owned.take());
+        hold_prelude_jobs_until_reset(s.allocator, std::mem::take(&mut s.prelude_job_bufs));
     }
 }
 
@@ -2453,12 +2473,51 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
                 std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
             }
 
-            // Helper to upload a packed `u32` job slice into `seg`'s UMA arena.
+            // Helper to upload a packed `u32` job slice into `seg`'s UMA arena, falling back to a
+            // dedicated non-pooled CUSTOM write-back L0 buffer when committed unified memory is full
+            // so the prelude never fails and leaves `seg` running with stale VRAM io / unguarded args.
             let upload_words = |words: &[u32]| -> Result<u64, String> {
                 let bytes = std::mem::size_of_val(words);
-                let p = with(seg, |s| s.arena.take(u, bytes.max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
-                std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), p, bytes);
-                super::real::uma_va_of(p as usize).ok_or_else(|| "unified memory is not open on the GPU".into())
+                if let Some(p) = with(seg, |s| s.arena.take(u, bytes.max(16), 256, &mut s.uma)) {
+                    std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), p, bytes);
+                    return super::real::uma_va_of(p as usize).ok_or_else(|| "unified memory is not open on the GPU".into());
+                }
+                let alloc_bytes = (bytes.max(16) as u64).next_multiple_of(256);
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                    CreationNodeMask: 1,
+                    VisibleNodeMask: 1,
+                };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: alloc_bytes,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                };
+                let mut buf: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut buf)
+                    .map_err(|e| format!("prelude job fallback buffer: {e}"))?;
+                let buf = buf.ok_or("prelude job fallback buffer was null")?;
+                let _ = buf.SetName(windows::core::w!("xcl prelude jobs (UMA full)"));
+                let mut mapped = std::ptr::null_mut();
+                let empty = D3D12_RANGE { Begin: 0, End: 0 };
+                buf.Map(0, Some(&empty), Some(&mut mapped)).map_err(|e| format!("prelude job fallback map: {e}"))?;
+                std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), mapped as *mut u8, bytes);
+                let written = D3D12_RANGE { Begin: 0, End: bytes };
+                buf.Unmap(0, Some(&written));
+                let va = buf.GetGPUVirtualAddress();
+                if va == 0 {
+                    return Err("prelude job fallback GPU VA is 0".into());
+                }
+                with(seg, |s| s.prelude_job_bufs.push(buf));
+                Ok(va)
             };
 
             let bind_windows = |list: &ID3D12GraphicsCommandList| {
@@ -4539,7 +4598,7 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
     };
     let size = size.max(16);
     let align = align.max(16);
-    if size <= crate::gpu::uma::ARENA_BLOCK / 2 {
+    if size <= crate::gpu::uma::UPLOAD_IN_ARENA_MOST {
         if let Some(p) = with(this, |s| s.arena.take(u, size, align, &mut s.uma)) {
             return p;
         }

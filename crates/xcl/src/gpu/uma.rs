@@ -756,8 +756,12 @@ pub struct Arena {
     end: usize,
 }
 
-/// block size of an `Arena`
-pub const ARENA_BLOCK: usize = 4 * GRAIN;
+/// block size of an `Arena` (64 KiB grain keeps ~190 live allocators under ~25 MB instead of ~100 MB)
+pub const ARENA_BLOCK: usize = GRAIN;
+
+/// Maximum `AllocateUploadMemory` request routed through the per-list arena (keeps the 128 KiB
+/// threshold unchanged after shrinking `ARENA_BLOCK` from 256 KiB to 64 KiB).
+pub const UPLOAD_IN_ARENA_MOST: usize = 2 * GRAIN;
 
 impl Arena {
     /// `n` bytes at an `align`-aligned address in committed unified memory (not zeroed), or

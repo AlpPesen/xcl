@@ -1058,10 +1058,11 @@ impl State {
     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
     unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
         let Some((rb, p)) = self.readback_buf() else { return };
-        let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (va, rb_off, chunk)
+        // (va, rb_off, len, pre-wait 64-byte chunk hashes of committed pages)
+        let mut pending: Vec<(usize, usize, usize, Vec<Option<u64>>)> = Vec::new();
         let mut used = 0usize;
         let mut open = false;
-        let flush_and_copy = |s: &mut State, open: &mut bool, pending: &mut Vec<(usize, usize, usize)>, used: &mut usize, p: *mut u8| {
+        let flush_and_copy = |s: &mut State, open: &mut bool, pending: &mut Vec<(usize, usize, usize, Vec<Option<u64>>)>, used: &mut usize, p: *mut u8| {
             if *open {
                 *open = false;
                 if s.rb_list.Close().is_ok() {
@@ -1076,8 +1077,11 @@ impl State {
                 s.wait_for(s.value);
                 s.reclaim_ring();
             }
-            for &(dst, off, len) in pending.iter() {
-                // copy only committed (non-hole) bytes
+            for (dst, off, len, snap) in pending.iter() {
+                let (dst, off, len) = (*dst, *off, *len);
+                let snap_base = dst & !(CHUNK - 1);
+                // Copy only committed (non-hole) 64-byte chunks whose host memory did not change
+                // during the GPU readback wait, so concurrent CPU writes are never clobbered.
                 let mut at = dst;
                 let mut src_off = off;
                 let end = dst + len;
@@ -1085,14 +1089,36 @@ impl State {
                     let pg = at & !(PAGE - 1);
                     let t = pg & !(TILE - 1);
                     let idx = (pg - t) / PAGE;
-                    let step = (pg + PAGE).min(end) - at;
-                    if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
-                        std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
+                    let page_end = (pg + PAGE).min(end);
+                    if let Some(entry) = s.mapped.get_mut(&t).filter(|e| e.holes & (1u16 << idx) == 0) {
+                        while at < page_end {
+                            let chunk_va = at & !(CHUNK - 1);
+                            let chunk_end = (chunk_va + CHUNK).min(page_end);
+                            let step = chunk_end - at;
+                            let snap_i = (chunk_va - snap_base) / CHUNK;
+                            let unchanged = snap.get(snap_i).copied().flatten().is_some_and(|expected| {
+                                chunk_hash(std::slice::from_raw_parts(chunk_va as *const u8, CHUNK)) == expected
+                            });
+                            if unchanged {
+                                std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
+                                let new_h = chunk_hash(std::slice::from_raw_parts(chunk_va as *const u8, CHUNK));
+                                let k = (chunk_va - pg) / CHUNK;
+                                if let Some(sent) = entry.sent[idx].as_deref_mut() {
+                                    sent[k] = new_h;
+                                } else if new_h != ZERO_HASH {
+                                    let sent = entry.sent[idx].insert(Box::new(ZERO_HASHES));
+                                    sent[k] = new_h;
+                                }
+                            }
+                            at += step;
+                            src_off += step;
+                        }
+                    } else {
+                        let step = page_end - at;
+                        at += step;
+                        src_off += step;
                     }
-                    at += step;
-                    src_off += step;
                 }
-                s.sync_sent_range(dst, len);
             }
             pending.clear();
             *used = 0;
@@ -1123,8 +1149,23 @@ impl State {
                     let _ = self.rb_list.Reset(&self.rb_alloc, None);
                     open = true;
                 }
+                let snap_base = cur & !(CHUNK - 1);
+                let snap_end = (cur + chunk).saturating_add(CHUNK - 1) & !(CHUNK - 1);
+                let mut snap = Vec::with_capacity((snap_end - snap_base) / CHUNK);
+                let mut c = snap_base;
+                while c < snap_end {
+                    let pg = c & !(PAGE - 1);
+                    let t = pg & !(TILE - 1);
+                    let idx = (pg - t) / PAGE;
+                    if self.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
+                        snap.push(Some(chunk_hash(std::slice::from_raw_parts(c as *const u8, CHUNK))));
+                    } else {
+                        snap.push(None);
+                    }
+                    c += CHUNK;
+                }
                 self.rb_list.CopyBufferRegion(&rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64);
-                pending.push((cur, used, chunk));
+                pending.push((cur, used, chunk, snap));
                 used += chunk;
                 done += chunk;
             }

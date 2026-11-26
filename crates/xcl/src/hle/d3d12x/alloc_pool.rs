@@ -56,6 +56,16 @@ struct State {
     /// PC list → recordings so far (a Reset or creation starts the next one)
     recordings: HashMap<usize, u64>,
     resubmits: u64,
+    /// Title allocators released while their submitted GPU fences are still running: held until
+    /// every fence completes (`release_finished`, polled at `PresentX`) so VRAM `io` slabs and
+    /// dispatch-chain scratch are never freed out from under active GPU work.
+    pending_releases: Vec<PendingRelease>,
+}
+
+struct PendingRelease {
+    marks: Vec<(ID3D12Fence, u64)>,
+    made: Vec<usize>,
+    cleanup: Box<dyn FnOnce() + Send>,
 }
 
 struct LastSubmit {
@@ -225,7 +235,7 @@ unsafe fn wait_for_previous_submits_within(lists: &[*mut c_void], limit: std::ti
         lists
             .iter()
             .filter_map(|&l| s.last_submit.get(&(l as usize)))
-            .filter(|l| super::real::fence_completed(&l.fence) < l.value)
+            .filter(|l| l.fence.GetCompletedValue() < l.value)
             .map(|l| (l.fence.clone(), l.value))
             .collect()
     };
@@ -238,7 +248,7 @@ unsafe fn wait_for_previous_submits_within(lists: &[*mut c_void], limit: std::ti
         // (XCL's own fence, read without the title's hook; a removed device reads as the largest
         // value: no wait then. Such a submit is milliseconds from done: a short poll)
         let mut polls = 0u32;
-        while super::real::fence_completed(fence) < *value {
+        while fence.GetCompletedValue() < *value {
             if start.elapsed() >= limit {
                 late += 1;
                 break;
@@ -318,6 +328,89 @@ pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
     let mine = s.cur.get(&alloc).into_iter().chain(s.aside.get(&alloc).into_iter().flatten()).chain([&alloc]);
     let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| b.marks.values().any(|(f, v)| f.GetCompletedValue() < *v));
     busy
+}
+
+/// Like `forget`, but when `alloc` (or any of its put-aside backings) still has unfinished GPU
+/// fence marks, defers running `cleanup` (and dropping any XCL-created spare PC allocators) until
+/// all those fences complete (`release_finished`). Returns `true` if deferred, `false` if all
+/// GPU work was already done and the caller should run cleanup immediately.
+pub unsafe fn release_when_done(alloc: usize, cleanup: Box<dyn FnOnce() + Send>) -> bool {
+    let (deferred, immediate_made) = {
+        let mut g = STATE.lock().unwrap();
+        let Some(s) = g.as_mut() else {
+            return false;
+        };
+        s.types.remove(&alloc);
+        let mut mine: Vec<usize> = s.aside.remove(&alloc).unwrap_or_default();
+        mine.extend(s.cur.remove(&alloc));
+        mine.push(alloc);
+        let mut pending_marks: Vec<(ID3D12Fence, u64)> = Vec::new();
+        let mut made_busy: Vec<usize> = Vec::new();
+        let mut made_free: Vec<usize> = Vec::new();
+        for b in mine {
+            let mut busy = false;
+            if let Some(gone) = s.backings.remove(&b) {
+                for l in gone.users {
+                    s.of_list.remove(&l);
+                }
+                for (_, (f, v)) in gone.marks {
+                    if f.GetCompletedValue() < v {
+                        pending_marks.push((f, v));
+                        busy = true;
+                    }
+                }
+            }
+            if b != alloc {
+                if busy {
+                    made_busy.push(b);
+                } else {
+                    made_free.push(b);
+                }
+            }
+        }
+        if pending_marks.is_empty() {
+            (false, made_free)
+        } else {
+            s.pending_releases.push(PendingRelease {
+                marks: pending_marks,
+                made: made_busy,
+                cleanup,
+            });
+            (true, made_free)
+        }
+    };
+    for b in immediate_made {
+        drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
+    }
+    deferred
+}
+
+/// Run deferred `release_when_done` cleanups whose GPU fences have all completed (polled once
+/// per `PresentX`, outside `STATE` so cleanups and COM drops cannot re-enter `STATE`).
+pub unsafe fn release_finished() {
+    let done: Vec<PendingRelease> = {
+        let mut g = STATE.lock().unwrap();
+        let Some(s) = g.as_mut() else { return };
+        if s.pending_releases.is_empty() {
+            return;
+        }
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < s.pending_releases.len() {
+            if s.pending_releases[i].marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v) {
+                ready.push(s.pending_releases.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        ready
+    };
+    for item in done {
+        (item.cleanup)();
+        for b in item.made {
+            drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
+        }
+    }
 }
 
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
