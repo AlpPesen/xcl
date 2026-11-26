@@ -119,7 +119,7 @@ impl Init {
 
     fn first(&mut self, s: &mut Shader, var: u32) -> Value {
         if var == VAR_BUDGET {
-            return s.m.i32c(LOOP_BUDGET);
+            return s.m.i32c(super::kernel::loop_budget());
         }
         if var == VAR_BUDGET_TOTAL {
             return s.m.i32c(LOOP_BUDGET * crate::gpu::recomp::LOOP_BUDGETS_IN_ALL);

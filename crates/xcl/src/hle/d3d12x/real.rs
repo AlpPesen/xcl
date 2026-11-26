@@ -2215,7 +2215,8 @@ enum RtGateMode {
 
 fn parse_rt_gate_mode(raw: Option<&str>) -> RtGateMode {
     match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        Some("0" | "off" | "false" | "allow") => RtGateMode::Off,
+        // `miss`: run, with every ray missing (`dxil::kernel::rt_all_miss`)
+        Some("0" | "off" | "false" | "allow" | "miss") => RtGateMode::Off,
         Some("auto") => RtGateMode::Auto,
         _ => RtGateMode::Hold,
     }
@@ -2306,6 +2307,12 @@ fn extra_rt_skip_hashes() -> &'static HashSet<u64> {
 
 fn is_rt_gated_cs_hash(hash: u64) -> bool {
     RT_COMPANION_CS_HASHES.contains(&hash) || extra_rt_skip_hashes().contains(&hash)
+}
+
+/// Whether a console compute shader container is a ray-tracing program (traversal or companion),
+/// whatever `XCL_RT_GATE` does with it.
+pub(crate) fn rt_gated_program(cs: &[u8]) -> bool {
+    is_rt_gated_cs(cs)
 }
 
 fn is_rt_gated_cs(cs: &[u8]) -> bool {

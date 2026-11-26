@@ -3663,8 +3663,34 @@ pub(crate) fn thread_dims_to_groups(threads: [u32; 3], group_size: [u32; 3]) -> 
     ])
 }
 
+/// Whether the BVH builder's passes (`DispatchX` with `USE_THREAD_DIMENSIONS`, the title's
+/// `XboxBvhBuilder.dll`) run: off unless `XCL_BVH_BUILDER=1`. Its 52 programs build and refit the
+/// ray-tracing structures in the title's memory by raw address; while their pipelines are built
+/// one by one some passes run and others do not, and a partly run builder writes garbage bounds
+/// and sizes there. A retail title's world loading crashed (title code reading corrupted
+/// pointers) or hung the device 2 to 100 s after its first builder pass, in every run of nine.
+/// Without the builder the structures stay unbuilt and every ray misses; the project the
+/// maintainer calls `nnnee`, playable with that title, keeps its builder off by default for the
+/// same finding.
+fn bvh_builder_runs(flags: u32, enabled: bool) -> bool {
+    flags & DISPATCH_FLAG_USE_THREAD_DIMENSIONS == 0 || enabled
+}
+
+fn bvh_builder_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_BVH_BUILDER").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// command list #78 DispatchX(x, y, z, flags)
 pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
+    if !bvh_builder_runs(flags, bvh_builder_enabled()) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: BVH builder pass left out ({n} so far; XCL_BVH_BUILDER=1 runs them)");
+        }
+        return;
+    }
     if flags & DISPATCH_FLAG_USE_THREAD_DIMENSIONS != 0 {
         if super::real::bvh_builder_failed() {
             return;

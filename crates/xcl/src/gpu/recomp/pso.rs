@@ -181,7 +181,10 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
-    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+    // a ray-tracing program with `XCL_RT_GATE=miss` gets its own loop budget
+    // (`dxil::kernel::RT_LOOP_BUDGET`): what makes it one is in its bytes, as the caches' keys are
+    let rt = stage == Stage::Compute && crate::gpu::dxil::kernel::rt_all_miss() && crate::hle::d3d12x::real::rt_gated_program(blob);
+    let compile_one = || crate::gpu::dxil::kernel::with_rt_program(rt, || compile_console_shader(blob, stage, sampler_base, windows, split_wave64));
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one().map(|(c, _)| c);
     }
@@ -297,6 +300,10 @@ mod translated {
             };
             let id = if Backend::current() != Backend::Hlsl {
                 identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()))
+            } else { id };
+            // `XCL_RT_GATE=miss`: ray-tracing programs are another output
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::dxil::kernel::rt_all_miss() {
+                identity_for(&id.to_string(), "xcl-rt-all-miss")
             } else { id };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
