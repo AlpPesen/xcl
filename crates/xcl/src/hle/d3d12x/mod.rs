@@ -23,6 +23,7 @@ pub mod dred;
 mod fence_x;
 mod format_alias;
 pub mod frame;
+pub(crate) mod gfx_records;
 pub(crate) mod gpu_awake;
 pub mod guard;
 mod late_release;
