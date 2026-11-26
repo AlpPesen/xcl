@@ -3785,6 +3785,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
         };
         let mark = super::culprit::before_dispatch(list, raw_pso, pso, [0, 0, max]);
+        if let Some((p, _)) = commands_at.filter(|&(_, n)| n >= 12) {
+            super::culprit::indirect_args(mark, p);
+        }
         match chained_indirect(
             this,
             list,
@@ -3873,6 +3876,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             count(if gfx { DRAWS } else { DISPATCHES });
             // an indirect dispatch: its groups are in the argument buffer (`max` of them)
             let mark = if gfx { 0 } else { super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [0, 0, max]) };
+            if let Some((p, _)) = commands_at.filter(|&(_, n)| n >= 12) {
+                super::culprit::indirect_args(mark, p);
+            }
             if guarded.is_some() && count_buf == 0 {
                 pc(this, sig, max, args, args_off, count_buf, count_off);
             } else {

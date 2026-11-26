@@ -129,6 +129,37 @@ pub unsafe fn before_dispatch(list: &ID3D12GraphicsCommandList, title_pso: usize
     id
 }
 
+/// Where in title memory the arguments of the indirect dispatches numbered so are (the newest
+/// 65 536): a hung one is logged with the group counts there.
+static ARGS: Mutex<Option<HashMap<u32, usize>>> = Mutex::new(None);
+
+/// The indirect dispatch `id` (of `before_dispatch`) takes its group counts from `at` in title
+/// memory.
+pub fn indirect_args(id: u32, at: usize) {
+    if id == 0 {
+        return;
+    }
+    let mut g = ARGS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() >= 1 << 16 {
+        m.clear();
+    }
+    m.insert(id, at);
+}
+
+/// ` ; its arguments in title memory now: x×y×z groups` for the dispatch `id`, when known. What
+/// the GPU read can differ: these are the bytes the CPU sees (a count another dispatch wrote may
+/// not be back yet).
+fn args_now(id: u32) -> String {
+    let Some(at) = ARGS.lock().unwrap().as_ref().and_then(|m| m.get(&id).copied()) else { return String::new() };
+    if !crate::gpu::shader::readable(at, 12) {
+        return format!("; its arguments at {at:#x} cannot be read");
+    }
+    // SAFETY: 12 readable bytes, checked above
+    let [x, y, z] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+    format!("; its arguments in title memory ({at:#x}) now: {x}x{y}x{z} groups")
+}
+
 /// After the dispatch: a marker out with its number.
 pub unsafe fn after_dispatch(list: &ID3D12GraphicsCommandList, id: u32) {
     if id == 0 {
@@ -194,6 +225,19 @@ pub fn on_watchdog_release() {
     if BURSTS.fetch_add(1, Ordering::Relaxed) >= 8 {
         return;
     }
+    report();
+}
+
+/// The device was removed: the same report, once. A driver that gives up on a hung GPU after
+/// 2 s does so before the watchdog's 3 s without progress, and the report never came.
+pub fn on_device_removed() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if enabled() && !DONE.swap(true, Ordering::Relaxed) {
+        report();
+    }
+}
+
+fn report() {
     let g = MARKERS.lock().unwrap();
     let Some(m) = g.as_ref() else { return };
     // SAFETY: slots index the mapped buffer of SLOTS pairs
@@ -203,7 +247,7 @@ pub fn on_watchdog_release() {
         let left = not_done(&m.what, *list, *i, *o);
         crate::xlog_warn!("GPU culprit: list {list:#x}: marker in #{i}, last marker out #{o}; {} of its dispatches not known done:", left.len());
         for (id, s) in left.iter().take(24) {
-            crate::xlog_warn!("GPU culprit:   #{id}: {s}");
+            crate::xlog_warn!("GPU culprit:   #{id}: {s}{}", args_now(*id));
         }
     }
 }

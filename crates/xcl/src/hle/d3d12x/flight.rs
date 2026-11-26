@@ -175,12 +175,17 @@ fn poll() {
         }
     }
     }
+    let stopped = lines.iter().any(|(warn, _)| *warn);
     for (warn, l) in lines {
         if warn {
             crate::xlog_warn!("{l}");
         } else {
             crate::xlog_info!("{l}");
         }
+    }
+    // a queue stopped: what the queues wait for on the GPU, while the fences can still be asked
+    if stopped {
+        super::list_x::log_pending_waits("a queue stopped");
     }
     // A GPU that has not moved for 3 s: which dispatches started and did not finish (the markers
     // are CPU memory, read without the driver), and at 8 s where every thread is. Here and not
@@ -343,9 +348,13 @@ pub fn dump(why: &str) {
         }
     }
     if let Ok(g) = EVENTS.try_lock() {
-        let skip = g.len().saturating_sub(400);
-        crate::xlog_error!("flight: the last {} events (ms, thread, what, numbers):", g.len() - skip);
-        for e in g.iter().skip(skip) {
+        // the tile mappings, most of the ring in a world load, are left out but for the slow ones
+        // (1 ms and more): they pushed the submits before a stop out of the 400 lines
+        let shown = |e: &&Event| e.what != "tile map" || e.c >= 1000;
+        let n = g.iter().filter(shown).count();
+        let skip = n.saturating_sub(400);
+        crate::xlog_error!("flight: the last {} events but quick tile mappings (ms, thread, what, numbers), {} ms of them:", n - skip, g.front().map_or(0, |e| now.saturating_sub(e.ms)));
+        for e in g.iter().filter(shown).skip(skip) {
             crate::xlog_error!("flight:   {} t{} {} {:#x} {} {}", e.ms, e.thread, e.what, e.a, e.b, e.c);
         }
     }

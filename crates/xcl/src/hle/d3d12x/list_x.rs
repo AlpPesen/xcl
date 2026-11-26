@@ -1590,6 +1590,8 @@ pub(super) fn note_internal_wait(queue: usize, what: &'static str, fence: &ID3D1
     let mut g = INTERNAL_WAITS.lock().unwrap();
     let waits = g.get_or_insert_with(HashMap::new).entry(queue).or_default();
     waits.retain(|w| unsafe { w.fence.GetCompletedValue() } < w.value);
+    // (flight: the queue, the value waited for and the fence's value now)
+    super::flight::event(what, queue as u64, value, unsafe { fence.GetCompletedValue() });
     waits.push(InternalWait { what, fence: fence.clone(), value, at: Instant::now() });
 }
 
@@ -1610,6 +1612,61 @@ fn internal_waits_summary() -> String {
         return "none".into();
     }
     unmet.into_iter().map(|(q, s)| format!("q{}: {s}", queue_id(q))).collect::<Vec<_>>().join(", ")
+}
+
+/// What the queues wait for on the GPU now – the title's `Wait*BitValueX` not met yet, its
+/// fences, XCL's own queue waits – into the log when a queue stops (`flight`): the watchdog says
+/// the same after 5 s, and a driver that gives up on the GPU after 2 s removes the device first.
+/// At most 8 times, 3 s apart.
+pub(super) fn log_pending_waits(why: &str) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    static TIMES: AtomicU64 = AtomicU64::new(0);
+    {
+        let mut l = LAST.lock().unwrap();
+        if l.is_some_and(|t| t.elapsed() < Duration::from_secs(3)) {
+            return;
+        }
+        *l = Some(Instant::now());
+    }
+    if !once(&TIMES, 8) {
+        return;
+    }
+    let mut armed = Vec::new();
+    if let Some(graph) = SYNC_GRAPH.lock().unwrap().as_mut() {
+        for (&va, cell) in graph.cells.iter_mut() {
+            if cell.armed_waits.is_empty() {
+                continue;
+            }
+            let completed = unsafe { prune_completed_waits(cell) };
+            if completed == u64::MAX {
+                continue;
+            }
+            let producer = cell.submitted_queue.or(cell.recorded_last_queue);
+            // the signals submitted for the address and not done: value, queue, its place there
+            let signals: Vec<String> = cell.submitted_signals.iter().map(|s| format!("{:#x} on {:#x} at #{}", s.val, s.queue, s.seq)).collect();
+            for aw in &cell.armed_waits {
+                armed.push(format!(
+                    "{va:#x} >= {:#x} for {} ms (waiter {:#x}/ty{} at #{}{}, producer {:x?}/ty{:?}, recorded {:#x}, submitted {:#x}, completed {completed:#x}, CPU-signalled {:#x}, signals [{}])",
+                    aw.val,
+                    aw.armed_at.elapsed().as_millis(),
+                    aw.waiting_queue,
+                    aw.waiting_queue_ty,
+                    aw.wait_seq,
+                    if aw.after_write64 { ", after a Write64 of its list" } else { "" },
+                    producer,
+                    cell.recorded_list_type.map(|t| t.0),
+                    cell.recorded_max,
+                    cell.submitted_max,
+                    cell.cpu_signaled_max,
+                    signals.join(", ")
+                ));
+            }
+        }
+    }
+    let ids = QUEUE_IDS.lock().unwrap().iter().enumerate().map(|(i, q)| format!("q{i} {q:#x}")).collect::<Vec<_>>().join(", ");
+    crate::xlog_warn!("D3D12.X: GPU waits as {why}: the title's value waits unmet: {}", if armed.is_empty() { "none".to_string() } else { armed.join("; ") });
+    crate::xlog_warn!("D3D12.X: GPU waits as {why}: pending title ID3D12Fences: {}", super::fence_x::pending_summary());
+    crate::xlog_warn!("D3D12.X: GPU waits as {why}: XCL's own queue waits unmet: {} (queues: {ids})", internal_waits_summary());
 }
 
 fn queue_id(q: usize) -> usize {
@@ -2197,6 +2254,8 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                 .is_some_and(|c| c.non_monotonic || c.submitted_max >= val)
         };
         if skip {
+            // (flight: the value was submitted before, or the address is not monotonic)
+            super::flight::event("w64 signal not sent", sig_q as u64, val, va);
             continue;
         }
         let Some(fence) = ensure_cell_fence(va, &dev, dev_raw) else { continue };
@@ -2258,6 +2317,17 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                 }
             }
         };
+        // (flight: the queue, the value and the address, in the order the queue gets them)
+        super::flight::event(
+            match action {
+                SignalAction::Skip => "w64 signal left out",
+                SignalAction::GpuSignal => "w64 signal",
+                SignalAction::CpuCycleBreak(_) => "w64 signal on the CPU (cycle)",
+            },
+            sig_q as u64,
+            val,
+            va,
+        );
         match action {
             SignalAction::Skip => {}
             SignalAction::GpuSignal => {
@@ -2417,6 +2487,8 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         (pre_ok.0, pre_ok.1, pre_ok.2, wait_seq)
     };
 
+    // (flight: the waiting queue, the value and the address the title waits on)
+    super::flight::event("title value wait", q_raw as u64, w.value, w.va);
     if let Err(e) = q.Wait(&fence, w.value) {
         let mut g = SYNC_GRAPH.lock().unwrap();
         if let Some(cell) = g.as_mut().and_then(|gr| gr.cells.get_mut(&w.va)) {

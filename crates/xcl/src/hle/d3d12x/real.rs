@@ -5243,10 +5243,10 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         });
         crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
     }
-    let started = std::time::Instant::now();
+    let prof = super::prof::span(super::prof::Kind::DriverCompile);
     let r = build();
-    let took = started.elapsed();
-    super::prof::add(super::prof::Kind::DriverCompile, took);
+    let took = prof.elapsed();
+    drop(prof);
     if log {
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_bytes || gated, gated, waited));
     }
@@ -9813,6 +9813,7 @@ pub fn log_device_removed() {
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
     // which of XCL's queues stopped first, and what went before (`flight`)
     super::flight::dump("device removed");
+    super::culprit::on_device_removed();
     unsafe {
         let mut pf_logged = false;
         if let Ok(dred1) = dev.cast::<ID3D12DeviceRemovedExtendedData1>() {
