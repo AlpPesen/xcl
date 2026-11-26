@@ -13,7 +13,7 @@
 //! Tunables: `XCL_AMBIENT_GAIN`, `XCL_AMBIENT_POWER`, `XCL_AMBIENT_LEAST`, `XCL_AMBIENT_AO`,
 //! `XCL_AMBIENT_REFLECT`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -185,8 +185,10 @@ fn role_of(pso: usize) -> Option<PassRole> {
     PSO_ROLES.read().unwrap().as_ref()?.get(&pso).copied()
 }
 
-/// Descriptor-heap view metadata indexed by `GLOBAL` heap descriptor index (`T# word 0`), so
-/// descriptors copied via either `CopyDescriptorsSimple` or inline title `memcpy` resolve cleanly.
+/// Descriptor-heap view metadata indexed by BOTH console slot UMA address (`slot.at`, globally
+/// unique across all shader-visible and CPU-only heaps) and `GLOBAL` heap descriptor index
+/// (`slot.index` when hosted in `GLOBAL`) so both `CopyDescriptors*` and inline title `memcpy`
+/// resolve without CPU-only heap index collisions.
 #[derive(Clone, Copy, Debug)]
 struct ViewEntry {
     res: usize,
@@ -194,11 +196,18 @@ struct ViewEntry {
     is_uav: bool,
 }
 
-static VIEW_SLOTS: RwLock<Option<HashMap<u32, ViewEntry>>> = RwLock::new(None);
+#[derive(Default)]
+struct ViewSlots {
+    by_addr: HashMap<usize, ViewEntry>,
+    by_idx: HashMap<u32, ViewEntry>,
+}
+
+static VIEW_SLOTS: RwLock<Option<ViewSlots>> = RwLock::new(None);
 static HAS_VIEW_SLOTS: AtomicBool = AtomicBool::new(false);
 
 fn is_ambient_uav_format(fmt: i32) -> bool {
-    matches!(fmt, 10 | 26) // R16G16B16A16_FLOAT, R11G11B10_FLOAT
+    // R16G16B16A16_FLOAT (10), R11G11B10_FLOAT (26), R32G32B32A32_FLOAT (2)
+    matches!(fmt, 10 | 26 | 2)
 }
 
 fn is_depth_srv_format(fmt: i32) -> bool {
@@ -210,15 +219,21 @@ fn is_depth_resource_format(fmt: i32) -> bool {
     matches!(fmt, 19 | 20 | 39 | 40 | 44 | 45 | 53 | 55)
 }
 
-/// Record a 2D texture UAV or depth SRV written at `GLOBAL` descriptor index `slot_index`.
-pub(super) fn note_descriptor(slot_index: u32, res: usize, fmt: i32, res_fmt: i32, is_uav: bool) {
-    if !enabled() || slot_index == 0 {
+/// Record a 2D texture UAV or depth SRV written at console slot address `slot_at` (and optional
+/// `GLOBAL` descriptor index `global_index`, 0 when on a CPU-only / unhosted heap).
+pub(super) fn note_descriptor(slot_at: usize, global_index: u32, res: usize, fmt: i32, res_fmt: i32, is_uav: bool) {
+    if !enabled() || (slot_at == 0 && global_index == 0) {
         return;
     }
     if res == 0 {
         if HAS_VIEW_SLOTS.load(Ordering::Relaxed) {
-            if let Some(m) = VIEW_SLOTS.write().unwrap().as_mut() {
-                m.remove(&slot_index);
+            if let Some(s) = VIEW_SLOTS.write().unwrap().as_mut() {
+                if slot_at != 0 {
+                    s.by_addr.remove(&slot_at);
+                }
+                if global_index != 0 {
+                    s.by_idx.remove(&global_index);
+                }
             }
         }
         return;
@@ -230,11 +245,22 @@ pub(super) fn note_descriptor(slot_index: u32, res: usize, fmt: i32, res_fmt: i3
     };
     let mut g = VIEW_SLOTS.write().unwrap();
     if keep {
-        g.get_or_insert_with(HashMap::new)
-            .insert(slot_index, ViewEntry { res, fmt, is_uav });
+        let s = g.get_or_insert_with(ViewSlots::default);
+        let ve = ViewEntry { res, fmt, is_uav };
+        if slot_at != 0 {
+            s.by_addr.insert(slot_at, ve);
+        }
+        if global_index != 0 {
+            s.by_idx.insert(global_index, ve);
+        }
         HAS_VIEW_SLOTS.store(true, Ordering::Release);
-    } else if let Some(m) = g.as_mut() {
-        m.remove(&slot_index);
+    } else if let Some(s) = g.as_mut() {
+        if slot_at != 0 {
+            s.by_addr.remove(&slot_at);
+        }
+        if global_index != 0 {
+            s.by_idx.remove(&global_index);
+        }
     }
 }
 
@@ -244,25 +270,43 @@ pub(super) fn forget_resource(res: usize) {
     if res == 0 || !HAS_VIEW_SLOTS.load(Ordering::Relaxed) {
         return;
     }
-    if let Some(m) = VIEW_SLOTS.write().unwrap().as_mut() {
-        m.retain(|_, v| v.res != res);
+    if let Some(s) = VIEW_SLOTS.write().unwrap().as_mut() {
+        s.by_addr.retain(|_, v| v.res != res);
+        s.by_idx.retain(|_, v| v.res != res);
     }
 }
 
-/// Propagate view metadata when `CopyDescriptorsSimple` renumbers a T# from `src_index` to `dst_index`.
-pub(super) fn copy_descriptor(src_index: u32, dst_index: u32) {
-    if !enabled() || src_index == dst_index {
+/// Propagate view metadata when `CopyDescriptors*` copies from `src_at` (with pre-copy T# word 0
+/// `src_global_index`) to `dst_at` (with destination `GLOBAL` index `dst_global_index`, 0 if unhosted).
+pub(super) fn copy_descriptor(src_at: usize, src_global_index: u32, dst_at: usize, dst_global_index: u32) {
+    if !enabled() || !HAS_VIEW_SLOTS.load(Ordering::Relaxed) || (src_at == dst_at && src_global_index == dst_global_index) {
         return;
     }
-    let entry = VIEW_SLOTS.read().unwrap().as_ref().and_then(|m| m.get(&src_index).copied());
+    let entry = VIEW_SLOTS.read().unwrap().as_ref().and_then(|s| {
+        s.by_addr
+            .get(&src_at)
+            .or_else(|| (src_global_index != 0).then(|| s.by_idx.get(&src_global_index)).flatten())
+            .copied()
+    });
     let mut g = VIEW_SLOTS.write().unwrap();
     match entry {
         Some(v) => {
-            g.get_or_insert_with(HashMap::new).insert(dst_index, v);
+            let s = g.get_or_insert_with(ViewSlots::default);
+            if dst_at != 0 {
+                s.by_addr.insert(dst_at, v);
+            }
+            if dst_global_index != 0 {
+                s.by_idx.insert(dst_global_index, v);
+            }
         }
         None => {
-            if let Some(m) = g.as_mut() {
-                m.remove(&dst_index);
+            if let Some(s) = g.as_mut() {
+                if dst_at != 0 {
+                    s.by_addr.remove(&dst_at);
+                }
+                if dst_global_index != 0 {
+                    s.by_idx.remove(&dst_global_index);
+                }
             }
         }
     }
@@ -276,25 +320,46 @@ fn is_sky_dome_target(rd: &D3D12_RESOURCE_DESC) -> bool {
         && rd.SampleDesc.Count == 1
 }
 
-/// Match a screen-space resolve/reflection output UAV against dispatch grid dimensions.
-fn matches_dispatch_target(rd: &D3D12_RESOURCE_DESC, groups: [u32; 3]) -> bool {
+/// Match a screen-space resolve/reflection output UAV against dispatch grid dimensions, returning
+/// a lower-is-better score when compatible (`None` if incompatible).
+/// Uses the UAV view's concrete `view_fmt` so typeless resources (`R16G16B16A16_TYPELESS`) match.
+fn score_dispatch_target(rd: &D3D12_RESOURCE_DESC, view_fmt: i32, groups: [u32; 3]) -> Option<u64> {
     if rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || rd.DepthOrArraySize != 1
         || rd.SampleDesc.Count != 1
         || rd.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0
-        || !is_ambient_uav_format(rd.Format.0)
+        || !is_ambient_uav_format(view_fmt)
     {
-        return false;
+        return None;
     }
     let w = rd.Width as u32;
     let h = rd.Height;
-    if w < 64 || h < 64 || groups[0] == 0 || groups[1] == 0 {
-        return false;
+    if w < 64 || h < 64 {
+        return None;
     }
-    let max_w = groups[0].saturating_mul(32);
-    let max_h = groups[1].saturating_mul(32);
-    let min_w = groups[0].saturating_mul(4);
-    let min_h = groups[1].saturating_mul(4);
-    w >= min_w && w <= max_w && h >= min_h && h <= max_h
+    // Indirect or 1D tiled dispatch (`groups[0] == 0` or `groups[1] <= 1`): match screen-space 2D
+    // float UAV targets (>= 128x72), preferring larger resolution.
+    if groups[0] == 0 || groups[1] <= 1 {
+        if w < 128 || h < 72 {
+            return None;
+        }
+        return Some(u64::MAX - (w as u64).saturating_mul(h as u64));
+    }
+    let max_w = groups[0].saturating_mul(64);
+    let max_h = groups[1].saturating_mul(64);
+    let min_w = groups[0].saturating_mul(2);
+    let min_h = groups[1].saturating_mul(2);
+    if w < min_w || w > max_w || h < min_h || h > max_h {
+        return None;
+    }
+    let ideal_w = groups[0].saturating_mul(8) as i64;
+    let ideal_h = groups[1].saturating_mul(8) as i64;
+    Some((w as i64 - ideal_w).unsigned_abs() + (h as i64 - ideal_h).unsigned_abs())
+}
+
+#[cfg(test)]
+fn matches_dispatch_target(rd: &D3D12_RESOURCE_DESC, groups: [u32; 3]) -> bool {
+    score_dispatch_target(rd, rd.Format.0, groups).is_some()
 }
 
 /// Compute scalar/RGB stand-in sky level (mirrors the GPU `sky_reduce_cs` transfer curve).
@@ -771,21 +836,38 @@ pub(super) unsafe fn after_draw(list: *mut c_void, pso_resolved: usize) {
     }
 }
 
-/// Inspect a compute dispatch's bound descriptor tables and root constants/CBVs to locate its
-/// output screen-space float UAV (and optional depth SRV for crease AO).
-unsafe fn find_dispatch_views(layout: &Layout, args: &[u8], groups: [u32; 3]) -> (Option<(usize, i32, u32, u32)>, Option<(usize, i32, u32, u32)>) {
-    let Some(u) = crate::gpu::uma::get() else { return (None, None) };
+/// Maximum bindless descriptor-heap slot index probed from root constants/CBVs
+/// (covers >1.24M-slot console shader-visible view heaps).
+const MAX_SLOT_INDEX: u32 = 2_000_000;
+
+/// Inspect a compute dispatch's bound descriptor tables, SM 6.6 directly-indexed view heap
+/// (`view_heap_base`), and root constants/CBVs to locate its output screen-space float UAV
+/// (and optional depth SRV for crease AO).
+unsafe fn find_dispatch_views(
+    layout: &Layout,
+    args: &[u8],
+    groups: [u32; 3],
+    view_heap_base: u32,
+) -> (Option<(usize, i32, u32, u32)>, Option<(usize, i32, u32, u32)>, usize, usize) {
+    let Some(u) = crate::gpu::uma::get() else { return (None, None, 0, 0) };
     let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let mut tables: Vec<u32> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut push_idx = |v: u32| {
+        if v < MAX_SLOT_INDEX && seen.insert(v) {
+            indices.push(v);
+        }
+    };
+    if view_heap_base != 0 {
+        tables.push(view_heap_base);
+    }
     for p in &layout.params {
         match *p {
             Param::Constants { at, count } => {
-                for k in 0..count.min(32) as usize {
+                for k in 0..count.min(64) as usize {
                     if let Some(v) = word(at as usize + 4 * k) {
-                        if v < (1 << 20) {
-                            indices.push(v);
-                        }
+                        push_idx(v);
                     }
                 }
             }
@@ -793,18 +875,26 @@ unsafe fn find_dispatch_views(layout: &Layout, args: &[u8], groups: [u32; 3]) ->
                 let lo = word(at as usize).unwrap_or(0) as u64;
                 let hi = word(at as usize + 4).unwrap_or(0) as u64;
                 let va = (lo | (hi << 32)) as usize;
-                if va != 0 && crate::gpu::shader::readable(va, 256) {
-                    for k in 0..64usize {
-                        let v = ((va + 4 * k) as *const u32).read_unaligned();
-                        if v < (1 << 20) {
-                            indices.push(v);
+                if va != 0 {
+                    // Scan up to 2048 bytes (512 u32s) in 256-byte readable chunks so bindless
+                    // pass/frame CBVs larger than 256 bytes are covered safely.
+                    for chunk in 0..8usize {
+                        let base = va + chunk * 256;
+                        if !crate::gpu::shader::readable(base, 256) {
+                            break;
+                        }
+                        for k in 0..64usize {
+                            let v = ((base + 4 * k) as *const u32).read_unaligned();
+                            if v != 0 {
+                                push_idx(v);
+                            }
                         }
                     }
                 }
             }
             Param::Table { at } => {
                 if let Some(t) = word(at as usize) {
-                    if t != 0 {
+                    if t != 0 && !tables.contains(&t) {
                         tables.push(t);
                     }
                 }
@@ -813,13 +903,13 @@ unsafe fn find_dispatch_views(layout: &Layout, args: &[u8], groups: [u32; 3]) ->
     }
     // Also probe direct table slots 0..16 in case descriptors are bound directly without bindless indices.
     for k in 0..16u32 {
-        indices.push(k);
+        push_idx(k);
     }
 
-    let mut uav_hit: Option<(usize, i32, u32, u32)> = None;
+    let mut uav_hit: Option<(u64, usize, i32, u32, u32)> = None;
     let mut depth_hit: Option<(usize, i32, u32, u32)> = None;
     let slots = VIEW_SLOTS.read().unwrap();
-    let Some(map) = slots.as_ref() else { return (None, None) };
+    let Some(vs) = slots.as_ref() else { return (None, None, tables.len(), indices.len()) };
 
     for &t in &tables {
         for &idx in &indices {
@@ -834,27 +924,34 @@ unsafe fn find_dispatch_views(layout: &Layout, args: &[u8], groups: [u32; 3]) ->
             if (w3 >> 28) < 8 {
                 continue;
             }
-            let Some(&ve) = map.get(&w0) else { continue };
+            let Some(&ve) = vs
+                .by_addr
+                .get(&addr)
+                .or_else(|| (w0 != 0).then(|| vs.by_idx.get(&w0)).flatten())
+            else {
+                continue;
+            };
             let ptr = ve.res as *mut c_void;
             let Some(res) = ID3D12Resource::from_raw_borrowed(&ptr) else { continue };
             let rd = res.GetDesc();
-            if ve.is_uav && uav_hit.is_none() && matches_dispatch_target(&rd, groups) {
-                uav_hit = Some((ve.res, ve.fmt, rd.Width as u32, rd.Height));
-            } else if !ve.is_uav
-                && depth_hit.is_none()
+            if ve.is_uav {
+                if let Some(score) = score_dispatch_target(&rd, ve.fmt, groups) {
+                    if uav_hit.is_none_or(|(best, _, _, _, _)| score < best) {
+                        uav_hit = Some((score, ve.res, ve.fmt, rd.Width as u32, rd.Height));
+                    }
+                }
+            } else if depth_hit.is_none()
                 && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && rd.DepthOrArraySize == 1
                 && rd.SampleDesc.Count == 1
                 && rd.Width >= 64
                 && rd.Height >= 64
             {
                 depth_hit = Some((ve.res, ve.fmt, rd.Width as u32, rd.Height));
             }
-            if uav_hit.is_some() && depth_hit.is_some() {
-                return (uav_hit, depth_hit);
-            }
         }
     }
-    (uav_hit, depth_hit)
+    (uav_hit.map(|(_, r, f, w, h)| (r, f, w, h)), depth_hit, tables.len(), indices.len())
 }
 
 /// Called right after a translated compute dispatch completes: when RT is gated off and a sky
@@ -866,6 +963,7 @@ pub(super) unsafe fn after_compute_dispatch(
     groups: [u32; 3],
     layout: Option<&Layout>,
     args: &[u8],
+    view_heap_base: u32,
 ) {
     if !has_compute_psos() || !active() {
         return;
@@ -887,11 +985,23 @@ pub(super) unsafe fn after_compute_dispatch(
     let Some(dev) = dev else { return };
     let Some(ad) = get_device(&dev) else { return };
     if !ad.sky_ready.load(Ordering::Acquire) {
+        static NO_SKY: AtomicU64 = AtomicU64::new(0);
+        if NO_SKY.fetch_add(1, Ordering::Relaxed) < 2 {
+            crate::xlog_info!("D3D12.X: ambient: {role:?} dispatched ({groups:?}) before sky dome capture");
+        }
         return;
     }
 
-    let (uav_opt, depth_opt) = find_dispatch_views(layout, args, groups);
-    let Some((uav_res, uav_fmt, w, h)) = uav_opt else { return };
+    let (uav_opt, depth_opt, n_tables, n_indices) = find_dispatch_views(layout, args, groups, view_heap_base);
+    let Some((uav_res, uav_fmt, w, h)) = uav_opt else {
+        static MISS: AtomicU64 = AtomicU64::new(0);
+        if MISS.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_info!(
+                "D3D12.X: ambient: {role:?} ({groups:?}) found no matching UAV (tables={n_tables}, view_heap={view_heap_base:#x}, indices={n_indices})"
+            );
+        }
+        return;
+    };
     if role == PassRole::ReflectionHistory && !typed_uav_load_supported(&dev, DXGI_FORMAT(uav_fmt)) {
         return;
     }
@@ -1044,5 +1154,45 @@ mod tests {
         assert!(compile_cs_sm5(SKY_REDUCE_HLSL).is_some(), "SKY_REDUCE_HLSL failed D3DCompile");
         assert!(compile_cs_sm5(AMBIENT_FILL_HLSL).is_some(), "AMBIENT_FILL_HLSL failed D3DCompile");
         assert!(compile_cs_sm5(REFLECT_CLAMP_HLSL).is_some(), "REFLECT_CLAMP_HLSL failed D3DCompile");
+    }
+
+    #[test]
+    fn typeless_uav_indirect_dispatch_and_cpu_heap_slot_copy_resolve_cleanly() {
+        // Typeless resource with concrete R16G16B16A16_FLOAT UAV view must match (both direct and indirect).
+        let typeless = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1920,
+            Height: 1080,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        assert!(score_dispatch_target(&typeless, DXGI_FORMAT_R16G16B16A16_FLOAT.0, [240, 135, 1]).is_some());
+        assert!(score_dispatch_target(&typeless, DXGI_FORMAT_R16G16B16A16_FLOAT.0, [0, 0, 0]).is_some());
+        // Texture2DArray must be rejected for TEXTURE2D view creation.
+        let arr = D3D12_RESOURCE_DESC { DepthOrArraySize: 4, ..typeless };
+        assert!(score_dispatch_target(&arr, DXGI_FORMAT_R16G16B16A16_FLOAT.0, [240, 135, 1]).is_none());
+
+        // Two distinct CPU-only heap slots (`global_index == 0`) at different addresses must not collide
+        // before being copied to the shader-visible heap.
+        let cpu_slot_a = 0x7F00_0000_0020usize;
+        let cpu_slot_b = 0x7F00_0010_0020usize;
+        let sv_slot_dst = 0x7F00_0020_0040usize;
+        let res_a = 0x7F00_AAAAusize;
+        let res_b = 0x7F00_BBBBusize;
+        note_descriptor(cpu_slot_a, 0, res_a, DXGI_FORMAT_R16G16B16A16_FLOAT.0, DXGI_FORMAT_R16G16B16A16_TYPELESS.0, true);
+        note_descriptor(cpu_slot_b, 0, res_b, DXGI_FORMAT_R8G8B8A8_UNORM.0, DXGI_FORMAT_R8G8B8A8_UNORM.0, false);
+        copy_descriptor(cpu_slot_a, 0, sv_slot_dst, 1_100_002);
+        {
+            let g = VIEW_SLOTS.read().unwrap();
+            let vs = g.as_ref().unwrap();
+            assert_eq!(vs.by_addr.get(&sv_slot_dst).map(|v| v.res), Some(res_a));
+            assert_eq!(vs.by_idx.get(&1_100_002).map(|v| v.res), Some(res_a));
+        }
+        forget_resource(res_a);
+        note_descriptor(cpu_slot_b, 0, 0, 0, 0, false);
     }
 }

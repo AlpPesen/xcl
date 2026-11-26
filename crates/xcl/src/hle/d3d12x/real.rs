@@ -2886,8 +2886,9 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
             );
         }
     }
+    let amb_idx = if slot.shared_srv != 0 { slot.index } else { 0 };
     let Some(rdesc) = rdesc_opt else {
-        super::ambient::note_descriptor(slot.index, 0, 0, 0, false);
+        super::ambient::note_descriptor(slot.at, amb_idx, 0, 0, 0, false);
         // A null image SRV was already created and published at `slot.index`. Writing `[0; 8]`
         // would point shaders at `ResourceDescriptorHeap[0]` (memory window 0 / uninitialized),
         // so write a valid T# referencing `slot.index` with the view's format class and type.
@@ -2901,12 +2902,12 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         return super::console_heap::write(&slot, &[0; 8]);
     };
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-        super::ambient::note_descriptor(slot.index, 0, 0, 0, false);
+        super::ambient::note_descriptor(slot.at, amb_idx, 0, 0, 0, false);
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, true));
     }
-    super::ambient::note_descriptor(slot.index, res as usize, desc.as_ref().map_or(rdesc.Format.0, |v| v.Format.0), rdesc.Format.0, false);
+    super::ambient::note_descriptor(slot.at, amb_idx, res as usize, desc.as_ref().map_or(rdesc.Format.0, |v| v.Format.0), rdesc.Format.0, false);
     match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
         Some(t) => super::console_heap::write(&slot, &t),
         None => {
@@ -3299,8 +3300,9 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     pc_uav(slot.pc_uav);
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
+    let amb_idx = if slot.shared_srv != 0 { slot.index } else { 0 };
     let Some(r) = ID3D12Resource::from_raw_borrowed(&uav_res) else {
-        super::ambient::note_descriptor(slot.index, 0, 0, 0, true);
+        super::ambient::note_descriptor(slot.at, amb_idx, 0, 0, 0, true);
         // A null image UAV was already created and published at `slot.index + 1`. Create a
         // matching null companion SRV at `slot.index` and write a valid T# referencing
         // `slot.index` so shaders never fall back to `ResourceDescriptorHeap[0]` / `[1]`.
@@ -3319,7 +3321,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     };
     let rd = uav_rd_opt.unwrap();
     if let Some(v) = uav_desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
-        super::ambient::note_descriptor(slot.index, 0, 0, 0, true);
+        super::ambient::note_descriptor(slot.at, amb_idx, 0, 0, 0, true);
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, false));
@@ -3340,7 +3342,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         }
         None => (rd.Format, resource_dim_to_view(&rd), rd.DepthOrArraySize as u32, 0),
     };
-    super::ambient::note_descriptor(slot.index, uav_res as usize, format.0, rd.Format.0, true);
+    super::ambient::note_descriptor(slot.at, amb_idx, uav_res as usize, format.0, rd.Format.0, true);
     let Some((fmt, ty, w, h, d, _)) = view_shape(r, format, dim, array, 1) else {
         note_buffer_view();
         return super::console_heap::write(&slot, &[0; 8]);

@@ -3588,6 +3588,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         ) {
             Ok(true) => {
                 super::culprit::after_dispatch(list, mark);
+                if super::ambient::has_compute_psos() {
+                    let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
+                    super::ambient::after_compute_dispatch(this, pso, [0, 0, 0], layout.as_deref(), &args, view_heap);
+                }
                 with(this, |s| {
                     s.pc_abi_cs = AbiBound::default();
                     s.arg_order_clean = false;
@@ -3665,6 +3669,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
             super::culprit::after_dispatch(list, mark);
             if compute {
+                if super::ambient::has_compute_psos() {
+                    let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
+                    super::ambient::after_compute_dispatch(this, pso, [0, 0, 0], layout.as_deref(), &args, view_heap);
+                }
                 with(this, |s| {
                     s.arg_order_clean = false;
                     s.prelude_blocked = true;
@@ -4493,8 +4501,8 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     let r = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
     super::culprit::after_dispatch(list, mark);
     if super::ambient::has_compute_psos() {
-        let (layout, args) = with(this, |s| (s.layout.clone(), s.args.clone()));
-        super::ambient::after_compute_dispatch(this, pso, [x, y, z], layout.as_deref(), &args);
+        let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
+        super::ambient::after_compute_dispatch(this, pso, [x, y, z], layout.as_deref(), &args, view_heap);
     }
     with(this, |s| {
         s.arg_order_clean = false;

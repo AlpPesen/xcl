@@ -738,6 +738,7 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     let n = if src.sampler { 4 } else { 8 };
     let mut w = [0u32; 8];
     unsafe { std::ptr::copy_nonoverlapping(src.at as *const u32, w.as_mut_ptr(), n) };
+    let src_w0 = w[0];
     if src.sampler {
         w[3] = (w[3] & !0xFFF) | (dst.index & 0xFFF);
     } else if w[3] >> 28 >= 8 {
@@ -749,7 +750,9 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
             note_resource(dst, resource_at(src.at).unwrap_or(0));
         }
         if w[3] >> 28 >= 8 {
-            super::ambient::copy_descriptor(src.index, dst.index);
+            let src_idx = if src.shared_srv != 0 { src_w0 } else { 0 };
+            let dst_idx = if dst.shared_srv != 0 { dst.index } else { 0 };
+            super::ambient::copy_descriptor(src.at, src_idx, dst.at, dst_idx);
         }
     }
 }
@@ -801,6 +804,7 @@ pub fn copy_words_range(dst: u64, src: u64, n: u32) -> bool {
             };
             let mut w = [0u32; 8];
             unsafe { std::ptr::copy_nonoverlapping(src_at as *const u32, w.as_mut_ptr(), words_n) };
+            let src_w0 = w[0];
             let is_tex = !sampler && (w[3] >> 28 >= 8);
             if sampler {
                 w[3] = (w[3] & !0xFFF) | (dst_idx & 0xFFF);
@@ -819,11 +823,9 @@ pub fn copy_words_range(dst: u64, src: u64, n: u32) -> bool {
                 }
             }
             if is_tex {
-                let src_idx = match s_page {
-                    Some((first, k0)) => first + 2 * (ksi - k0),
-                    None => view_unmapped_index(s_hosted, ksi),
-                };
-                super::ambient::copy_descriptor(src_idx, dst_idx);
+                let src_global = if s_hosted && s_page.is_some() { src_w0 } else { 0 };
+                let dst_global = if d_hosted && d_page.is_some() { dst_idx } else { 0 };
+                super::ambient::copy_descriptor(src_at, src_global, dst_at, dst_global);
             }
         }
         done += run;
