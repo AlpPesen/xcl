@@ -233,9 +233,9 @@ struct State {
     /// video-memory pool heaps (None: given back, its index free for the next one)
     pools: Vec<Option<ID3D12Heap>>,
     free: Vec<(u32, u32)>,
-    /// pools all of whose tiles came free: released once the GPU is past `value` and a moment
-    /// went by (titles' queues may still read what was mapped there)
-    retired: Vec<(ID3D12Heap, u64, std::time::Instant)>,
+    /// pools all of whose tiles came free: released once the GPU is past `(value, rb_done_value)`
+    /// and a moment went by (titles' queues and `rb_queue` may still read what was mapped there)
+    retired: Vec<(ID3D12Heap, u64, u64, std::time::Instant)>,
     /// tile address → pool tile + uncommitted page hole mask + per-page sent chunk hashes
     mapped: FxHashMap<usize, TileEntry>,
     /// pool tiles also used by placed buffers (not freed while they are)
@@ -656,7 +656,7 @@ impl State {
         // 64 MB heap is made: freeing and allocating a tile in turn made a new pool each time,
         // up to 18 GB of retired heaps in 2 s (#913). Its tiles are reused as freed tiles are
         // (zeroed), so this is no less safe than reusing a tile of a pool in use.
-        if let Some((heap, _, _)) = self.retired.pop() {
+        if let Some((heap, _, _, _)) = self.retired.pop() {
             let h = self.add_pool(heap);
             return Some(((h, 0), true));
         }
@@ -699,7 +699,8 @@ impl State {
     fn retire_free_pools(&mut self) {
         let now = std::time::Instant::now();
         let done = unsafe { self.fence.GetCompletedValue() };
-        self.retired.retain(|(_, v, at)| !(done >= *v && now.duration_since(*at).as_secs() >= 2));
+        let rb_done = unsafe { self.rb_done_fence.GetCompletedValue() };
+        self.retired.retain(|(_, v, rb_v, at)| !(done >= *v && rb_done >= *rb_v && now.duration_since(*at).as_secs() >= 2));
         if self.free.len() < POOL_TILES as usize {
             return;
         }
@@ -714,7 +715,7 @@ impl State {
         self.free.retain(|&(h, _)| !gone.contains(&(h as usize)));
         for h in gone {
             if let Some(heap) = self.pools[h].take() {
-                self.retired.push((heap, self.value, now));
+                self.retired.push((heap, self.value, self.rb_done_value, now));
             }
         }
     }
@@ -2057,9 +2058,13 @@ impl State {
         }
         self.signal();
         if !tiles.is_empty() {
+            let mut marks = vec![(self.fence.clone(), self.value)];
+            if self.rb_done_value > 0 {
+                marks.push((self.rb_done_fence.clone(), self.rb_done_value));
+            }
             self.quarantined.push_back(RetiredTiles {
                 tiles,
-                marks: Some(vec![(self.fence.clone(), self.value)]),
+                marks: Some(marks),
             });
         }
     }
@@ -2132,7 +2137,12 @@ impl State {
             return false;
         }
         let entries: Vec<(usize, (u32, u32))> = std::mem::take(&mut self.parked).into_iter().collect();
-        let title_marks = self.signal_title_queues_for(queues);
+        let mut title_marks = self.signal_title_queues_for(queues);
+        if self.rb_done_value > 0 {
+            if let Some(marks) = title_marks.as_mut() {
+                marks.push((self.rb_done_fence.clone(), self.rb_done_value));
+            }
+        }
         if title_marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v)) {
             self.unmap_entries_and_quarantine(entries);
         } else {
