@@ -97,6 +97,62 @@ pub(crate) fn unmark(page: usize) -> bool {
     LAZY.write().unwrap_or_else(|e| e.into_inner()).remove(&page)
 }
 
+/// `[p, p + len)` is decommitted or released: its lazy pages are not lazy any more. One it
+/// covers in part is committed first (the rest of it stays the title's memory).
+pub(crate) fn unmark_range(p: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = p.saturating_add(len);
+    let (whole, part): (Vec<usize>, Vec<usize>) = {
+        let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
+        if g.is_empty() {
+            return;
+        }
+        g.range(p & !(PAGE - 1)..end).copied().partition(|&x| x >= p && x.saturating_add(PAGE) <= end)
+    };
+    if !whole.is_empty() {
+        let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
+        for x in whole {
+            g.remove(&x);
+        }
+    }
+    for x in part {
+        unsafe { commit(x) };
+    }
+}
+
+/// The lazy pages of `[p, p + len)` committed now (before a call that needs them committed,
+/// as VirtualProtect does; no guard is opened).
+pub(crate) fn commit_range(p: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let pages: Vec<usize> = {
+        let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
+        if g.is_empty() {
+            return;
+        }
+        g.range(p & !(PAGE - 1)..p.saturating_add(len)).copied().collect()
+    };
+    for page in pages {
+        unsafe { commit(page) };
+    }
+}
+
+/// Where the run of lazy pages from `page` (64 KiB aligned) ends (`page` itself: not lazy).
+pub fn lazy_run_end(page: usize) -> usize {
+    let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
+    let mut end = page;
+    for &x in g.range(page..) {
+        if x != end {
+            break;
+        }
+        end += PAGE;
+    }
+    end
+}
+
 /// The lazy pages of `[p, p + len)` committed – memory a kernel call or XCL writes. Views of
 /// physical pages there are read-only until written and a kernel call cannot fault: they are
 /// opened, and stay open while the returned value lives (hold it across the write).

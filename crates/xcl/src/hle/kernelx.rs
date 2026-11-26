@@ -429,11 +429,27 @@ const MEM_64K_PAGES: u32 = 0x2040_0000;
 /// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
 /// memory (`d3d12x::sparse`).
 unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
-    let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, sanitize_protect(p));
-    if !q.is_null() {
-        crate::hle::d3d12x::sparse::committed(q as usize, n);
+    crate::hle::d3d12x::sparse::commit_title(a, n, sanitize_protect(p))
+}
+
+/// A lazy page (`lazy`: the title's memory, committed on the CPU's first touch) reads as the
+/// committed read-write memory it is to the title.
+unsafe fn lazy_as_committed(mbi: *mut mem::MEMORY_BASIC_INFORMATION) {
+    let m = &mut *mbi;
+    if m.State != mem::MEM_RESERVE {
+        return;
     }
-    q
+    let base = m.BaseAddress as usize;
+    let page = base & !0xFFFF;
+    if !lazy::is_lazy(page) {
+        return;
+    }
+    let end = lazy::lazy_run_end(page).min(base.saturating_add(m.RegionSize));
+    if end > base {
+        m.State = mem::MEM_COMMIT;
+        m.Protect = mem::PAGE_READWRITE;
+        m.RegionSize = end - base;
+    }
 }
 
 pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
@@ -487,7 +503,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             crate::gpu::uma::GRAIN
         };
         let rounded = size.max(1).div_ceil(align) * align;
-        if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+        if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc_title(rounded, align) {
             trace_mem("VirtualAlloc (graphics, sparse VRAM)", 0, rounded, t as u64, p, q);
             return q as *mut c_void;
         }
@@ -733,6 +749,8 @@ pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void,
 }
 
 pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
+    // (a lazy page is the title's committed memory: Windows protects committed pages only)
+    lazy::commit_range(addr as usize, size);
     mem::VirtualProtect(addr, size, sanitize_protect(p), old)
 }
 
@@ -809,7 +827,7 @@ pub unsafe extern "system" fn XMemAllocDefault(size: usize, attrs: u64) -> *mut 
         return std::ptr::null_mut();
     };
     // Graphics memory types live in the sparse VRAM pool (fallback to coherent UMA, then Windows).
-    if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+    if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc_title(rounded, align) {
         trace_mem("XMemAlloc (graphics, sparse VRAM)", 0, rounded, attrs, 0, q);
         return q as *mut c_void;
     }
@@ -945,7 +963,11 @@ pub unsafe extern "system" fn VirtualQuery(address: *const c_void, mbi: *mut mem
     if let Some(n) = query_committed_window(address, mbi, len) {
         return n;
     }
-    mem::VirtualQuery(address, mbi, len)
+    let n = mem::VirtualQuery(address, mbi, len);
+    if n != 0 && len >= std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>() {
+        lazy_as_committed(mbi);
+    }
+    n
 }
 
 pub unsafe extern "system" fn VirtualQueryEx(process: HANDLE, address: *const c_void, mbi: *mut mem::MEMORY_BASIC_INFORMATION, len: usize) -> usize {
@@ -953,6 +975,11 @@ pub unsafe extern "system" fn VirtualQueryEx(process: HANDLE, address: *const c_
         if let Some(n) = query_committed_window(address, mbi, len) {
             return n;
         }
+        let n = mem::VirtualQueryEx(process, address, mbi, len);
+        if n != 0 && len >= std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>() {
+            lazy_as_committed(mbi);
+        }
+        return n;
     }
     mem::VirtualQueryEx(process, address, mbi, len)
 }
@@ -990,6 +1017,9 @@ pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const 
     }
     if mem::VirtualQueryEx(process, address, mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()) == 0 {
         return 0;
+    }
+    if is_current_process(process) {
+        lazy_as_committed(mbi);
     }
     const READABLE: u32 = mem::PAGE_READONLY
         | mem::PAGE_READWRITE

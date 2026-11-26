@@ -1723,6 +1723,101 @@ pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
     Some((addr, rounded))
 }
 
+/// `alloc` for the title's own memory: its CPU pages are committed when the CPU first touches
+/// them (`commit_title`).
+pub unsafe fn alloc_title(size: usize, align: usize) -> Option<(usize, usize)> {
+    let u = crate::gpu::uma::get()?;
+    let (addr, rounded) = u.sparse_alloc(size, align)?;
+    if commit_title(addr, rounded, PAGE_READWRITE).is_null() {
+        u.sparse_release(addr);
+        return None;
+    }
+    Some((addr, rounded))
+}
+
+/// The title commits `[a, a + n)` in a sparse window with the protection `protect`: as
+/// `committed`, but the CPU's copy of a whole 64 KiB page is made when the CPU first touches it
+/// (`kernelx::lazy`). Returns the address, or null as VirtualAlloc does.
+///
+/// A title page in a sparse window was committed on the CPU as well as mapped to a tile of
+/// video memory. A retail title's render targets, depth buffers and GPU-written buffers there
+/// took system memory and commit the CPU never touched, and each write-watch look walked them
+/// (2-4 GB of tiles, ~5 ms a look, ~90 looks a second). Such a page's tile is now video memory
+/// only (all holes: the look leaves it out and no upload writes it) until the CPU's first
+/// access commits the page (zeros, as a new commit holds); from then on its writes are watched
+/// and uploaded as before. Pages at the ends that do not fill a 64 KiB page, pages already
+/// committed, another protection than read-write, and commits before the device exists are
+/// committed now, as before.
+pub unsafe fn commit_title(a: usize, n: usize, protect: u32) -> *mut c_void {
+    let eager = |a: usize, n: usize| -> bool {
+        if n == 0 {
+            return true;
+        }
+        if VirtualAlloc(a as *const c_void, n, MEM_COMMIT, protect).is_null() {
+            return false;
+        }
+        committed(a, n);
+        true
+    };
+    let (lo, hi) = ((a + TILE - 1) & !(TILE - 1), a.saturating_add(n) & !(TILE - 1));
+    if protect != PAGE_READWRITE || hi <= lo || lock_state().is_none() {
+        return if eager(a, n) { a as *mut c_void } else { std::ptr::null_mut() };
+    }
+    if !eager(a, lo - a) || !eager(hi, a + n - hi) {
+        return std::ptr::null_mut();
+    }
+    // the pages committed already (the title commits a range again) stay as they are
+    let mut lazy: Vec<(usize, usize)> = Vec::new();
+    let mut at = lo;
+    while at < hi {
+        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
+            return std::ptr::null_mut();
+        }
+        let end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(hi).max(at + PAGE);
+        if m.State == MEM_COMMIT {
+            committed(at, end - at);
+        } else {
+            // whole 64 KiB pages lazy; a part of one at either end now
+            let s = ((at + TILE - 1) & !(TILE - 1)).min(end);
+            let e = (end & !(TILE - 1)).max(s);
+            if !eager(at, s - at) {
+                return std::ptr::null_mut();
+            }
+            if e > s {
+                lazy.push((s, e - s));
+            }
+            if !eager(e, end - e) {
+                return std::ptr::null_mut();
+            }
+        }
+        at = end;
+    }
+    {
+        let mut g = lock_state();
+        let Some(s) = g.as_mut() else { return std::ptr::null_mut() };
+        for &(p, len) in &lazy {
+            s.ensure_mapped(p, len, |_| 0xFFFF);
+        }
+    }
+    // (marked after their tiles are mapped: a first touch finds them, `drain_lazy_commits`)
+    for &(p, len) in &lazy {
+        for page in (p..p + len).step_by(TILE) {
+            crate::hle::kernelx::lazy::mark(page);
+        }
+        LAZY_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+    }
+    a as *mut c_void
+}
+
+/// Bytes of the title's commits in the sparse windows that `commit_title` left lazy so far
+/// (some of them committed since by a first touch, some decommitted).
+pub fn lazy_title_bytes() -> u64 {
+    LAZY_BYTES.load(Ordering::Relaxed)
+}
+
+static LAZY_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// Allocate a zeroed, write-watched block strictly inside sparse window `window` (e.g.
 /// window 0 for 32-bit-addressed descriptor heaps). Returns `(address, rounded_size)`.
 pub unsafe fn alloc_in(window: usize, size: usize, align: usize) -> Option<(usize, usize)> {
@@ -2224,6 +2319,8 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
     }
+    // (pages `commit_title` left lazy go with them)
+    crate::hle::kernelx::lazy::unmark_range(a, n);
     let mut g = lock_state();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
