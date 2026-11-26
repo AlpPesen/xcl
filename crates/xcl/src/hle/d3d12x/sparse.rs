@@ -253,8 +253,8 @@ struct State {
     /// unpinned unused pool tiles queued from `forget_in` (cannot signal queues under D3D12 release locks)
     /// until `flush_pending_quarantine` places them behind GPU fences
     pending_quarantine: Vec<(u32, u32)>,
-    /// per-title-queue fences used to mark in-flight GPU work (`note_queue`)
-    queue_fences: FxHashMap<usize, (ID3D12CommandQueue, ID3D12Fence, u64)>,
+    /// per-title-queue fences used to mark in-flight GPU work (non-owning raw queue key → fence + value)
+    queue_fences: FxHashMap<usize, (ID3D12Fence, u64)>,
     /// placed buffers → the pool tiles they use
     buffers: FxHashMap<usize, Vec<(u32, u32)>>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
@@ -1362,7 +1362,6 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.drain_lazy_commits();
-    s.note_queue(queue);
     let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
     if filtered.is_empty() {
         return;
@@ -1454,18 +1453,78 @@ fn return_readback_job(job: ReadbackJob) {
     }
 }
 
+/// Apply GPU readback bytes for `[dst, dst + len)` into host memory, comparing each 64-byte
+/// chunk's current host bytes against its Phase-1 `snap_hashes` entry so any chunk modified by
+/// the CPU during the GPU wait is NOT clobbered (and its `sent` hash remains stale so the next
+/// `before_execute` uploads the CPU's write). Updates `snap_hashes` for copied chunks so a
+/// multi-batch readback splitting a 64-byte chunk across `job.cap` preserves continuity.
+unsafe fn apply_readback_preserving_cpu_writes(
+    dst: usize,
+    src: *const u8,
+    len: usize,
+    snap_base: usize,
+    snap_hashes: &mut [u64],
+    mapped: &mut FxHashMap<usize, TileEntry>,
+) {
+    let mut at = dst;
+    let mut src_off = 0usize;
+    let end = dst + len;
+    while at < end {
+        let pg = at & !(PAGE - 1);
+        let t = pg & !(TILE - 1);
+        let page_idx = (pg - t) / PAGE;
+        let page_end = (pg + PAGE).min(end);
+        if let Some(entry) = mapped.get_mut(&t).filter(|e| e.holes & (1u16 << page_idx) == 0) {
+            while at < page_end {
+                let chunk_va = at & !(CHUNK - 1);
+                let chunk_end = (chunk_va + CHUNK).min(page_end);
+                let step = chunk_end - at;
+                let snap_i = (chunk_va - snap_base) / CHUNK;
+                if let Some(expected) = snap_hashes.get_mut(snap_i) {
+                    let cur_slice = std::slice::from_raw_parts(chunk_va as *const u8, CHUNK);
+                    if chunk_hash(cur_slice) == *expected {
+                        std::ptr::copy_nonoverlapping(src.add(src_off), at as *mut u8, step);
+                        let new_h = chunk_hash(std::slice::from_raw_parts(chunk_va as *const u8, CHUNK));
+                        *expected = new_h;
+                        let k = (chunk_va - pg) / CHUNK;
+                        if let Some(sent) = entry.sent[page_idx].as_deref_mut() {
+                            sent[k] = new_h;
+                        } else if new_h != ZERO_HASH {
+                            let sent = entry.sent[page_idx].insert(Box::new(ZERO_HASHES));
+                            sent[k] = new_h;
+                        }
+                    }
+                }
+                at += step;
+                src_off += step;
+            }
+        } else {
+            let step = page_end - at;
+            at += step;
+            src_off += step;
+        }
+    }
+}
+
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
 /// a non-empty read range, or `Map(0, NULL)` on a sparse readback resource): flushes pending
-/// tile clears and unsubmitted CPU-changed chunks first so CPU writes are preserved, then
-/// copies the range back from VRAM into CPU memory using a per-call pooled `ReadbackJob` whose
-/// GPU fence wait runs OUTSIDE the global `STATE` lock.
+/// tile clears and unsubmitted CPU-changed chunks first so CPU writes are preserved, orders
+/// `s.queue` behind active title queues via `rb_fence` before copying, and copies the range
+/// back from VRAM into CPU memory using a per-call pooled `ReadbackJob` whose GPU fence wait
+/// runs OUTSIDE the global `STATE` lock without clobbering concurrent CPU writes.
 pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    // 1. Flush pending clears & dirty CPU chunks under `STATE`, collect mapped spans, then release
-    //    `STATE` before recording/waiting so other `Map` threads and `before_execute` never stall.
-    let (dev, spans): (ID3D12Device, Vec<(usize, ID3D12Resource, u64, usize)>) = {
+    let end = va.saturating_add(len);
+    let snap_base = va & !(CHUNK - 1);
+    let snap_end = end.saturating_add(CHUNK - 1) & !(CHUNK - 1);
+    let snap_count = (snap_end - snap_base) / CHUNK;
+
+    // 1. Flush pending clears & dirty CPU chunks under `STATE`, snapshot Phase-1 64-byte chunk
+    //    hashes, collect mapped spans, then release `STATE` before recording/waiting so other
+    //    `Map` threads and `before_execute` never stall.
+    let (dev, spans, mut snap_hashes): (ID3D12Device, Vec<(usize, ID3D12Resource, u64, usize)>, Vec<u64>) = {
         let mut g = lock_state();
         let Some(s) = g.as_mut() else { return };
         if s.window_index(va).is_none() {
@@ -1479,10 +1538,11 @@ pub unsafe fn readback_now(va: usize, len: usize) {
             }
             s.upload_zeros(&zeroed);
         }
-        // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)`
+        // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)` and snapshot
+        // each 64-byte chunk's Phase-1 hash so Phase 3 never clobbers concurrent CPU writes.
         let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
+        let mut snap_hashes = vec![ZERO_HASH; snap_count];
         let mut pg = va & !(PAGE - 1);
-        let end = va + len;
         while pg < end {
             let t = pg & !(TILE - 1);
             let tile_end = (t + TILE).min(end);
@@ -1493,6 +1553,16 @@ pub unsafe fn readback_now(va: usize, len: usize) {
                     if entry.holes & (1u16 << idx) == 0 {
                         let bytes = std::slice::from_raw_parts(p as *const u8, PAGE);
                         scan_page(bytes, p, &mut entry.sent[idx], &mut dirty_runs);
+                        if let Some(sent) = entry.sent[idx].as_deref() {
+                            let lo = va.saturating_sub(p) / CHUNK;
+                            let hi = (end.min(p + PAGE) - p).div_ceil(CHUNK).min(CHUNKS);
+                            for k in lo..hi {
+                                let snap_i = (p + k * CHUNK - snap_base) / CHUNK;
+                                if let Some(dst_h) = snap_hashes.get_mut(snap_i) {
+                                    *dst_h = sent[k];
+                                }
+                            }
+                        }
                     }
                     p += PAGE;
                 }
@@ -1522,13 +1592,14 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         if spans.is_empty() {
             return;
         }
-        (s.dev.clone(), spans)
+        (s.dev.clone(), spans, snap_hashes)
     };
 
     let total_need: usize = spans.iter().map(|s| s.3).sum();
     let Some(job) = take_readback_job(&dev, total_need) else {
         let mut g = lock_state();
         if let Some(s) = g.as_mut() {
+            s.wait_title_queues_for_readback();
             s.readback_ranges(&[(va, len)]);
         }
         return;
@@ -1538,6 +1609,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     let mut sub_off = 0usize;
     let mut pending: Vec<(usize, usize, usize)> = Vec::new();
     let mut job_idle = true;
+    let mut waited_title_queues = false;
     while idx < spans.len() {
         let mut used = 0usize;
         pending.clear();
@@ -1561,11 +1633,16 @@ pub unsafe fn readback_now(va: usize, len: usize) {
             break;
         }
         let Ok(cmd_list) = job.list.cast::<ID3D12CommandList>() else { break };
-        // 2. Submit & signal atomically under `STATE` (strictly ordered after our uploads on `s.queue`),
-        //    then release `STATE` BEFORE waiting on the GPU fence.
+        // 2. Order `s.queue` behind active title queues via `rb_fence`, then submit & signal
+        //    atomically under `STATE` (ordered after our uploads on `s.queue`) and release
+        //    `STATE` BEFORE waiting on the GPU fence.
         let wait_target = {
             let mut g = lock_state();
             let Some(s) = g.as_mut() else { break };
+            if !waited_title_queues {
+                s.wait_title_queues_for_readback();
+                waited_title_queues = true;
+            }
             super::title_textures::own_work(|| {
                 s.queue.ExecuteCommandLists(&[Some(cmd_list)]);
             });
@@ -1585,26 +1662,13 @@ pub unsafe fn readback_now(va: usize, len: usize) {
                 break;
             }
         }
-        // 3. Copy only still-committed non-hole bytes into host memory and sync `sent` hashes.
+        // 3. Copy only still-committed non-hole 64-byte chunks that were NOT modified by the CPU
+        //    during the GPU wait, and sync `sent` hashes only for copied chunks.
         let mut g = lock_state();
         let Some(s) = g.as_mut() else { break };
         let p = job.mapped as *const u8;
         for &(dst, off, chunk) in &pending {
-            let mut at = dst;
-            let mut src_off = off;
-            let end = dst + chunk;
-            while at < end {
-                let pg = at & !(PAGE - 1);
-                let t = pg & !(TILE - 1);
-                let page_idx = (pg - t) / PAGE;
-                let step = (pg + PAGE).min(end) - at;
-                if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << page_idx) == 0) {
-                    std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
-                }
-                at += step;
-                src_off += step;
-            }
-            s.sync_sent_range(dst, chunk);
+            apply_readback_preserving_cpu_writes(dst, p.add(off), chunk, snap_base, &mut snap_hashes, &mut s.mapped);
         }
         s.reclaim_ring();
     }
@@ -1734,6 +1798,19 @@ impl State {
     /// Move any `pending_quarantine` tiles (unpinned when a placed buffer was released) into the
     /// GPU fence quarantine behind `self.fence` and every known title queue.
     unsafe fn flush_pending_quarantine(&mut self) -> bool {
+        self.flush_pending_quarantine_with(None)
+    }
+
+    unsafe fn flush_pending_quarantine_with(&mut self, extra: Option<&ID3D12CommandQueue>) -> bool {
+        if self.pending_quarantine.is_empty() {
+            return false;
+        }
+        let raw_ptrs = collect_known_queue_ptrs(extra);
+        let borrowed: Vec<&ID3D12CommandQueue> = raw_ptrs.iter().filter_map(|p| ID3D12CommandQueue::from_raw_borrowed(p)).collect();
+        self.flush_pending_quarantine_for(&borrowed)
+    }
+
+    unsafe fn flush_pending_quarantine_for(&mut self, queues: &[&ID3D12CommandQueue]) -> bool {
         if self.pending_quarantine.is_empty() {
             return false;
         }
@@ -1751,52 +1828,70 @@ impl State {
         if tiles.is_empty() {
             return false;
         }
-        self.quarantine_tiles(tiles);
+        self.quarantine_tiles_for(tiles, queues);
         true
     }
 
-    unsafe fn note_queue(&mut self, q: &ID3D12CommandQueue) -> bool {
-        let key = q.as_raw() as usize;
-        if self.queue_fences.contains_key(&key) {
-            return true;
-        }
-        // Ignore queues belonging to a different device (e.g. isolated unit tests).
-        let mut qdev: Option<ID3D12Device> = None;
-        if q.GetDevice(&mut qdev).is_err() || qdev.as_ref().is_none_or(|d| d.as_raw() != self.dev.as_raw()) {
-            return true;
-        }
-        match self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
-            Ok(fence) => {
-                self.queue_fences.insert(key, (q.clone(), fence, 0));
-                true
-            }
-            Err(_) => false,
-        }
-    }
-
-    unsafe fn sync_known_queues(&mut self) -> bool {
-        let mut ok = true;
+    /// Order `self.queue` behind every active same-device title queue via `self.rb_fence`
+    /// so a subsequent sparse readback sees all submitted GPU writes.
+    unsafe fn wait_title_queues_for_readback(&mut self) {
+        let self_q = self.queue.as_raw() as usize;
+        let self_dev = self.dev.as_raw();
+        let mut seen: Vec<usize> = Vec::new();
         for raw in super::present::known_queues() {
-            if !self.queue_fences.contains_key(&raw) {
-                let ptr = raw as *mut c_void;
-                if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&ptr) {
-                    ok &= self.note_queue(q);
-                }
+            if raw == 0 || raw == self_q || seen.contains(&raw) {
+                continue;
+            }
+            let ptr = raw as *mut c_void;
+            let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&ptr) else {
+                continue;
+            };
+            let mut qdev: Option<ID3D12Device> = None;
+            if q.GetDevice(&mut qdev).is_err() || qdev.as_ref().is_none_or(|d| d.as_raw() != self_dev) {
+                continue;
+            }
+            seen.push(raw);
+            self.rb_value += 1;
+            let v = self.rb_value;
+            if q.Signal(&self.rb_fence, v).is_ok() {
+                let _ = self.queue.Wait(&self.rb_fence, v);
+                super::list_x::note_internal_wait(self_q, "sparse readback behind a title queue", &self.rb_fence, v);
             }
         }
-        ok
     }
 
-    unsafe fn signal_title_queues(&mut self) -> Option<Vec<(ID3D12Fence, u64)>> {
-        if !self.sync_known_queues() {
-            return None;
+    unsafe fn signal_title_queues_for(&mut self, queues: &[&ID3D12CommandQueue]) -> Option<Vec<(ID3D12Fence, u64)>> {
+        // Pass 1 (before signaling): deduplicate live same-device title queues and prune stale
+        // queue fences unconditionally so an early error cannot prune another live queue.
+        let self_q = self.queue.as_raw() as usize;
+        let mut active: Vec<(usize, &ID3D12CommandQueue)> = Vec::with_capacity(queues.len());
+        let mut live_keys: Vec<usize> = Vec::with_capacity(queues.len());
+        for &q in queues {
+            let key = q.as_raw() as usize;
+            if key == 0 || key == self_q || live_keys.contains(&key) {
+                continue;
+            }
+            let mut qdev: Option<ID3D12Device> = None;
+            if q.GetDevice(&mut qdev).is_err() || qdev.as_ref().is_none_or(|d| d.as_raw() != self.dev.as_raw()) {
+                continue;
+            }
+            live_keys.push(key);
+            active.push((key, q));
         }
-        let mut marks = Vec::with_capacity(self.queue_fences.len());
-        for (q, fence, val) in self.queue_fences.values_mut() {
-            let next = *val + 1;
-            if q.Signal(&*fence, next).is_ok() {
-                *val = next;
-                marks.push((fence.clone(), next));
+        self.queue_fences.retain(|k, _| live_keys.contains(k));
+        let mut marks = Vec::with_capacity(active.len());
+        for (key, q) in active {
+            let entry = match self.queue_fences.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => match self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+                    Ok(fence) => e.insert((fence, 0)),
+                    Err(_) => return None,
+                },
+            };
+            let next = entry.1 + 1;
+            if q.Signal(&entry.0, next).is_ok() {
+                entry.1 = next;
+                marks.push((entry.0.clone(), next));
             } else {
                 return None;
             }
@@ -1804,11 +1899,11 @@ impl State {
         Some(marks)
     }
 
-    unsafe fn quarantine_tiles(&mut self, tiles: Vec<(u32, u32)>) {
+    unsafe fn quarantine_tiles_for(&mut self, tiles: Vec<(u32, u32)>, queues: &[&ID3D12CommandQueue]) {
         if tiles.is_empty() {
             return;
         }
-        let marks = self.signal_title_queues().map(|mut title_marks| {
+        let marks = self.signal_title_queues_for(queues).map(|mut title_marks| {
             title_marks.push((self.fence.clone(), self.value));
             title_marks
         });
@@ -1899,12 +1994,26 @@ impl State {
     /// inserting a cross-queue GPU `Wait` on `self.queue`). When no title queues are busy, unmaps
     /// immediately on `self.queue` and quarantines unpinned pool tiles behind `self.fence`.
     unsafe fn flush_parked(&mut self) -> bool {
+        self.flush_parked_with(None)
+    }
+
+    unsafe fn flush_parked_with(&mut self, extra: Option<&ID3D12CommandQueue>) -> bool {
+        self.drain_pending_unmaps();
+        if self.parked.is_empty() {
+            return false;
+        }
+        let raw_ptrs = collect_known_queue_ptrs(extra);
+        let borrowed: Vec<&ID3D12CommandQueue> = raw_ptrs.iter().filter_map(|p| ID3D12CommandQueue::from_raw_borrowed(p)).collect();
+        self.flush_parked_for(&borrowed)
+    }
+
+    unsafe fn flush_parked_for(&mut self, queues: &[&ID3D12CommandQueue]) -> bool {
         self.drain_pending_unmaps();
         if self.parked.is_empty() {
             return false;
         }
         let entries: Vec<(usize, (u32, u32))> = std::mem::take(&mut self.parked).into_iter().collect();
-        let title_marks = self.signal_title_queues();
+        let title_marks = self.signal_title_queues_for(queues);
         if title_marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v)) {
             self.unmap_entries_and_quarantine(entries);
         } else {
@@ -1917,6 +2026,18 @@ impl State {
         }
         true
     }
+}
+
+fn collect_known_queue_ptrs(extra: Option<&ID3D12CommandQueue>) -> Vec<*mut c_void> {
+    let mut raw_ptrs: Vec<*mut c_void> =
+        super::present::known_queues().into_iter().filter(|&raw| raw != 0).map(|raw| raw as *mut c_void).collect();
+    if let Some(q) = extra {
+        let p = q.as_raw();
+        if !p.is_null() && !raw_ptrs.contains(&p) {
+            raw_ptrs.push(p);
+        }
+    }
+    raw_ptrs
 }
 
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
@@ -1960,10 +2081,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.drain_lazy_commits();
-    s.note_queue(queue);
     // the title's work sees what was decommitted unmapped, as it was
-    let flushed = s.flush_parked();
-    let quarantined = s.flush_pending_quarantine();
+    let flushed = s.flush_parked_with(Some(queue));
+    let quarantined = s.flush_pending_quarantine_with(Some(queue));
     let drained = s.drain_quarantined();
     if flushed || quarantined || drained {
         s.retire_free_pools();
@@ -2674,7 +2794,9 @@ mod tests {
 
         let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
         let mut dev: Option<ID3D12Device> = None;
-        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+        if std::env::var("XCL_WARP").ok().as_deref() == Some("1")
+            || D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err()
+        {
             let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
             D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
         }
@@ -2780,7 +2902,6 @@ mod tests {
         unsafe {
             let (base, mut s) = test_state_with_reserved(2);
             let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
-            assert!(s.note_queue(&title_q));
 
             s.commit_range(base, TILE);
             let tile = s.mapped[&base].pool;
@@ -2792,7 +2913,7 @@ mod tests {
 
             s.decommit_range(base, TILE);
             s.free.clear();
-            assert!(s.flush_parked());
+            assert!(s.flush_parked_for(&[&title_q]));
 
             // Even after `s.queue` finishes `unmap_tiles`, `title_q` is still gated behind `title_gate`.
             s.wait_for(s.value);
@@ -2810,6 +2931,108 @@ mod tests {
             assert!(s.free.contains(&tile), "tile must return to free list after title queue completes");
             drop(_unblock);
             s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    unsafe fn com_refcount(q: &ID3D12CommandQueue) -> u32 {
+        let raw = q.as_raw() as *mut *const *const c_void;
+        let vt = *raw;
+        let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+        let _ = add_ref(raw as *mut c_void);
+        release(raw as *mut c_void)
+    }
+
+    #[test]
+    fn flush_parked_does_not_retain_title_queue_com_refs() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            let before = com_refcount(&title_q);
+            s.commit_range(base, TILE);
+            s.wait_for(s.value);
+            s.decommit_range(base, TILE);
+            assert!(s.flush_parked_for(&[&title_q]));
+            assert_eq!(com_refcount(&title_q), before, "flush_parked must not retain a strong COM ref on title queues");
+            assert_eq!(s.queue_fences.len(), 1);
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn flush_parked_prunes_stale_queue_fences_while_inflight_batches_stay_gated() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(2);
+            let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            let title_gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate fence");
+            let _unblock = SignalOnDrop(title_gate.clone(), 1);
+            title_q.Wait(&title_gate, 1).expect("gate title queue");
+
+            s.commit_range(base, TILE);
+            let tile_a = s.mapped[&base].pool;
+            s.commit_range(base + TILE, TILE);
+            let tile_b = s.mapped[&(base + TILE)].pool;
+            s.wait_for(s.value);
+
+            s.decommit_range(base, TILE);
+            s.free.clear();
+            assert!(s.flush_parked_for(&[&title_q]));
+            assert_eq!(s.queue_fences.len(), 1);
+
+            // Simulate title_q release before the next flush: stale fence entry is pruned,
+            // while batch A keeps its own fence clone in `marks` and stays gated.
+            s.decommit_range(base + TILE, TILE);
+            assert!(s.flush_parked_for(&[]));
+            assert!(s.queue_fences.is_empty(), "stale queue fence must be pruned");
+            s.wait_for(s.value);
+            s.drain_quarantined();
+            assert!(!s.free.contains(&tile_a) && !s.pending_unmaps.is_empty(), "in-flight batch A must stay gated");
+
+            title_gate.Signal(1).expect("release title queue");
+            let start = std::time::Instant::now();
+            while (!s.free.contains(&tile_a) || !s.free.contains(&tile_b)) && start.elapsed() < std::time::Duration::from_secs(5) {
+                s.drain_quarantined();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(s.free.contains(&tile_a) && s.free.contains(&tile_b), "both batches must drain after title_q completes");
+            drop(_unblock);
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn repeated_queue_quarantine_and_release_does_not_leak_queues_or_fences() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(2);
+            for i in 0..80usize {
+                let q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap_or_else(|e| panic!("queue {i}: {e}"));
+                let before = com_refcount(&q);
+                s.commit_range(base, TILE);
+                s.decommit_range(base, TILE);
+                assert!(s.flush_parked_for(&[&q]));
+                assert_eq!(com_refcount(&q), before, "queue {i} refcount leaked");
+                drop(q);
+                s.commit_range(base + TILE, TILE);
+                s.decommit_range(base + TILE, TILE);
+                assert!(s.flush_parked_for(&[]));
+                assert!(s.queue_fences.is_empty(), "stale fence leaked at iteration {i}");
+                s.wait_for(s.value);
+                let start = std::time::Instant::now();
+                while (!s.quarantined.is_empty() || !s.pending_unmaps.is_empty()) && start.elapsed() < std::time::Duration::from_secs(5) {
+                    s.drain_quarantined();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert!(s.quarantined.is_empty() && s.pending_unmaps.is_empty(), "quarantine failed to drain at iteration {i}");
+            }
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
@@ -3006,7 +3229,6 @@ mod tests {
             let title_queue: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
             let gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate fence");
             let _release_gate = SignalOnDrop(gate.clone(), 1);
-            assert!(s.note_queue(&title_queue));
 
             s.commit_range(base, TILE);
             let tile = s.mapped[&base].pool;
@@ -3017,7 +3239,7 @@ mod tests {
             // Decommit and flush while still pinned by BUF: tile is unmapped from window once
             // idle title_queue passes its fence, NOT freed.
             s.decommit_range(base, TILE);
-            assert!(s.flush_parked());
+            assert!(s.flush_parked_for(&[&title_queue]));
             let start = std::time::Instant::now();
             while !s.pending_unmaps.is_empty() && start.elapsed() < std::time::Duration::from_secs(5) {
                 s.drain_pending_unmaps();
@@ -3037,7 +3259,7 @@ mod tests {
             assert_eq!(s.pending_quarantine, vec![tile]);
 
             // Flushing pending_quarantine attaches title_queue fence; tile stays quarantined until gate signals.
-            assert!(s.flush_pending_quarantine());
+            assert!(s.flush_pending_quarantine_for(&[&title_queue]));
             assert!(s.pending_quarantine.is_empty());
             assert!(!s.drain_quarantined(), "tile must remain quarantined while title queue is blocked");
             assert!(!s.free.contains(&tile));
@@ -3064,7 +3286,6 @@ mod tests {
         unsafe {
             let (base, mut s) = test_state_with_reserved(2);
             let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
-            assert!(s.note_queue(&title_q));
 
             s.commit_range(base, TILE);
             let tile = s.mapped[&base].pool;
@@ -3077,7 +3298,7 @@ mod tests {
 
             // Decommit + flush while title_q is busy: NULL unmap must be deferred, NOT queued on s.queue yet.
             s.decommit_range(base, TILE);
-            assert!(s.flush_parked());
+            assert!(s.flush_parked_for(&[&title_q]));
             assert_eq!(s.value, v_before, "UpdateTileMappings(NULL) must not be issued while title queue is in flight");
             assert_eq!(s.pending_unmaps.len(), 1);
             assert!(s.pending_unmap_va.contains_key(&base));
@@ -3096,7 +3317,7 @@ mod tests {
             let _unblock2 = SignalOnDrop(gate2.clone(), 1);
             title_q.Wait(&gate2, 1).expect("gate title_q 2");
             s.decommit_range(base, TILE);
-            assert!(s.flush_parked());
+            assert!(s.flush_parked_for(&[&title_q]));
             assert_eq!(s.pending_unmaps.len(), 2);
 
             gate1.Signal(1).expect("signal gate1");
@@ -3167,6 +3388,63 @@ mod tests {
             assert_eq!(slice[0xFF], 0xFFFF_FFFF);
             assert!(!crate::hle::kernelx::lazy::unmark(p), "page must already have been committed by VEH");
             assert_ne!(VirtualFree(p as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn readback_now_preserves_concurrent_cpu_writes_and_unaligned_batches() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+        unsafe {
+            // Allocate a real 64 KiB aligned tile with page 0 committed and page 1 left as a hole.
+            let tile = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert!(tile != 0 && tile % TILE == 0);
+            assert!(!VirtualAlloc(tile as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+
+            let host = std::slice::from_raw_parts_mut(tile as *mut u8, PAGE);
+            host[0..64].fill(0x11); // chunk 0: untouched during GPU wait -> should take GPU readback
+            host[64..128].fill(0x22); // chunk 1: modified by CPU during GPU wait -> must NOT be clobbered
+            host[128..192].fill(0x33); // chunk 2: split across two unaligned batches -> both halves should apply
+
+            let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
+            mapped.insert(tile, TileEntry::with_holes((0, 0), 0xFFFF & !1u16));
+            let mut dirty = Vec::new();
+            scan_page(host, tile, &mut mapped.get_mut(&tile).unwrap().sent[0], &mut dirty);
+            assert_eq!(dirty, vec![(tile, 192)]);
+
+            // Phase-1 snapshot hashes for chunks 0..3.
+            let mut snap_hashes = vec![
+                chunk_hash(&host[0..64]),
+                chunk_hash(&host[64..128]),
+                chunk_hash(&host[128..192]),
+            ];
+
+            // Simulate concurrent CPU write to chunk 1 during the GPU wait.
+            host[64 + 7] = 0xEE;
+
+            // GPU readback buffer containing new GPU values for chunks 0..3.
+            let mut gpu_rb = vec![0u8; 192];
+            gpu_rb[0..64].fill(0xA1);
+            gpu_rb[64..128].fill(0xB2);
+            gpu_rb[128..160].fill(0xC3);
+            gpu_rb[160..192].fill(0xD4);
+
+            // Batch 1 covers [0..160) (splitting chunk 2 in half); Batch 2 covers [160..192).
+            apply_readback_preserving_cpu_writes(tile, gpu_rb.as_ptr(), 160, tile, &mut snap_hashes, &mut mapped);
+            apply_readback_preserving_cpu_writes(tile + 160, gpu_rb.as_ptr().add(160), 32, tile, &mut snap_hashes, &mut mapped);
+
+            // Chunk 0 received GPU readback; chunk 1 preserved CPU write; chunk 2 received both batch halves.
+            assert!(host[0..64].iter().all(|&b| b == 0xA1));
+            assert_eq!(host[64 + 7], 0xEE, "concurrent CPU write in chunk 1 must not be clobbered");
+            assert_eq!(host[64], 0x22, "rest of modified chunk 1 must stay intact");
+            assert!(host[128..160].iter().all(|&b| b == 0xC3));
+            assert!(host[160..192].iter().all(|&b| b == 0xD4));
+
+            // Next `scan_page` must detect ONLY chunk 1 as dirty (chunks 0 and 2 had their `sent` hashes synced).
+            dirty.clear();
+            scan_page(host, tile, &mut mapped.get_mut(&tile).unwrap().sent[0], &mut dirty);
+            assert_eq!(dirty, vec![(tile + 64, 64)]);
+
+            assert_ne!(VirtualFree(tile as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 }

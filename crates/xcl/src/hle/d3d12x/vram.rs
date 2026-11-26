@@ -2769,13 +2769,57 @@ fn console_has_packed_3d_mips(desc: &D3D12_RESOURCE_DESC) -> bool {
         .unwrap_or(false)
 }
 
+fn volume_texel_bytes(f: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> u64 {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    match f {
+        DXGI_FORMAT_R32G32B32A32_FLOAT
+        | DXGI_FORMAT_R32G32B32A32_UINT
+        | DXGI_FORMAT_R32G32B32A32_SINT
+        | DXGI_FORMAT_R32G32B32A32_TYPELESS => 16,
+        DXGI_FORMAT_R16G16B16A16_FLOAT
+        | DXGI_FORMAT_R16G16B16A16_UNORM
+        | DXGI_FORMAT_R16G16B16A16_UINT
+        | DXGI_FORMAT_R16G16B16A16_SNORM
+        | DXGI_FORMAT_R16G16B16A16_SINT
+        | DXGI_FORMAT_R16G16B16A16_TYPELESS
+        | DXGI_FORMAT_R32G32_FLOAT
+        | DXGI_FORMAT_R32G32_UINT
+        | DXGI_FORMAT_R32G32_SINT
+        | DXGI_FORMAT_R32G32_TYPELESS
+        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+        | DXGI_FORMAT_R32G8X24_TYPELESS => 8,
+        DXGI_FORMAT_R8G8_UNORM
+        | DXGI_FORMAT_R8G8_UINT
+        | DXGI_FORMAT_R8G8_SNORM
+        | DXGI_FORMAT_R8G8_SINT
+        | DXGI_FORMAT_R8G8_TYPELESS
+        | DXGI_FORMAT_R16_FLOAT
+        | DXGI_FORMAT_R16_UNORM
+        | DXGI_FORMAT_R16_UINT
+        | DXGI_FORMAT_R16_SNORM
+        | DXGI_FORMAT_R16_SINT
+        | DXGI_FORMAT_R16_TYPELESS
+        | DXGI_FORMAT_D16_UNORM
+        | DXGI_FORMAT_B5G6R5_UNORM
+        | DXGI_FORMAT_B5G5R5A1_UNORM
+        | DXGI_FORMAT_B4G4R4A4_UNORM => 2,
+        DXGI_FORMAT_R8_UNORM
+        | DXGI_FORMAT_R8_UINT
+        | DXGI_FORMAT_R8_SNORM
+        | DXGI_FORMAT_R8_SINT
+        | DXGI_FORMAT_A8_UNORM
+        | DXGI_FORMAT_R8_TYPELESS => 1,
+        _ => 4,
+    }
+}
+
 /// The least a 3D texture of `desc` takes on the console – the texels of its first level, one
 /// after the other – for a 3D texture whose size there is not known: the pages it has to itself
 /// at its address. None: not a 3D texture. The PC's tiles past those pages are its own
 /// (`owned_pages`), not the pages of what the title placed behind it.
 fn least_volume_bytes(desc: &D3D12_RESOURCE_DESC) -> Option<u64> {
     (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
-        .then(|| desc.Width * desc.Height as u64 * desc.DepthOrArraySize as u64 * super::targets::texel_bytes(desc.Format) as u64)
+        .then(|| desc.Width * desc.Height as u64 * desc.DepthOrArraySize as u64 * volume_texel_bytes(desc.Format))
         .filter(|&b| b != 0)
 }
 

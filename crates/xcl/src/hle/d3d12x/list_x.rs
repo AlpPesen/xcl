@@ -5452,10 +5452,24 @@ unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usi
             return;
         }
     };
+    if real::is_unaligned_delta_uav(cpu as usize) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if once(&N, 4) {
+            crate::xlog_warn!("D3D12.X: ClearUnorderedAccessView skipped for unaligned delta buffer UAV (cpu {cpu:#x}, res {res:#x})");
+        }
+        return;
+    }
+    let pc_res = super::depth_uav::twin_for_pc_uav(cpu as usize).unwrap_or(res);
+    if let Some((va, len)) = real::console_buffer(res) {
+        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va)) {
+            note_write(this as usize, va as u64, len as u64);
+        }
+    }
+    super::bind::note_gpu_write(this);
     if shared {
         ensure_console_view_heap(this);
     }
-    pc::<unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT)>(this, slot)(this, gpu, cpu, res, values, n, rects)
+    pc::<unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT)>(this, slot)(this, gpu, cpu, pc_res, values, n, rects)
 }
 
 pub(super) unsafe extern "system" fn clear_uav_uint_x(this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const u32, n: u32, rects: *const windows::Win32::Foundation::RECT) {

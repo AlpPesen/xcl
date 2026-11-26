@@ -9,6 +9,9 @@ static PIECES: AtomicU64 = AtomicU64::new(0);
 static DISPATCHES: AtomicU64 = AtomicU64::new(0);
 /// slabs dispatched (`pso::dispatch_slabs`)
 static SLABS: AtomicU64 = AtomicU64::new(0);
+/// `.plib` hits and misses for split compute pipelines (pieces and whole forms)
+static PLIB_HITS: AtomicU64 = AtomicU64::new(0);
+static PLIB_MISSES: AtomicU64 = AtomicU64::new(0);
 /// scratch alive now, the most there was, and the most a dispatch would have needed at once (bytes)
 static LIVE: AtomicU64 = AtomicU64::new(0);
 static PEAK: AtomicU64 = AtomicU64::new(0);
@@ -28,8 +31,8 @@ static SLICER_LABELED: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 pub(crate) fn log_counts() {
     let mib = |a: &AtomicU64| a.load(Ordering::Relaxed) >> 20;
     let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
-    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab); ExecuteIndirect: {} chained ({} of them whole, {} slabs lost), {} whole",
-        n(&PROGRAMS), n(&PIECES), n(&DISPATCHES), n(&SLABS), mib(&LIVE), mib(&PEAK), mib(&WANTED),
+    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; plib {} hits / {} misses; scratch {} MiB (most {}, largest dispatch {} in one slab); ExecuteIndirect: {} chained ({} of them whole, {} slabs lost), {} whole",
+        n(&PROGRAMS), n(&PIECES), n(&DISPATCHES), n(&SLABS), n(&PLIB_HITS), n(&PLIB_MISSES), mib(&LIVE), mib(&PEAK), mib(&WANTED),
         n(&INDIRECT), n(&INDIRECT_WHOLE), n(&INDIRECT_LOST), n(&WHOLE_INDIRECT));
 }
 
@@ -64,7 +67,7 @@ struct PipelineBuilder {
 }
 
 impl PipelineBuilder {
-    unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Option<ID3D12PipelineState> {
+    unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Result<ID3D12PipelineState, HRESULT> {
         let lib_key = split_plib_key(dxil, &self.samplers, self.flags.0);
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let lib_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -76,15 +79,23 @@ impl PipelineBuilder {
         };
         let mut raw = std::ptr::null_mut();
         if pso_lib::try_load_compute(self.device.as_raw(), &lib_key, &lib_desc, iid, &mut raw) && !raw.is_null() {
-            return Some(ID3D12PipelineState::from_raw(raw));
+            let hits = PLIB_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+            if hits <= 4 {
+                crate::xlog_info!("compute split: .plib hit #{hits} for cs {:016x} ({lib_key})", self.record);
+            }
+            return Ok(ID3D12PipelineState::from_raw(raw));
+        }
+        let misses = PLIB_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+        if misses <= 4 {
+            crate::xlog_info!("compute split: .plib miss #{misses} for cs {:016x} ({lib_key})", self.record);
         }
         let (hr, _, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
             dxil, self.record, iid, &mut raw, true);
         if hr >= 0 && !raw.is_null() {
             pso_lib::store_pipeline(self.device.as_raw(), &lib_key, raw);
-            Some(ID3D12PipelineState::from_raw(raw))
+            Ok(ID3D12PipelineState::from_raw(raw))
         } else {
-            None
+            Err(hr)
         }
     }
 }
@@ -94,10 +105,10 @@ struct Chain {
     tail: Vec<ID3D12PipelineState>,
     words: u32,
     whole_code: Vec<u8>,
-    whole: OnceLock<ID3D12PipelineState>,
+    whole: OnceLock<Option<ID3D12PipelineState>>,
     whole_started: AtomicBool,
-    whole_failed: AtomicBool,
-    build_whole: Mutex<()>,
+    /// after a whole build that ran out of memory: when it may be tried, once more
+    retry_at: Mutex<Option<std::time::Instant>>,
     /// its command signature for ExecuteIndirect (`pso::chain_command_signature`)
     signature: OnceLock<ID3D12CommandSignature>,
     /// the most slabs one of its ExecuteIndirects had
@@ -105,6 +116,9 @@ struct Chain {
     /// a lost slab was reported once for this program
     warned: AtomicBool,
 }
+
+/// How long a split program's whole form waits after a build that ran out of memory, before its last try.
+const WHOLE_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(in crate::hle::d3d12x) enum WholeStatus {
     /// Not a split compute pipeline.
@@ -120,17 +134,39 @@ pub(in crate::hle::d3d12x) enum WholeStatus {
 
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let _guard = self.build_whole.lock().unwrap();
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
-        super::super::dred::label_text(p.as_raw() as usize, || format!("cs {:016x} whole", self.builder.record));
-        let _ = self.whole.set(p.clone());
-        Ok(p)
+        if let Some(p) = self.whole.get() {
+            return p.clone().ok_or_else(|| "whole compute pipeline".into());
+        }
+        let mut retry_at = self.retry_at.lock().unwrap();
+        if let Some(p) = self.whole.get() {
+            return p.clone().ok_or_else(|| "whole compute pipeline".into());
+        }
+        if retry_at.is_some_and(|t| std::time::Instant::now() < t) {
+            return Err("whole compute pipeline: out of memory".into());
+        }
+        match self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)) {
+            Ok(p) => {
+                super::super::dred::label_text(p.as_raw() as usize, || format!("cs {:016x} whole", self.builder.record));
+                let _ = self.whole.set(Some(p.clone()));
+                Ok(p)
+            }
+            Err(hr) if hr == crate::util::E_OUTOFMEMORY && retry_at.is_none() => {
+                *retry_at = Some(std::time::Instant::now() + WHOLE_RETRY);
+                Err("whole compute pipeline: out of memory".into())
+            }
+            Err(_) => {
+                let _ = self.whole.set(None);
+                Err("whole compute pipeline".into())
+            }
+        }
+    }
+
+    fn whole_in_cooldown(&self) -> bool {
+        self.retry_at.lock().unwrap().is_some_and(|t| std::time::Instant::now() < t)
     }
 
     fn start_whole_async(self: &Arc<Self>) {
-        if self.whole.get().is_some() || self.whole_failed.load(Ordering::Acquire) {
+        if self.whole.get().is_some() || self.whole_in_cooldown() {
             return;
         }
         if self.whole_started.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
@@ -164,7 +200,10 @@ fn enqueue_whole_async(chain: Arc<Chain>) -> bool {
                     };
                     let record = chain.builder.record;
                     if let Err(e) = unsafe { chain.whole() } {
-                        chain.whole_failed.store(true, Ordering::Release);
+                        if chain.whole.get().is_none() {
+                            // Transient E_OUTOFMEMORY: allow one retry after WHOLE_RETRY.
+                            chain.whole_started.store(false, Ordering::Release);
+                        }
                         crate::xlog_warn!("D3D12.X: background whole compute PSO for cs {record:016x} failed: {e}");
                     }
                 }
@@ -183,12 +222,75 @@ fn enqueue_whole_async(chain: Arc<Chain>) -> bool {
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
 
+/// Canonical COM object identity (`IUnknown*`) for a D3D12 device pointer so tear-off interfaces
+/// share cache slots while synthetic/unreadable test pointers preserve their raw address safely.
+unsafe fn canonical_device_key(this: *mut c_void) -> usize {
+    if this.is_null() || !crate::gpu::shader::readable(this as usize, std::mem::size_of::<usize>()) {
+        return this as usize;
+    }
+    let v = *(this as *const usize);
+    if !crate::gpu::shader::readable(v, std::mem::size_of::<usize>()) || *(v as *const usize) == 0 {
+        return this as usize;
+    }
+    if is_ext(v) && orig_fn(this, 0) == 0 {
+        return this as usize;
+    }
+    ID3D12Device::from_raw_borrowed(&this)
+        .and_then(|d| d.cast::<windows::core::IUnknown>().ok())
+        .map_or(this as usize, |u| u.as_raw() as usize)
+}
+
+/// Dispatch-chain root signatures shared per `(canonical_device_key, static_samplers)`.
+/// Intentionally retained for the process lifetime (bounded to one `ID3D12RootSignature` per
+/// distinct `(device, static_sampler_set)`) so split programs sharing pieces hit `COMPUTE_BLOBS`
+/// instead of allocating a fresh root signature object per program.
+static SIGNATURES: LazyLock<Mutex<HashMap<(usize, Vec<u32>), ID3D12RootSignature>>> = LazyLock::new(Default::default);
+
+fn sampler_key(samplers: &[pso::StaticSampler]) -> Vec<u32> {
+    samplers.iter().flat_map(|(w, c)| w.iter().copied().chain([*c as u32])).collect()
+}
+
+unsafe fn root_signature_device(rs: &ID3D12RootSignature) -> Option<ID3D12Device> {
+    let mut owner: Option<ID3D12Device> = None;
+    rs.GetDevice(&mut owner).ok()?;
+    owner
+}
+
+unsafe fn rs_belongs_to_device(rs: &ID3D12RootSignature, dev_key: usize) -> bool {
+    root_signature_device(rs).is_some_and(|owner| canonical_device_key(owner.as_raw()) == dev_key)
+}
+
+/// Shared dispatch-chain root signature for `dev` and `samplers`, isolating distinct D3D12 devices
+/// so `COMPUTE_BLOBS` never reuses a root signature across devices or sampler layouts.
+unsafe fn signature_for(dev: &ID3D12Device, samplers: &[pso::StaticSampler]) -> Option<ID3D12RootSignature> {
+    let dev_key = canonical_device_key(dev.as_raw());
+    let key = (dev_key, sampler_key(samplers));
+    if let Some(rs) = SIGNATURES.lock().unwrap().get(&key).cloned() {
+        if rs_belongs_to_device(&rs, dev_key) {
+            return Some(rs);
+        }
+    }
+    let created = match pso::dispatch_chain_root_signature(dev, samplers) {
+        Ok(rs) => rs,
+        Err(e) => {
+            note_translation_error(format!("dispatch-chain root signature: {e}"));
+            return None;
+        }
+    };
+    let mut g = SIGNATURES.lock().unwrap();
+    if g.get(&key).is_some_and(|rs| !rs_belongs_to_device(rs, dev_key)) {
+        g.insert(key, created.clone());
+        return Some(created);
+    }
+    Some(g.entry(key).or_insert(created).clone())
+}
+
 pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
     iid: *const GUID, result: *mut *mut c_void, record: u64, whole: &[u8], samplers: &[pso::StaticSampler],
     plan: Arc<DispatchChain>) -> Option<usize> {
     if result.is_null() || iid.is_null() || plan.pieces.len() < 2 { return None; }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
-    let signature = pso::dispatch_chain_root_signature(dev, samplers).ok()?;
+    let signature = signature_for(dev, samplers)?;
     let rs = signature.as_raw() as usize;
     let builder = Arc::new(PipelineBuilder { device: dev.clone(), create, signature,
         samplers: samplers.to_vec(), flags: desc.Flags, node: desc.NodeMask, record });
@@ -196,7 +298,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
         let plan = plan.clone();
         let builder = builder.clone();
         let iid = if i == 0 { *iid } else { pc_iid(Kind::PipelineState) };
-        Box::new(move || builder.pipeline(&plan.pieces[i], &iid).map_or(0, |p| p.into_raw() as usize)) as super::super::pso_async::Job
+        Box::new(move || builder.pipeline(&plan.pieces[i], &iid).ok().map_or(0, |p| p.into_raw() as usize)) as super::super::pso_async::Job
     }).collect();
     // Take ownership of every success, including when a different piece failed.
     let built: Vec<_> = super::super::pso_async::build_pieces(jobs).into_iter()
@@ -214,8 +316,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
         whole_code: whole.to_vec(),
         whole: OnceLock::new(),
         whole_started: AtomicBool::new(false),
-        whole_failed: AtomicBool::new(false),
-        build_whole: Mutex::new(()),
+        retry_at: Mutex::new(None),
         signature: OnceLock::new(),
         slabs: Default::default(),
         warned: AtomicBool::new(false),
@@ -248,12 +349,13 @@ pub(in crate::hle::d3d12x) unsafe fn whole_nonblocking(pso: usize) -> WholeStatu
     let Some(chain) = CHAINS.lock().unwrap().get(&pso).cloned() else {
         return WholeStatus::NotSplit;
     };
-    if let Some(p) = chain.whole.get() {
-        WHOLE_INDIRECT.fetch_add(1, Ordering::Relaxed);
-        return WholeStatus::Ready(p.clone());
-    }
-    if chain.whole_failed.load(Ordering::Acquire) {
-        return WholeStatus::Failed;
+    match chain.whole.get() {
+        Some(Some(p)) => {
+            WHOLE_INDIRECT.fetch_add(1, Ordering::Relaxed);
+            return WholeStatus::Ready(p.clone());
+        }
+        Some(None) => return WholeStatus::Failed,
+        None => {}
     }
     if !super::super::pso_async::enabled() {
         return match chain.whole() {
@@ -261,11 +363,11 @@ pub(in crate::hle::d3d12x) unsafe fn whole_nonblocking(pso: usize) -> WholeStatu
                 WHOLE_INDIRECT.fetch_add(1, Ordering::Relaxed);
                 WholeStatus::Ready(p)
             }
-            Err(_) => {
-                chain.whole_failed.store(true, Ordering::Release);
-                WholeStatus::Failed
-            }
+            Err(_) => WholeStatus::Failed,
         };
+    }
+    if chain.whole_in_cooldown() {
+        return WholeStatus::Failed;
     }
     chain.start_whole_async();
     WholeStatus::Pending
@@ -534,15 +636,22 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
-        if let Some(whole) = chain.whole.get() {
-            list.SetPipelineState(whole);
-            list.Dispatch(x, y, z);
-            return Ok(());
+        match chain.whole.get() {
+            Some(Some(whole)) => {
+                list.SetPipelineState(whole);
+                list.Dispatch(x, y, z);
+                return Ok(());
+            }
+            Some(None) => return Err("whole compute pipeline".into()),
+            None => {}
         }
         if !super::super::pso_async::enabled() {
             list.SetPipelineState(&chain.whole()?);
             list.Dispatch(x, y, z);
             return Ok(());
+        }
+        if chain.whole_in_cooldown() {
+            return Err("whole compute pipeline: out of memory".into());
         }
         chain.start_whole_async();
         return Err("whole compute pipeline still building in background".into());
@@ -634,7 +743,7 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(
     }
     bind()?;
     // under the title's own predication XCL's cannot be set: the slabs past the rounds are lost
-    let full = if predicated { None } else { chain.whole.get().cloned() };
+    let full = if predicated { None } else { chain.whole.get().and_then(|o| o.clone()) };
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
     pso::record_dispatch_chain_indirect(list, &sig, &buffer, rounds, full.is_some(), &scratch.buffer, std::iter::once(&first).chain(&chain.tail));
     let at = pso::chain_predicate_offset(rounds, pieces);
@@ -664,23 +773,37 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(
 #[cfg(test)]
 mod tests {
     use super::{scratch_bytes, LEAST};
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+    use windows::Win32::Graphics::Direct3D12::{
+        ID3D12Device, ID3D12PipelineState, D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_PIPELINE_STATE_FLAG_NONE,
+    };
 
     const MB: u64 = 1 << 20;
 
-    #[test]
-    fn a_list_recorded_after_another_goes_on_in_its_scratch() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
+    fn test_device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D12::D3D12CreateDevice;
         use windows::Win32::Graphics::Dxgi::*;
         let mut dev: Option<ID3D12Device> = None;
         if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev) }.is_err() {
             let warp = unsafe { CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) };
-            if warp.and_then(|w| unsafe { D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev) }).is_err() {
-                crate::gpu::recomp::runner::skip_test("no GPU");
-                return;
-            }
+            let _ = warp.and_then(|w| unsafe { D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev) });
         }
-        let dev = dev.unwrap();
+        dev
+    }
+
+    fn warp_device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Dxgi::*;
+        let warp = unsafe { CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) }.ok()?;
+        crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0).ok()
+    }
+
+    #[test]
+    fn a_list_recorded_after_another_goes_on_in_its_scratch() {
+        let Some(dev) = test_device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
         let (a, b, c, alloc) = (0x7E57_5C01usize, 0x7E57_5C02usize, 0x7E57_5C03usize, 0x7E57_5CA0usize);
         let (first, used) = unsafe { super::scratch_for(&dev, a, alloc, MB, 4096) }.unwrap();
         assert!(!used);
@@ -805,5 +928,325 @@ mod tests {
         assert_eq!(split_key, super::split_plib_key(dxil, &samplers, 0));
         assert_ne!(split_key, super::split_plib_key(dxil, &[], 0));
         assert_ne!(split_key, super::split_plib_key(dxil, &samplers, 1));
+    }
+
+    #[test]
+    fn signature_for_reuses_root_signature_per_device_and_separates_devices_and_samplers() {
+        let Some(dev1) = test_device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        let Some(dev2) = warp_device().filter(|d| d.as_raw() != dev1.as_raw()) else {
+            crate::gpu::recomp::runner::skip_test("second distinct D3D12 device unavailable");
+            return;
+        };
+        let sampler: super::pso::StaticSampler = ([0x1111_0001, 0x2222_0002, 0x3333_0003, 0x4444_0004], false);
+        unsafe {
+            let rs1_a = super::signature_for(&dev1, &[]).expect("dispatch chain RS 1");
+            let rs1_b = super::signature_for(&dev1, &[]).expect("dispatch chain RS 1 cached");
+            assert_eq!(rs1_a.as_raw(), rs1_b.as_raw(), "repeated builds on the same device must share one RS");
+
+            let rs1_samp_a = super::signature_for(&dev1, &[sampler]).expect("dispatch chain RS with sampler");
+            let rs1_samp_b = super::signature_for(&dev1, &[sampler]).expect("dispatch chain RS with sampler cached");
+            assert_eq!(rs1_samp_a.as_raw(), rs1_samp_b.as_raw());
+            assert_ne!(rs1_samp_a.as_raw(), rs1_a.as_raw(), "static samplers must partition the RS cache");
+
+            let rs2 = super::signature_for(&dev2, &[]).expect("dispatch chain RS for second device");
+            assert_ne!(rs2.as_raw(), rs1_a.as_raw(), "distinct D3D12 devices must never share COM root signatures");
+
+            let cs = super::super::dummy().cs.clone();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs2.clone())),
+                CS: super::super::bytecode(&cs),
+                ..Default::default()
+            };
+            let _pso: ID3D12PipelineState = dev2.CreateComputePipelineState(&desc).expect("dev2 accepts its own dispatch-chain RS");
+        }
+    }
+
+    #[test]
+    fn signature_retention_and_device_child_lifetime() {
+        let Some(dev_hw) = test_device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        let Some(dev_warp) = warp_device() else {
+            crate::gpu::recomp::runner::skip_test("WARP device unavailable");
+            return;
+        };
+        unsafe {
+            let warp_key = super::canonical_device_key(dev_warp.as_raw());
+            let refs_of = |d: &ID3D12Device| -> u32 {
+                type F = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+                let vt = *(d.as_raw() as *const *const usize);
+                let add: F = std::mem::transmute(*vt.add(1));
+                let rel: F = std::mem::transmute(*vt.add(2));
+                add(d.as_raw());
+                rel(d.as_raw())
+            };
+            let before_refs = refs_of(&dev_warp);
+            let rs_warp = super::signature_for(&dev_warp, &[]).expect("WARP dispatch chain RS");
+            let after_refs = refs_of(&dev_warp);
+            assert!(super::rs_belongs_to_device(&rs_warp, warp_key));
+            let owner = super::root_signature_device(&rs_warp).expect("GetDevice while device live");
+            assert_eq!(super::canonical_device_key(owner.as_raw()), warp_key);
+            drop(owner);
+            drop(rs_warp);
+            drop(dev_warp);
+
+            // While `SIGNATURES` retains the child root signature, inspect `GetDevice` and cache entry count.
+            let retained = super::SIGNATURES.lock().unwrap().get(&(warp_key, Vec::new())).cloned().expect("retained child RS");
+            let resurrected_owner = super::root_signature_device(&retained).expect("retained ID3D12RootSignature keeps parent device queryable");
+            assert_eq!(super::canonical_device_key(resurrected_owner.as_raw()), warp_key);
+
+            let sig_count_before = super::SIGNATURES.lock().unwrap().len();
+            let _ = super::signature_for(&dev_hw, &[]).expect("HW dispatch chain RS");
+            let _ = super::signature_for(&dev_hw, &[]).expect("HW dispatch chain RS cached");
+            let sig_count_after = super::SIGNATURES.lock().unwrap().len();
+            assert!(sig_count_after <= sig_count_before + 1, "repeated calls must not grow SIGNATURES");
+            println!("SIGNATURES_LIFETIME before_refs={before_refs} after_refs={after_refs} cached_entries={sig_count_after}");
+        }
+    }
+
+    #[test]
+    fn split_programs_sharing_large_piece_hit_compute_blobs_and_reuse_root_signature() {
+        use std::ffi::c_void;
+        use std::sync::{atomic::Ordering, Arc, Mutex};
+
+        if crate::gpu::recomp::dxc::location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let Some(dev) = test_device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+
+        // Compile unique >= 16 KB DXIL pieces (`>= COMPUTE_BLOB_MIN_DXIL`) with a per-run salt so
+        // earlier runs' disk caches cannot satisfy Program A cold builds.
+        let nonce = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u32) ^ std::process::id();
+        let compile_piece = |rounds: u32, extra_xor: u32| {
+            let hlsl = format!(
+                "RWByteAddressBuffer dst : register(u0, space0);\n\
+                 [numthreads(1, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {{\n\
+                     uint x = id.x ^ 0x{nonce:08x}u ^ 0x{extra_xor:08x}u;\n\
+                     [unroll] for (uint i = 0; i < {rounds}; ++i) {{\n\
+                         x = (x * 1664525u + (i ^ 0x9e3779b9u)) ^ (x >> 13);\n\
+                     }}\n\
+                     dst.Store(0, x);\n\
+                 }}\n"
+            );
+            crate::gpu::recomp::dxc::compile(&hlsl, "main", "cs_6_0", &[]).expect("compile cs_6_0 piece")
+        };
+        let mut rounds = 600u32;
+        let mut shared = compile_piece(rounds, 0);
+        while shared.len() < super::super::COMPUTE_BLOB_MIN_DXIL {
+            rounds *= 2;
+            shared = compile_piece(rounds, 0);
+        }
+        let tail_a = compile_piece(12, 1);
+        let tail_b = compile_piece(12, 2);
+        let whole = compile_piece(16, 3);
+
+        static SPY_LOCK: Mutex<()> = Mutex::new(());
+        static SPY_CALLS: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+        let _serial = SPY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SPY_CALLS.lock().unwrap().clear();
+
+        struct FixtureCleanup {
+            psos: Vec<ID3D12PipelineState>,
+            blob_keys: Vec<(u64, usize, i32)>,
+            disk_dxils: Vec<Vec<u8>>,
+        }
+        impl Drop for FixtureCleanup {
+            fn drop(&mut self) {
+                for pso in self.psos.drain(..) {
+                    super::forget(pso.as_raw() as usize);
+                }
+                for key in self.blob_keys.drain(..) {
+                    super::super::forget_compute_blob(key);
+                }
+                for bytes in self.disk_dxils.drain(..) {
+                    if let Some(p) = super::super::driver_cache::path_for(&bytes, 0, true) {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+                SPY_CALLS.lock().unwrap().clear();
+            }
+        }
+        let mut cleanup = FixtureCleanup {
+            psos: Vec::new(),
+            blob_keys: Vec::new(),
+            disk_dxils: vec![shared.clone(), tail_a.clone(), tail_b.clone()],
+        };
+
+        unsafe extern "system" fn spy_create(this: *mut c_void, desc: *const c_void, _iid: *const super::GUID, out: *mut *mut c_void) -> super::HRESULT {
+            let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+            SPY_CALLS.lock().unwrap().push((d.CS.BytecodeLength, !d.CachedPSO.pCachedBlob.is_null()));
+            let dev = ID3D12Device::from_raw_borrowed(&this).unwrap();
+            match dev.CreateComputePipelineState::<ID3D12PipelineState>(d) {
+                Ok(pso) => {
+                    *out = pso.into_raw();
+                    0
+                }
+                Err(e) => e.code().0,
+            }
+        }
+
+        let base_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+        let iid = &ID3D12PipelineState::IID as *const windows::core::GUID as *const super::GUID;
+        let plan_a = Arc::new(super::DispatchChain { pieces: vec![shared.clone(), tail_a.clone()], dwords_per_group: 4 });
+        let plan_b = Arc::new(super::DispatchChain { pieces: vec![shared.clone(), tail_b.clone()], dwords_per_group: 4 });
+
+        unsafe {
+            let mut raw_a: *mut c_void = std::ptr::null_mut();
+            let rs_a = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_a, 1, &whole, &[], plan_a.clone()).expect("build Program A");
+            cleanup.psos.push(ID3D12PipelineState::from_raw(raw_a));
+            cleanup.blob_keys.push(super::super::compute_blob_key(&shared, rs_a, 0));
+            cleanup.blob_keys.push(super::super::compute_blob_key(&tail_a, rs_a, 0));
+            let a_calls = std::mem::take(&mut *SPY_CALLS.lock().unwrap());
+            assert_eq!(a_calls.len(), 2, "Program A should compile 2 pieces, got {a_calls:?}");
+            assert!(a_calls.iter().any(|&(len, cached)| len == shared.len() && !cached), "Program A shared piece should start cold: {a_calls:?}");
+
+            let sigs_after_a = super::SIGNATURES.lock().unwrap().len();
+            let key_shared = super::super::compute_blob_key(&shared, rs_a, 0);
+            let count_shared_keys = || {
+                super::super::COMPUTE_BLOBS.lock().unwrap().as_ref().map_or(0, |(m, _)| m.keys().filter(|k| k.0 == key_shared.0).count())
+            };
+            let stored_blob = count_shared_keys();
+            assert!(stored_blob <= 1, "shared piece driver blob stored at most once in COMPUTE_BLOBS (0 on AMD stub-blob drivers)");
+
+            let plib_hits_before_b = super::PLIB_HITS.load(Ordering::Relaxed);
+            let mut raw_b: *mut c_void = std::ptr::null_mut();
+            let rs_b = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_b, 2, &whole, &[], plan_b).expect("build Program B");
+            cleanup.psos.push(ID3D12PipelineState::from_raw(raw_b));
+            cleanup.blob_keys.push(super::super::compute_blob_key(&tail_b, rs_b, 0));
+            let b_calls = std::mem::take(&mut *SPY_CALLS.lock().unwrap());
+            assert_eq!(rs_b, rs_a, "Program B must reuse Program A's cached dispatch-chain root signature");
+            assert_eq!(super::SIGNATURES.lock().unwrap().len(), sigs_after_a, "Program B must not allocate a new SIGNATURES entry");
+            if stored_blob == 1 {
+                assert!(
+                    super::PLIB_HITS.load(Ordering::Relaxed) > plib_hits_before_b
+                        || b_calls.iter().any(|&(len, cached)| len == shared.len() && cached),
+                    "Program B must reuse shared piece from .plib or COMPUTE_BLOBS via CachedPSO: {b_calls:?}"
+                );
+            }
+            assert_eq!(count_shared_keys(), stored_blob, "Program B must not insert a duplicate COMPUTE_BLOBS entry under another root signature");
+
+            // Dropping and rebuilding Program A must also hit .plib or COMPUTE_BLOBS with no extra root signature.
+            let pso_a = cleanup.psos.remove(0);
+            super::forget(pso_a.as_raw() as usize);
+            drop(pso_a);
+            let plib_hits_before_a2 = super::PLIB_HITS.load(Ordering::Relaxed);
+            let mut raw_a2: *mut c_void = std::ptr::null_mut();
+            let rs_a2 = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_a2, 3, &whole, &[], plan_a).expect("rebuild Program A");
+            cleanup.psos.push(ID3D12PipelineState::from_raw(raw_a2));
+            let a2_calls = std::mem::take(&mut *SPY_CALLS.lock().unwrap());
+            assert_eq!(rs_a2, rs_a);
+            assert_eq!(super::SIGNATURES.lock().unwrap().len(), sigs_after_a);
+            if stored_blob == 1 {
+                assert!(
+                    super::PLIB_HITS.load(Ordering::Relaxed) > plib_hits_before_a2
+                        || a2_calls.iter().any(|&(len, cached)| len == shared.len() && cached),
+                    "rebuild must hit .plib or COMPUTE_BLOBS: {a2_calls:?}"
+                );
+            }
+            assert_eq!(count_shared_keys(), stored_blob);
+            println!("DISPATCH_CHAIN_RS_CACHE shared_dxil={} sigs={}", shared.len(), sigs_after_a);
+        }
+    }
+
+    #[test]
+    fn a_failed_whole_form_is_not_built_again() {
+        use std::ffi::c_void;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc, Mutex, OnceLock,
+        };
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        unsafe extern "system" fn refused(_: *mut c_void, _: *const c_void, _: *const super::GUID, _: *mut *mut c_void) -> super::HRESULT {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            crate::util::E_FAIL
+        }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let signature = super::pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
+            let builder = Arc::new(super::PipelineBuilder {
+                device: dev,
+                create: refused,
+                signature,
+                samplers: Vec::new(),
+                flags: D3D12_PIPELINE_STATE_FLAG_NONE,
+                node: 0,
+                record: 0,
+            });
+            let chain = super::Chain {
+                builder,
+                tail: Vec::new(),
+                words: 4,
+                whole_code: vec![0; 16],
+                whole: OnceLock::new(),
+                whole_started: AtomicBool::new(false),
+                retry_at: Mutex::new(None),
+                signature: OnceLock::new(),
+                slabs: Default::default(),
+                warned: AtomicBool::new(false),
+            };
+            assert!(chain.whole().is_err());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn a_whole_form_that_ran_out_of_memory_is_tried_once_more_after_a_pause() {
+        use std::ffi::c_void;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc, Mutex, OnceLock,
+        };
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        unsafe extern "system" fn out_of_memory(_: *mut c_void, _: *const c_void, _: *const super::GUID, _: *mut *mut c_void) -> super::HRESULT {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            crate::util::E_OUTOFMEMORY
+        }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let signature = super::pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
+            let builder = Arc::new(super::PipelineBuilder {
+                device: dev,
+                create: out_of_memory,
+                signature,
+                samplers: Vec::new(),
+                flags: D3D12_PIPELINE_STATE_FLAG_NONE,
+                node: 0,
+                record: 0,
+            });
+            let chain = super::Chain {
+                builder,
+                tail: Vec::new(),
+                words: 4,
+                whole_code: vec![0; 16],
+                whole: OnceLock::new(),
+                whole_started: AtomicBool::new(false),
+                retry_at: Mutex::new(None),
+                signature: OnceLock::new(),
+                slabs: Default::default(),
+                warned: AtomicBool::new(false),
+            };
+            assert!(chain.whole().is_err());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+            *chain.retry_at.lock().unwrap() = Some(std::time::Instant::now());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+            *chain.retry_at.lock().unwrap() = Some(std::time::Instant::now());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+        }
     }
 }

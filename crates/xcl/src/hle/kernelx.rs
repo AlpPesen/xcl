@@ -1246,7 +1246,16 @@ fn page_home(page: usize) -> Option<usize> {
 
 /// Whether every page of `pages` (at least one) is a physical page allocated now.
 pub fn physical_pages_live(pages: &[usize]) -> bool {
-    !pages.is_empty() && pages.iter().all(|&p| if alias::enabled() { alias::page_live(p) } else { page_home(p).is_some() })
+    if pages.is_empty() {
+        return false;
+    }
+    if alias::enabled() {
+        return pages.iter().all(|&p| alias::page_live(p));
+    }
+    // Lock `AWAY` before `PHYS_BLOCKS` (`page_home`) to match `read_physical_pages` /
+    // `write_physical_pages` and avoid ABBA lock inversions.
+    let away = AWAY.lock().unwrap();
+    pages.iter().all(|&p| !away.as_ref().is_some_and(|a| a.freed.contains(&p)) && page_home(p).is_some())
 }
 
 /// Whether a home is only reserved until it is used (a sparse window's, or plain memory's –
@@ -1268,6 +1277,9 @@ unsafe fn resolve_physical_pages(away: Option<&Away>, pages: &[usize], offset: u
     }
     let mut addrs = Vec::with_capacity(need);
     for &p in &pages[..need] {
+        if away.is_some_and(|a| a.freed.contains(&p)) {
+            return None;
+        }
         let home = page_home(p)?;
         let addr = match away.and_then(|a| a.page.get(&p).copied()) {
             Some(at) => at,
@@ -4178,6 +4190,32 @@ mod tests {
             let h0 = MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr()) as usize;
             assert_eq!((*(h0 as *const u32), *((h0 + 2 * PHYS_PAGE) as *const u32)), (0x7777_0001, 0x7777_0002));
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
+        }
+    }
+
+    #[test]
+    fn physical_pages_live_and_rw_reject_partially_freed_pages() {
+        unsafe {
+            let _ = crate::gpu::uma::get().expect("UMA must initialize");
+            let (mut n, mut pages) = (2usize, [0usize; 2]);
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let [p0, p1] = pages;
+            assert!(physical_pages_live(&[p0, p1]));
+
+            // Free only p0 while p1 keeps the backing PHYS_BLOCKS entry alive.
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, [p0].as_mut_ptr()), 1);
+            assert!(!physical_pages_live(&[p0]), "individually freed page must not be reported live");
+            assert!(!physical_pages_live(&[p0, p1]), "slice containing a freed page must not be reported live");
+            assert!(physical_pages_live(&[p1]), "sibling page in the same block must remain live");
+
+            let mut buf = [0u8; 16];
+            assert!(!read_physical_pages(&[p0], 0, &mut buf), "read_physical_pages must reject a freed page");
+            assert!(!write_physical_pages(&[p0], 0, &[0xAB; 16]), "write_physical_pages must reject a freed page");
+            assert!(write_physical_pages(&[p1], 0, &[0xCD; 16]), "sibling page stays writable");
+            assert!(read_physical_pages(&[p1], 0, &mut buf) && buf == [0xCD; 16], "sibling page stays readable");
+
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, [p1].as_mut_ptr()), 1);
+            assert!(!physical_pages_live(&[p1]), "fully freed block must not be live");
         }
     }
 }

@@ -2063,6 +2063,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     } else {
         f(this)
     };
+    let mut uma_to_free: Option<(usize, bool)> = None;
     if n == 0 {
         if let Some(s) = UNMAPPABLE.write().unwrap().as_mut() {
             s.remove(&(this as usize));
@@ -2092,15 +2093,14 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         forget_outside_resource(this as usize);
         let gone = UMA_BUFFERS.write().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
-                super::sparse::free(p);
-            } else {
-                u.free(p);
-            }
+            uma_to_free = Some((p, u.is_sparse(p)));
         }
     }
     if held {
         super::late_release::hold(this as usize);
+    }
+    if let Some((p, sparse)) = uma_to_free {
+        super::late_release::hold_uma(p, sparse);
     }
     n
 }
@@ -2574,6 +2574,11 @@ unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u3
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, n, dst, src, ty);
+    if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 && n > 0 && super::depth_uav::any() {
+        let get_inc: unsafe extern "system" fn(*mut c_void, u32) -> u32 = std::mem::transmute(orig_fn(this, 15));
+        let inc = get_inc(this, ty) as usize;
+        super::depth_uav::copy_dsv(dst as usize, src as usize, n, inc);
+    }
 }
 
 /// #23 CopyDescriptors(dst ranges, src ranges, type): range by range over console slots.
@@ -2593,7 +2598,39 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
         }
         type F = unsafe extern "system" fn(*mut c_void, u32, *const u64, *const u32, u32, *const u64, *const u32, u32);
         let f: F = std::mem::transmute(orig_fn(this, 23));
-        return f(this, nd, dsts, dsizes, ns, srcs, ssizes, ty);
+        f(this, nd, dsts, dsizes, ns, srcs, ssizes, ty);
+        if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 && !dsts.is_null() && !srcs.is_null() && nd > 0 && ns > 0 && super::depth_uav::any() {
+            let get_inc: unsafe extern "system" fn(*mut c_void, u32) -> u32 = std::mem::transmute(orig_fn(this, 15));
+            let inc = get_inc(this, ty) as usize;
+            let (mut di, mut si) = (0usize, 0usize);
+            let (mut d_rem, mut s_rem) = (0u32, 0u32);
+            let (mut d_cur, mut s_cur) = (0u64, 0u64);
+            loop {
+                while d_rem == 0 {
+                    if di >= nd as usize {
+                        return;
+                    }
+                    d_cur = *dsts.add(di);
+                    d_rem = if dsizes.is_null() { 1 } else { *dsizes.add(di) };
+                    di += 1;
+                }
+                while s_rem == 0 {
+                    if si >= ns as usize {
+                        return;
+                    }
+                    s_cur = *srcs.add(si);
+                    s_rem = if ssizes.is_null() { 1 } else { *ssizes.add(si) };
+                    si += 1;
+                }
+                let run = d_rem.min(s_rem);
+                super::depth_uav::copy_dsv(d_cur as usize, s_cur as usize, run, inc);
+                d_cur = d_cur.wrapping_add(run as u64 * inc as u64);
+                s_cur = s_cur.wrapping_add(run as u64 * inc as u64);
+                d_rem -= run;
+                s_rem -= run;
+            }
+        }
+        return;
     }
     // Walk (dst, src) ranges in lockstep with zero heap allocations, batching each maximal
     // contiguous overlap into a single `copy_console_slots` call.
@@ -2631,12 +2668,7 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
 
 /// descriptor heap Release (every caller): a console heap's slots go with it
 unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
-    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
-    if n == 0 {
-        super::console_heap::unregister(this as usize);
-    }
-    n
+    release_taking_first(this, || super::console_heap::take(this as usize), |h| h.into_iter().for_each(super::console_heap::free))
 }
 
 /// Default UAV dimension for a texture resource when `CreateUnorderedAccessView` receives a NULL desc.
@@ -3031,6 +3063,11 @@ fn null_uav_desc(
         .or_else(|| rd.map(resource_dim_to_view))
         .unwrap_or(D3D12_UAV_DIMENSION_TEXTURE2D.0);
     match dim {
+        1 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            ..Default::default()
+        },
         2 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_FLOAT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1D,
@@ -3243,6 +3280,171 @@ fn uav_companion_srv(
     Some(srv)
 }
 
+/// PC UAV CPU descriptor handles that were replaced by a null buffer UAV because the placed
+/// buffer's `buffer_delta` was not element-aligned (or its counter offset was not 4096-aligned).
+/// `ClearUnorderedAccessView*` checks this before calling PC clear with a non-null resource.
+static UNALIGNED_DELTA_UAVS: std::sync::RwLock<Option<HashSet<usize>>> = std::sync::RwLock::new(None);
+static UNALIGNED_DELTA_UAV_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(super) fn is_unaligned_delta_uav(pc_uav: usize) -> bool {
+    if UNALIGNED_DELTA_UAV_COUNT.load(Ordering::Relaxed) == 0 || pc_uav == 0 {
+        return false;
+    }
+    UNALIGNED_DELTA_UAVS.read().unwrap().as_ref().is_some_and(|s| s.contains(&pc_uav))
+}
+
+fn note_unaligned_delta_uav(pc_uav: usize, unaligned: bool) {
+    if pc_uav == 0 {
+        return;
+    }
+    if unaligned {
+        let mut g = UNALIGNED_DELTA_UAVS.write().unwrap();
+        if g.get_or_insert_with(HashSet::new).insert(pc_uav) {
+            UNALIGNED_DELTA_UAV_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if UNALIGNED_DELTA_UAV_COUNT.load(Ordering::Relaxed) != 0 {
+        if let Some(s) = UNALIGNED_DELTA_UAVS.write().unwrap().as_mut() {
+            if s.remove(&pc_uav) {
+                UNALIGNED_DELTA_UAV_COUNT.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Element byte size for standard DXGI typed buffer formats (`None` for unknown/block-compressed).
+fn dxgi_buffer_format_bytes(fmt: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> Option<u64> {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    match fmt {
+        DXGI_FORMAT_R32G32B32A32_TYPELESS
+        | DXGI_FORMAT_R32G32B32A32_FLOAT
+        | DXGI_FORMAT_R32G32B32A32_UINT
+        | DXGI_FORMAT_R32G32B32A32_SINT => Some(16),
+        DXGI_FORMAT_R32G32B32_TYPELESS
+        | DXGI_FORMAT_R32G32B32_FLOAT
+        | DXGI_FORMAT_R32G32B32_UINT
+        | DXGI_FORMAT_R32G32B32_SINT => Some(12),
+        DXGI_FORMAT_R16G16B16A16_TYPELESS
+        | DXGI_FORMAT_R16G16B16A16_FLOAT
+        | DXGI_FORMAT_R16G16B16A16_UNORM
+        | DXGI_FORMAT_R16G16B16A16_UINT
+        | DXGI_FORMAT_R16G16B16A16_SNORM
+        | DXGI_FORMAT_R16G16B16A16_SINT
+        | DXGI_FORMAT_R32G32_TYPELESS
+        | DXGI_FORMAT_R32G32_FLOAT
+        | DXGI_FORMAT_R32G32_UINT
+        | DXGI_FORMAT_R32G32_SINT => Some(8),
+        DXGI_FORMAT_R10G10B10A2_TYPELESS
+        | DXGI_FORMAT_R10G10B10A2_UNORM
+        | DXGI_FORMAT_R10G10B10A2_UINT
+        | DXGI_FORMAT_R11G11B10_FLOAT
+        | DXGI_FORMAT_R8G8B8A8_TYPELESS
+        | DXGI_FORMAT_R8G8B8A8_UNORM
+        | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+        | DXGI_FORMAT_R8G8B8A8_UINT
+        | DXGI_FORMAT_R8G8B8A8_SNORM
+        | DXGI_FORMAT_R8G8B8A8_SINT
+        | DXGI_FORMAT_B8G8R8A8_TYPELESS
+        | DXGI_FORMAT_B8G8R8A8_UNORM
+        | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+        | DXGI_FORMAT_B8G8R8X8_TYPELESS
+        | DXGI_FORMAT_B8G8R8X8_UNORM
+        | DXGI_FORMAT_B8G8R8X8_UNORM_SRGB
+        | DXGI_FORMAT_R16G16_TYPELESS
+        | DXGI_FORMAT_R16G16_FLOAT
+        | DXGI_FORMAT_R16G16_UNORM
+        | DXGI_FORMAT_R16G16_UINT
+        | DXGI_FORMAT_R16G16_SNORM
+        | DXGI_FORMAT_R16G16_SINT
+        | DXGI_FORMAT_R32_TYPELESS
+        | DXGI_FORMAT_R32_FLOAT
+        | DXGI_FORMAT_R32_UINT
+        | DXGI_FORMAT_R32_SINT => Some(4),
+        DXGI_FORMAT_R8G8_TYPELESS
+        | DXGI_FORMAT_R8G8_UNORM
+        | DXGI_FORMAT_R8G8_UINT
+        | DXGI_FORMAT_R8G8_SNORM
+        | DXGI_FORMAT_R8G8_SINT
+        | DXGI_FORMAT_R16_TYPELESS
+        | DXGI_FORMAT_R16_FLOAT
+        | DXGI_FORMAT_R16_UNORM
+        | DXGI_FORMAT_R16_UINT
+        | DXGI_FORMAT_R16_SNORM
+        | DXGI_FORMAT_R16_SINT
+        | DXGI_FORMAT_B5G6R5_UNORM
+        | DXGI_FORMAT_B5G5R5A1_UNORM
+        | DXGI_FORMAT_B4G4R4A4_UNORM => Some(2),
+        DXGI_FORMAT_R8_TYPELESS
+        | DXGI_FORMAT_R8_UNORM
+        | DXGI_FORMAT_R8_UINT
+        | DXGI_FORMAT_R8_SNORM
+        | DXGI_FORMAT_R8_SINT
+        | DXGI_FORMAT_A8_UNORM => Some(1),
+        _ => crate::gpu::desc::gfx10_format(fmt)
+            .filter(|&g| (1..=77).contains(&g))
+            .map(|g| crate::gpu::desc::format_bytes(g) as u64),
+    }
+}
+
+/// Element byte size for a buffer UAV (`None` when the typed format is unknown).
+fn buffer_uav_element_bytes(desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> Option<u64> {
+    // SAFETY: caller ensures `desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER`.
+    let b = unsafe { desc.Anonymous.Buffer };
+    if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        Some(4)
+    } else if b.StructureByteStride > 0 {
+        Some(b.StructureByteStride as u64)
+    } else {
+        dxgi_buffer_format_bytes(desc.Format)
+    }
+}
+
+/// Adjust a PC buffer UAV description by `res_delta` (and `ctr_delta` when `has_counter`).
+/// - `Ok(None)`: no delta adjustment needed.
+/// - `Ok(Some(patched))`: aligned delta applied (`FirstElement += res_delta / elem`,
+///   `CounterOffsetInBytes += ctr_delta`).
+/// - `Err(())`: delta buffer UAV cannot be safely shifted on PC (null desc, unknown element size,
+///   unaligned `res_delta % elem != 0`, or unaligned counter offset mod 4096) — bind a null PC UAV
+///   so PC `ClearUnorderedAccessView*` / pipelines never overwrite `[va & !0xFFFF, va)`.
+fn patch_buffer_uav_delta(
+    desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    is_buffer_res: bool,
+    res_delta: u64,
+    has_counter: bool,
+    ctr_delta: u64,
+) -> Result<Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>, ()> {
+    if res_delta == 0 && (!has_counter || ctr_delta == 0) {
+        return Ok(None);
+    }
+    let is_buf_view = desc.is_some_and(|d| d.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) || is_buffer_res;
+    if !is_buf_view {
+        return Ok(None);
+    }
+    let Some(d) = desc else {
+        return Err(());
+    };
+    if d.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return Err(());
+    }
+    let elem = buffer_uav_element_bytes(d).filter(|&e| e > 0).ok_or(())?;
+    if res_delta % elem != 0 {
+        return Err(());
+    }
+    let mut patched = *d;
+    // SAFETY: `ViewDimension == D3D12_UAV_DIMENSION_BUFFER` verified above.
+    unsafe {
+        let b = &mut patched.Anonymous.Buffer;
+        if has_counter && ctr_delta != 0 {
+            let new_ctr = b.CounterOffsetInBytes.checked_add(ctr_delta).ok_or(())?;
+            if new_ctr % 4096 != 0 {
+                return Err(());
+            }
+            b.CounterOffsetInBytes = new_ctr;
+        }
+        b.FirstElement = b.FirstElement.checked_add(res_delta / elem).ok_or(())?;
+    }
+    Ok(Some(patched))
+}
+
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
     let orig_desc = desc.as_ref().copied();
     // Route depth+UAV textures (`ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS`) to their
@@ -3286,16 +3488,58 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     // another non-UAV resource): a null view – a UAV of it is an invalid call (0x887A0001)
     let uav_rd_opt = if uav_res == res { rd_opt } else { ID3D12Resource::from_raw_borrowed(&uav_res).map(|r| r.GetDesc()) };
     let no_uav = uav_rd_opt.is_some_and(|d| d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0);
+    // Placed buffers with `buffer_delta != 0` start below the title's VA (`va & !0xFFFF`). Shift
+    // the PC UAV's `FirstElement` (and `CounterOffsetInBytes`) by the delta so PC UAV clears and
+    // pipelines hit the title's true buffer instead of `[va & !0xFFFF, va)` in live CPU RAM; if
+    // the delta is unaligned, bind a null PC UAV and skip PC clears on it.
+    let res_delta = buffer_delta(uav_res as usize);
+    let ctr_delta = if counter.is_null() { 0 } else { buffer_delta(counter as usize) };
+    let is_buf_res = uav_rd_opt.is_some_and(|d| d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
+    let (pc_uav_desc_patched, unaligned_delta) = if depth_twin.is_none() && !no_uav {
+        match patch_buffer_uav_delta(uav_desc.as_ref(), is_buf_res, res_delta, !counter.is_null(), ctr_delta) {
+            Ok(patched) => (patched, false),
+            Err(()) => (None, true),
+        }
+    } else {
+        (None, false)
+    };
+    let pc_uav_desc = pc_uav_desc_patched.as_ref().map_or(uav_desc, |d| d as *const _);
     let null_desc = null_uav_desc(uav_desc.as_ref(), uav_rd_opt.as_ref());
+    let null_buf_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        ..Default::default()
+    };
     let pc_uav = |at: u64| {
+        note_unaligned_delta_uav(at as usize, unaligned_delta);
+        if let Some((twin_res, _)) = &depth_twin {
+            super::depth_uav::note_uav_twin(at as usize, *twin_res as usize);
+        } else {
+            super::depth_uav::clear_uav_twin(at as usize);
+        }
         if no_uav {
             static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view");
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                if let Some(d) = uav_rd_opt {
+                    crate::xlog_warn!(
+                        "D3D12.X: a UAV of a resource that cannot have one on the PC (res {res:p}, fmt {}, {}x{}, samples {}, flags {:#x}) – a null view",
+                        d.Format.0, d.Width, d.Height, d.SampleDesc.Count, d.Flags.0
+                    );
+                } else {
+                    crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (res {res:p}) – a null view");
+                }
             }
             f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
+        } else if unaligned_delta {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_warn!(
+                    "D3D12.X: buffer UAV on placed resource {res:p} has unaligned delta (res_delta={res_delta:#x}, ctr_delta={ctr_delta:#x}) – binding null PC UAV"
+                );
+            }
+            f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_buf_desc, at)
         } else {
-            f(this, uav_res, counter, uav_desc, at)
+            f(this, uav_res, counter, pc_uav_desc, at)
         }
     };
     let Some(slot) = super::console_heap::slot(cpu) else { return pc_uav(cpu) };
@@ -4243,21 +4487,18 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
     Some((p, cpu_readback))
 }
 
-/// ID3D12Heap::Release: its block of unified memory goes with it.
+/// ID3D12Heap::Release: its block of unified memory goes with it (deferred until active GPU
+/// queues finish so in-flight lists never lose their backing block).
 unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
-    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
-    if n == 0 {
-        let gone = HEAP_UMA.write().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
-        if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
-                super::sparse::free(p);
-            } else {
-                u.free(p);
+    release_taking_first(
+        this,
+        || HEAP_UMA.write().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block),
+        |gone| {
+            if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
+                super::late_release::hold_uma(p, u.is_sparse(p));
             }
-        }
-    }
-    n
+        },
+    )
 }
 creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
 
@@ -5535,8 +5776,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     }
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
-        keep_compute_blob(key, *ppv, dxil.len());
-        if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
+        if let (Some(p), Some(b)) = (disk.as_deref(), keep_compute_blob(key, *ppv, dxil.len())) {
             driver_cache::keep(p, &b, in_driver);
         }
     } else if reused && from_disk {
@@ -5884,6 +6124,30 @@ mod compute_blob_tests {
         }
         assert_eq!(*total, 0);
     }
+
+    /// A blob the in-memory store has no room for still goes back to its caller (which writes
+    /// it to the disk cache); one that fits is kept in memory as well.
+    #[test]
+    fn a_blob_over_the_memory_budget_still_reaches_its_caller() {
+        let mut store = (super::HashMap::new(), 0usize);
+        let fits = super::remember_compute_blob(&mut store, (1, 2, 0), vec![7u8; 64]).expect("a blob that fits");
+        assert_eq!(fits.len(), 64);
+        assert_eq!(store.1, 64);
+        assert!(store.0.contains_key(&(1, 2, 0)));
+        let duplicate = super::remember_compute_blob(&mut store, (1, 2, 0), vec![3; 64]).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&fits, &duplicate));
+        assert_eq!(store.1, 64, "a concurrent insertion of the same blob is charged once");
+
+        // the store is full: nothing more is kept in memory …
+        store.1 = super::COMPUTE_BLOBS_MAX;
+        let over = super::remember_compute_blob(&mut store, (3, 4, 0), vec![9u8; 128]);
+        assert!(!store.0.contains_key(&(3, 4, 0)));
+        assert_eq!(store.1, super::COMPUTE_BLOBS_MAX, "a blob that is not kept is not charged");
+        // … but the caller gets it for the disk
+        assert_eq!(over.expect("the blob for the disk cache").as_slice(), &[9u8; 128][..]);
+
+        assert!(super::remember_compute_blob(&mut store, (5, 6, 0), Vec::new()).is_none(), "an empty blob is nothing to keep");
+    }
 }
 
 /// Read `GetCachedBlob` from either an adopted or raw PC `ID3D12PipelineState`.
@@ -5933,13 +6197,36 @@ fn insert_cached_blob<K: Eq + std::hash::Hash>(
 }
 
 /// The driver's blob of the PSO just built (works on both adopted title PSOs and raw PC compute
-/// passes owned by `TwoPassPso`).
-unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
-    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || compute_blob(key).is_some() {
-        return;
+/// passes owned by `TwoPassPso`), for the disk cache; kept in memory too while `COMPUTE_BLOBS_MAX`
+/// has room.
+unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) -> Option<std::sync::Arc<Vec<u8>>> {
+    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() {
+        return None;
     }
-    let Some(bytes) = read_pso_cached_blob(pso) else { return };
-    insert_cached_blob(&COMPUTE_BLOBS, COMPUTE_BLOBS_MAX, key, bytes);
+    if let Some(b) = compute_blob(key) {
+        return Some(b);
+    }
+    let bytes = read_pso_cached_blob(pso)?;
+    let mut g = COMPUTE_BLOBS.lock().unwrap();
+    remember_compute_blob(g.get_or_insert_with(|| (HashMap::new(), 0)), key, bytes)
+}
+
+/// `bytes`, the driver's blob of the pipeline `key`, for its caller – and in `store` (the blobs
+/// kept in memory and their bytes in all) while `COMPUTE_BLOBS_MAX` has room. The blob is
+/// returned either way so once the RAM store fills, slower pipelines still persist to disk.
+fn remember_compute_blob(store: &mut (HashMap<(u64, usize, i32), std::sync::Arc<Vec<u8>>>, usize), key: (u64, usize, i32), bytes: Vec<u8>) -> Option<std::sync::Arc<Vec<u8>>> {
+    if let Some(current) = store.0.get(&key) {
+        return Some(current.clone());
+    }
+    if bytes.is_empty() {
+        return None;
+    }
+    let bytes = std::sync::Arc::new(bytes);
+    if bytes.len() <= COMPUTE_BLOBS_MAX.saturating_sub(store.1) {
+        store.1 += bytes.len();
+        store.0.insert(key, bytes.clone());
+    }
+    Some(bytes)
 }
 
 /// The driver's compiled form of translated graphics pipelines (`GetCachedBlob`),
@@ -7370,8 +7657,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let creused = hc >= 0 && chas_isa_blob && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
     if hc >= 0 && !creused && !compute.is_null() {
-        keep_compute_blob(ckey, compute, tp.cs.len());
-        if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
+        if let (Some(p), Some(b)) = (cdisk.as_deref(), keep_compute_blob(ckey, compute, tp.cs.len())) {
             driver_cache::keep(p, &b, cin_driver);
         }
     } else if creused && cfrom_disk {
@@ -8523,25 +8809,42 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     n
 }
 
-unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
+/// Release `this` through its driver vtable. When this call drops the last reference, `take`
+/// runs first, while the call still holds one: once the driver has freed the object, another
+/// thread can get a new one at the same address and record its own entries there, which `take`
+/// would then remove. What `take` returns goes to `after` once the object is gone (memory the
+/// object was made on is freed after it). Two last-but-one releases at once both miss
+/// `AddRef == 2`; the one whose `Release` ends at 0 then runs `take` after the object is gone,
+/// as before.
+unsafe fn release_taking_first<T>(this: *mut c_void, take: impl FnOnce() -> T, after: impl FnOnce(T)) -> u32 {
+    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let mut take = Some(take);
+    let taken = if add_ref(this) == 2 { take.take().map(|t| t()) } else { None };
+    f(this);
     let n = f(this);
-    if n == 0 {
-        super::list_x::on_queue_release(this as usize);
+    let taken = taken.or_else(|| if n == 0 { take.take().map(|t| t()) } else { None });
+    if let Some(t) = taken {
+        after(t);
     }
     n
 }
 
+unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
+    release_taking_first(this, || super::list_x::on_queue_release(this as usize), drop)
+}
+
 unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
-    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
-    if n == 0 {
-        dispatch_chain::allocator_reset(this as usize);
-        super::console_list::allocator_reset(this);
-        super::alloc_pool::forget(this as usize);
-        super::list_x::on_allocator_release(this as usize);
-    }
-    n
+    release_taking_first(
+        this,
+        || {
+            dispatch_chain::allocator_reset(this as usize);
+            super::console_list::allocator_reset(this);
+            super::alloc_pool::forget(this as usize);
+            super::list_x::on_allocator_release(this as usize);
+        },
+        drop,
+    )
 }
 
 /// Reset the (adopted) PC allocator `raw` itself.
@@ -9630,7 +9933,7 @@ mod queue_tests {
         impl Drop for ClassCleanup {
             fn drop(&mut self) {
                 let mut exts = Vec::new();
-                CLASSES.lock().unwrap().retain(|c| {
+                CLASSES.write().unwrap().retain(|c| {
                     if c.orig == self.0 {
                         exts.push(c.ext);
                         false
@@ -9638,7 +9941,7 @@ mod queue_tests {
                         true
                     }
                 });
-                if let Some(set) = EXTS.lock().unwrap().as_mut() {
+                if let Some(set) = EXTS.write().unwrap().as_mut() {
                     for e in exts {
                         set.remove(&e);
                     }
@@ -11639,5 +11942,207 @@ mod outside_buffer_tests {
             heap_vtbl[47] = method_a as usize;
             assert_eq!(class_for(obj_ptr, orig, Kind::CommandList), ext1);
         }
+    }
+}
+
+#[cfg(test)]
+mod release_order_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    /// A driver object whose last Release runs `freed` with its address, as another thread's
+    /// new object made at that address the moment the driver frees it would.
+    #[repr(C)]
+    struct Reused {
+        vt: *const usize,
+        refs: u32,
+        freed: fn(usize),
+        ext_vt: [usize; 4],
+        orig_vt: [usize; 3],
+    }
+    unsafe extern "system" fn reused_add_ref(this: *mut c_void) -> u32 {
+        (*(this as *mut Reused)).refs += 1;
+        (*(this as *mut Reused)).refs
+    }
+    unsafe extern "system" fn reused_release(this: *mut c_void) -> u32 {
+        let o = &mut *(this as *mut Reused);
+        o.refs -= 1;
+        if o.refs == 0 {
+            (o.freed)(this as usize);
+        }
+        o.refs
+    }
+    fn reused(refs: u32, freed: fn(usize)) -> *mut Reused {
+        let o = Box::into_raw(Box::new(Reused { vt: std::ptr::null(), refs, freed, ext_vt: [0; 4], orig_vt: [0; 3] }));
+        unsafe {
+            (*o).orig_vt[1] = reused_add_ref as usize;
+            (*o).orig_vt[2] = reused_release as usize;
+            (*o).ext_vt[0] = (*o).orig_vt.as_ptr() as usize;
+            (*o).ext_vt[1] = (*o).orig_vt[0];
+            (*o).ext_vt[2] = (*o).orig_vt[1];
+            (*o).ext_vt[3] = (*o).orig_vt[2];
+            (*o).vt = (*o).ext_vt.as_ptr().add(1);
+        }
+        o
+    }
+
+    std::thread_local! {
+        static EVENTS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    fn event(e: &'static str) {
+        EVENTS.with(|v| v.borrow_mut().push(e));
+    }
+
+    #[test]
+    fn take_runs_before_the_last_release_and_after_once_it_is_gone() {
+        EVENTS.with(|v| v.borrow_mut().clear());
+        let o = reused(2, |_| event("freed"));
+        unsafe {
+            let raw = o as *mut c_void;
+            assert_eq!(release_taking_first(raw, || event("take"), |()| event("after")), 1);
+            assert!(EVENTS.with(|v| v.borrow().is_empty()), "nothing runs while references are left");
+            assert_eq!(release_taking_first(raw, || { event("take"); 7 }, |t| { assert_eq!(t, 7); event("after") }), 0);
+            drop(Box::from_raw(o));
+        }
+        assert_eq!(EVENTS.with(|v| v.borrow().clone()), ["take", "freed", "after"]);
+    }
+
+    #[repr(C)]
+    struct Racy {
+        vt: *const usize,
+        refs: AtomicU32,
+        ext_vt: [usize; 4],
+        orig_vt: [usize; 3],
+    }
+    static RACY_BARRIER: std::sync::LazyLock<std::sync::Barrier> = std::sync::LazyLock::new(|| std::sync::Barrier::new(2));
+    unsafe extern "system" fn racy_add_ref(this: *mut c_void) -> u32 {
+        let n = (*(this as *mut Racy)).refs.fetch_add(1, Ordering::AcqRel) + 1;
+        RACY_BARRIER.wait();
+        n
+    }
+    unsafe extern "system" fn racy_release(this: *mut c_void) -> u32 {
+        (*(this as *mut Racy)).refs.fetch_sub(1, Ordering::AcqRel) - 1
+    }
+
+    #[test]
+    fn two_last_releases_at_once_take_the_entries_once() {
+        static TAKES: AtomicU32 = AtomicU32::new(0);
+        static AFTERS: AtomicU32 = AtomicU32::new(0);
+        let o = Box::into_raw(Box::new(Racy { vt: std::ptr::null(), refs: AtomicU32::new(2), ext_vt: [0; 4], orig_vt: [0; 3] }));
+        unsafe {
+            (*o).orig_vt[1] = racy_add_ref as usize;
+            (*o).orig_vt[2] = racy_release as usize;
+            (*o).ext_vt[0] = (*o).orig_vt.as_ptr() as usize;
+            (*o).ext_vt[1] = (*o).orig_vt[0];
+            (*o).ext_vt[2] = (*o).orig_vt[1];
+            (*o).ext_vt[3] = (*o).orig_vt[2];
+            (*o).vt = (*o).ext_vt.as_ptr().add(1);
+        }
+        let addr = o as usize;
+        let release = move || unsafe {
+            release_taking_first(addr as *mut c_void, || TAKES.fetch_add(1, Ordering::AcqRel), |_| {
+                AFTERS.fetch_add(1, Ordering::AcqRel);
+            })
+        };
+        let a = std::thread::spawn(release);
+        let b = std::thread::spawn(release);
+        let mut left = [a.join().unwrap(), b.join().unwrap()];
+        left.sort_unstable();
+        unsafe { drop(Box::from_raw(o)) };
+        assert_eq!(left[0], 0, "one of the two releases is the last");
+        assert_eq!((TAKES.load(Ordering::Acquire), AFTERS.load(Ordering::Acquire)), (1, 1), "the entries are taken once, by the last release");
+    }
+
+    #[test]
+    fn mem_heap_release_keeps_a_new_heap_at_the_freed_address() {
+        let o = reused(1, |addr| {
+            let h = HeapUma { size: 0x1_0000, align: 0x1_0000, prefer_coherent: false, cpu_readback: false, block: None };
+            HEAP_UMA.write().unwrap().get_or_insert_with(HashMap::new).insert(addr, h);
+        });
+        let addr = o as usize;
+        unsafe {
+            assert_eq!(mem_heap_release(o as *mut c_void), 0);
+            drop(Box::from_raw(o));
+        }
+        let kept = HEAP_UMA.write().unwrap().as_mut().and_then(|m| m.remove(&addr)).is_some();
+        assert!(kept, "mem_heap_release dropped the heap made at the freed address after the driver freed the old one");
+    }
+}
+
+#[cfg(test)]
+mod uav_buffer_delta_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    fn buf_uav(fmt: DXGI_FORMAT, first: u64, num: u32, stride: u32, ctr_off: u64, raw: bool) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: fmt,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: first,
+                    NumElements: num,
+                    StructureByteStride: stride,
+                    CounterOffsetInBytes: ctr_off,
+                    Flags: if raw { D3D12_BUFFER_UAV_FLAG_RAW } else { D3D12_BUFFER_UAV_FLAG_NONE },
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn patch_buffer_uav_delta_shifts_raw_structured_and_typed_views() {
+        // Zero delta is a no-op.
+        let raw = buf_uav(DXGI_FORMAT_R32_TYPELESS, 10, 64, 0, 0, true);
+        assert!(patch_buffer_uav_delta(Some(&raw), true, 0, false, 0).unwrap().is_none());
+
+        // Raw buffer (4-byte elements): delta 0x200 -> +128 elements.
+        let p = patch_buffer_uav_delta(Some(&raw), true, 0x200, false, 0).unwrap().unwrap();
+        assert_eq!(unsafe { p.Anonymous.Buffer.FirstElement }, 10 + 128);
+
+        // Structured buffer (24-byte stride): 0x300 % 24 == 0 -> +32 elements; 0x100 % 24 != 0 -> Err.
+        let structured = buf_uav(DXGI_FORMAT_UNKNOWN, 5, 100, 24, 0, false);
+        let p = patch_buffer_uav_delta(Some(&structured), true, 0x300, false, 0).unwrap().unwrap();
+        assert_eq!(unsafe { p.Anonymous.Buffer.FirstElement }, 5 + 32);
+        assert!(patch_buffer_uav_delta(Some(&structured), true, 0x100, false, 0).is_err());
+
+        // Typed buffers (R8=1, R16=2, R32=4, RG32=8, RGBA32=16, R11G11B10=4, R10G10B10A2=4).
+        for (fmt, elem) in [
+            (DXGI_FORMAT_R8_UINT, 1u64),
+            (DXGI_FORMAT_R16_UNORM, 2),
+            (DXGI_FORMAT_R32_UINT, 4),
+            (DXGI_FORMAT_R11G11B10_FLOAT, 4),
+            (DXGI_FORMAT_R10G10B10A2_UNORM, 4),
+            (DXGI_FORMAT_R32G32_FLOAT, 8),
+            (DXGI_FORMAT_R32G32B32A32_FLOAT, 16),
+        ] {
+            let typed = buf_uav(fmt, 3, 16, 0, 0, false);
+            let p = patch_buffer_uav_delta(Some(&typed), true, elem * 7, false, 0).unwrap().unwrap();
+            assert_eq!(unsafe { p.Anonymous.Buffer.FirstElement }, 10);
+            if elem > 1 {
+                assert!(patch_buffer_uav_delta(Some(&typed), true, elem - 1, false, 0).is_err());
+            }
+        }
+
+        // Counter buffer offset alignment (4096 bytes).
+        let with_ctr = buf_uav(DXGI_FORMAT_UNKNOWN, 0, 16, 16, 4096, false);
+        let p = patch_buffer_uav_delta(Some(&with_ctr), true, 64, true, 8192).unwrap().unwrap();
+        assert_eq!(unsafe { (p.Anonymous.Buffer.FirstElement, p.Anonymous.Buffer.CounterOffsetInBytes) }, (4, 12288));
+        assert!(patch_buffer_uav_delta(Some(&with_ctr), true, 64, true, 128).is_err());
+
+        // NULL desc or unknown typed format with non-zero delta must fail safely to null PC UAV.
+        assert!(patch_buffer_uav_delta(None, true, 0x100, false, 0).is_err());
+        let unknown = buf_uav(DXGI_FORMAT_UNKNOWN, 0, 16, 0, 0, false);
+        assert!(patch_buffer_uav_delta(Some(&unknown), true, 0x100, false, 0).is_err());
+    }
+
+    #[test]
+    fn unaligned_delta_uav_tracking_sets_and_clears() {
+        let handle = 0xDEAD_BEEF_1234usize;
+        assert!(!is_unaligned_delta_uav(handle));
+        note_unaligned_delta_uav(handle, true);
+        assert!(is_unaligned_delta_uav(handle));
+        note_unaligned_delta_uav(handle, false);
+        assert!(!is_unaligned_delta_uav(handle));
     }
 }

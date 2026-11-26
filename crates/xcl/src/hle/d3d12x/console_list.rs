@@ -915,7 +915,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let q = |k: usize| get(1 + 2 * k) as u64 | (get(2 + 2 * k) as u64) << 32;
                 let (dst, src) = (q(0) as *mut c_void, q(2) as *mut c_void);
                 if let (Some(d), Some(s)) = (ID3D12Resource::from_raw_borrowed(&dst), ID3D12Resource::from_raw_borrowed(&src)) {
-                    list.CopyBufferRegion(d, q(1), s, q(3), q(4));
+                    let dst_off = q(1).saturating_add(super::real::buffer_delta(dst as usize));
+                    let src_off = q(3).saturating_add(super::real::buffer_delta(src as usize));
+                    list.CopyBufferRegion(d, dst_off, s, src_off, q(4));
                     out.copies += 1;
                 } else {
                     out.skipped += 1;
@@ -926,20 +928,29 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let values = [get(8), get(9), get(10), get(11)];
                 let res = q(2) as *mut c_void;
                 let (gpu, cpu) = (super::console_heap::slot(q(0)), super::console_heap::slot(q(1)));
-                match (gpu, cpu, ID3D12Resource::from_raw_borrowed(&res)) {
-                    (Some(g), Some(c), Some(r)) if clear_uav_gpu_handle(&g, &c) != 0 => {
-                        let gpu_uav = clear_uav_gpu_handle(&g, &c);
-                        if g.shared_srv != 0 || (c.shared_srv != 0 && gpu_uav == c.pc_gpu_uav) {
-                            ensure_uav_clear_heap(&list, &mut bound_heaps, &mut has_sampler_heap);
-                        }
-                        let (gh, ch) = (D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu_uav }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: c.pc_uav as usize });
-                        if get(1) != 0 {
-                            let f = values.map(f32::from_bits);
-                            list.ClearUnorderedAccessViewFloat(gh, ch, r, &f, &[]);
+                match (gpu, cpu) {
+                    (Some(g), Some(c)) if clear_uav_gpu_handle(&g, &c) != 0 => {
+                        if super::real::is_unaligned_delta_uav(c.pc_uav as usize) {
+                            out.skipped += 1;
                         } else {
-                            list.ClearUnorderedAccessViewUint(gh, ch, r, &values, &[]);
+                            let pc_res = super::depth_uav::twin_for_pc_uav(c.pc_uav as usize).map_or(res, |t| t as *mut c_void);
+                            if let Some(r) = ID3D12Resource::from_raw_borrowed(&pc_res) {
+                                let gpu_uav = clear_uav_gpu_handle(&g, &c);
+                                if g.shared_srv != 0 || (c.shared_srv != 0 && gpu_uav == c.pc_gpu_uav) {
+                                    ensure_uav_clear_heap(&list, &mut bound_heaps, &mut has_sampler_heap);
+                                }
+                                let (gh, ch) = (D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu_uav }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: c.pc_uav as usize });
+                                if get(1) != 0 {
+                                    let f = values.map(f32::from_bits);
+                                    list.ClearUnorderedAccessViewFloat(gh, ch, r, &f, &[]);
+                                } else {
+                                    list.ClearUnorderedAccessViewUint(gh, ch, r, &values, &[]);
+                                }
+                                out.clears += 1;
+                            } else {
+                                out.skipped += 1;
+                            }
                         }
-                        out.clears += 1;
                     }
                     _ => out.skipped += 1,
                 }

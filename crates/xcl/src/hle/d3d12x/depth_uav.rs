@@ -292,6 +292,10 @@ static ENTRIES: Mutex<Option<HashMap<usize, Entry>>> = Mutex::new(None);
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 /// DSV CPU handle -> `(resource raw pointer, D3D12_DSV_FLAGS)`.
 static DSV_TO_RES: Mutex<Option<HashMap<usize, (usize, u32)>>> = Mutex::new(None);
+/// PC UAV CPU descriptor handle -> color twin `ID3D12Resource` raw pointer
+/// (used to route `ClearUnorderedAccessViewUint/Float` onto the color twin).
+static UAV_PC_TO_TWIN: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+static UAV_TWIN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether Depth+UAV color twins are enabled (`XCL_DEPTH_UAV_TWIN=0` turns them off).
 pub fn enabled() -> bool {
@@ -334,8 +338,10 @@ pub(super) fn register_if_depth_uav(device: *mut c_void, res: *mut c_void, conso
         COUNT.fetch_add(1, Ordering::Relaxed);
     }
     static LOGGED: AtomicU64 = AtomicU64::new(0);
+    static LOGGED_TWO_PLANE: AtomicU64 = AtomicU64::new(0);
     let n = LOGGED.fetch_add(1, Ordering::Relaxed);
-    if n < 8 || n.is_power_of_two() {
+    let tp_n = if plan.two_plane { Some(LOGGED_TWO_PLANE.fetch_add(1, Ordering::Relaxed)) } else { None };
+    if n < 8 || n.is_power_of_two() || tp_n.is_some_and(|k| k < 8 || k.is_power_of_two()) {
         crate::xlog_info!(
             "D3D12.X: tracked depth+UAV texture {res:p} ({width}x{height}x{array_size}, {mip_levels} mips, console fmt {console_fmt}, two_plane {}) for color-twin UAV sync ({} tracked)",
             plan.two_plane,
@@ -360,6 +366,18 @@ pub(super) fn forget(res: usize) {
     if let Some(mut e) = removed {
         if let Some(m) = DSV_TO_RES.lock().unwrap().as_mut() {
             m.retain(|_, &mut (v, _)| v != res);
+        }
+        let d_twin = e.depth_twin.as_ref().map(|t| t.as_raw() as usize);
+        let s_twin = e.stencil_twin.as_ref().map(|t| t.as_raw() as usize);
+        if (d_twin.is_some() || s_twin.is_some()) && UAV_TWIN_COUNT.load(Ordering::Relaxed) != 0 {
+            if let Some(m) = UAV_PC_TO_TWIN.lock().unwrap().as_mut() {
+                let before = m.len();
+                m.retain(|_, &mut t| Some(t) != d_twin && Some(t) != s_twin);
+                let removed_n = before - m.len();
+                if removed_n > 0 {
+                    UAV_TWIN_COUNT.fetch_sub(removed_n, Ordering::Relaxed);
+                }
+            }
         }
         // Defer release of internal unadopted pass descriptor heaps until in-flight GPU work completes.
         unsafe {
@@ -386,6 +404,96 @@ pub(super) fn note_dsv(dsv_cpu: usize, res: usize, dsv_flags: u32) {
     } else if let Some(m) = g.as_mut() {
         m.remove(&dsv_cpu);
     }
+}
+
+/// Propagate tracked DSV mappings across `CopyDescriptorsSimple` / `CopyDescriptors` on DSV heaps,
+/// snapshotting source entries first so overlapping ranges copy safely.
+pub(super) fn copy_dsv(dst_cpu: usize, src_cpu: usize, count: u32, inc: usize) {
+    if !any() || count == 0 || inc == 0 || dst_cpu == 0 || src_cpu == 0 || dst_cpu == src_cpu {
+        return;
+    }
+    let mut g = DSV_TO_RES.lock().unwrap();
+    let Some(m) = g.as_mut() else {
+        return;
+    };
+    if m.is_empty() {
+        return;
+    }
+    let n = count as usize;
+    let mut snap: Vec<Option<(usize, u32)>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let Some(src) = i.checked_mul(inc).and_then(|off| src_cpu.checked_add(off)) else {
+            break;
+        };
+        snap.push(m.get(&src).copied());
+    }
+    for (i, entry) in snap.into_iter().enumerate() {
+        let Some(dst) = i.checked_mul(inc).and_then(|off| dst_cpu.checked_add(off)) else {
+            break;
+        };
+        if let Some(v) = entry {
+            m.insert(dst, v);
+        } else {
+            m.remove(&dst);
+        }
+    }
+}
+
+/// Record that PC UAV CPU handle `pc_uav` was routed to color twin resource `twin_res`.
+pub(super) fn note_uav_twin(pc_uav: usize, twin_res: usize) {
+    if pc_uav == 0 {
+        return;
+    }
+    if twin_res == 0 {
+        clear_uav_twin(pc_uav);
+        return;
+    }
+    let mut g = UAV_PC_TO_TWIN.lock().unwrap();
+    if g.get_or_insert_with(HashMap::new).insert(pc_uav, twin_res).is_none() {
+        UAV_TWIN_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Clear any recorded color-twin mapping for PC UAV CPU handle `pc_uav`.
+pub(super) fn clear_uav_twin(pc_uav: usize) {
+    if pc_uav == 0 || UAV_TWIN_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    if let Some(m) = UAV_PC_TO_TWIN.lock().unwrap().as_mut() {
+        if m.remove(&pc_uav).is_some() {
+            UAV_TWIN_COUNT.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Look up the color twin resource for a twinned PC UAV CPU handle (e.g. for
+/// `ClearUnorderedAccessViewUint/Float`) and mark that twin dirty so subsequent DSV/SRV uses flush.
+pub(super) fn twin_for_pc_uav(pc_uav: usize) -> Option<usize> {
+    if pc_uav == 0 || UAV_TWIN_COUNT.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let twin = UAV_PC_TO_TWIN.lock().unwrap().as_ref()?.get(&pc_uav).copied()?;
+    if any() {
+        if let Some(map) = ENTRIES.lock().unwrap().as_mut() {
+            for e in map.values_mut() {
+                if e.depth_twin.as_ref().is_some_and(|t| t.as_raw() as usize == twin) {
+                    e.depth_twin_dirty = true;
+                    if e.plan.two_plane {
+                        e.depth_plane_dirty = false;
+                    }
+                    break;
+                }
+                if e.stencil_twin.as_ref().is_some_and(|t| t.as_raw() as usize == twin) {
+                    e.stencil_twin_dirty = true;
+                    if e.plan.two_plane {
+                        e.stencil_plane_dirty = false;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    Some(twin)
 }
 
 unsafe fn create_twin_resource(device: *mut c_void, width: u64, height: u32, array_size: u16, mip_levels: u16, format: i32) -> Option<ID3D12Resource> {
@@ -442,7 +550,7 @@ pub(super) unsafe fn resolve_uav(
     let req_fmt = orig_desc.map_or(0, |d| d.Format.0 as u32);
 
     // Inspect plan and check whether the twin already exists before allocating outside the lock.
-    let (need_alloc, is_stencil, twin_fmt, width, height, array_size, mip_levels, device, existing_raw) = {
+    let (need_alloc, is_stencil, two_plane, twin_fmt, width, height, array_size, mip_levels, device, existing_raw) = {
         let g = ENTRIES.lock().unwrap();
         let e = g.as_ref()?.get(&key)?;
         let stencil = e.plan.two_plane && is_stencil_uav_format(req_fmt, plane_slice);
@@ -452,7 +560,7 @@ pub(super) unsafe fn resolve_uav(
         } else {
             e.depth_twin.as_ref().map(|r| r.as_raw())
         };
-        (existing.is_none(), stencil, twin_fmt, e.width, e.height, e.array_size, e.mip_levels, if dev.is_null() { e.device as *mut c_void } else { dev }, existing)
+        (existing.is_none(), stencil, e.plan.two_plane, twin_fmt, e.width, e.height, e.array_size, e.mip_levels, if dev.is_null() { e.device as *mut c_void } else { dev }, existing)
     };
 
     let twin_raw = if let Some(raw) = existing_raw {
@@ -500,10 +608,12 @@ pub(super) unsafe fn resolve_uav(
     }
 
     static ROUTED: AtomicU64 = AtomicU64::new(0);
+    static ROUTED_TWO_PLANE: AtomicU64 = AtomicU64::new(0);
     let n = ROUTED.fetch_add(1, Ordering::Relaxed);
-    if n < 8 || n.is_power_of_two() {
+    let tp_n = if two_plane { Some(ROUTED_TWO_PLANE.fetch_add(1, Ordering::Relaxed)) } else { None };
+    if n < 8 || n.is_power_of_two() || tp_n.is_some_and(|k| k < 8 || k.is_power_of_two()) {
         crate::xlog_info!(
-            "D3D12.X: routed {} UAV of depth+UAV texture {res:p} (req fmt {req_fmt} -> twin fmt {patched_fmt}) to color twin {twin_raw:p} ({} routed)",
+            "D3D12.X: routed {} UAV of depth+UAV texture {res:p} (two_plane {two_plane}, req fmt {req_fmt} -> twin fmt {patched_fmt}) to color twin {twin_raw:p} ({} routed)",
             if is_stencil { "stencil" } else { "depth" },
             n + 1
         );
@@ -838,11 +948,17 @@ fn decide_enhanced_texture_barrier(
 
     if !is_direct {
         if uav_before || uav_after || common_before {
-            if !d_subs.is_empty() && e.depth_twin.is_some() && !e.depth_plane_dirty {
+            if !d_subs.is_empty() && e.depth_twin.is_some() && (e.plan.two_plane || !e.depth_plane_dirty) {
                 e.depth_twin_dirty = true;
+                if e.plan.two_plane {
+                    e.depth_plane_dirty = false;
+                }
             }
-            if !s_subs.is_empty() && e.stencil_twin.is_some() && !e.stencil_plane_dirty {
+            if !s_subs.is_empty() && e.stencil_twin.is_some() && (e.plan.two_plane || !e.stencil_plane_dirty) {
                 e.stencil_twin_dirty = true;
+                if e.plan.two_plane {
+                    e.stencil_plane_dirty = false;
+                }
             }
         }
         return None;
@@ -921,8 +1037,14 @@ fn decide_enhanced_texture_barrier(
 
     // Neither before nor after explicitly names UAV. Flush dirty twins (including compute-only
     // twins transitioning out of COMMON access) unless discarded, and advance tracked PC state.
-    let flush_d = !discard_before && !d_subs.is_empty() && e.depth_twin.is_some() && (e.depth_twin_dirty || (common_before && !e.depth_plane_dirty));
-    let flush_s = !discard_before && !s_subs.is_empty() && e.stencil_twin.is_some() && (e.stencil_twin_dirty || (common_before && !e.stencil_plane_dirty));
+    let flush_d = !discard_before
+        && !d_subs.is_empty()
+        && e.depth_twin.is_some()
+        && (e.depth_twin_dirty || (common_before && (e.plan.two_plane || !e.depth_plane_dirty)));
+    let flush_s = !discard_before
+        && !s_subs.is_empty()
+        && e.stencil_twin.is_some()
+        && (e.stencil_twin_dirty || (common_before && (e.plan.two_plane || !e.stencil_plane_dirty)));
     let depth = collect_subs(&mut e.pc_states_depth, &d_subs, after_pc);
     let stencil = collect_subs(&mut e.pc_states_stencil, &s_subs, after_pc);
     if !d_subs.is_empty() {
@@ -931,7 +1053,7 @@ fn decide_enhanced_texture_barrier(
         }
         if write_after {
             e.depth_plane_dirty = true;
-        } else if discard_before {
+        } else if discard_before || (flush_d && e.plan.two_plane) {
             e.depth_plane_dirty = false;
         }
     }
@@ -941,7 +1063,7 @@ fn decide_enhanced_texture_barrier(
         }
         if write_after {
             e.stencil_plane_dirty = true;
-        } else if discard_before {
+        } else if discard_before || (flush_s && e.plan.two_plane) {
             e.stencil_plane_dirty = false;
         }
     }
@@ -1047,15 +1169,23 @@ pub(super) unsafe fn filter_enhanced_barriers(
     had_global_uav
 }
 
-/// Apply a global UAV barrier to a single entry: mark materialized twins dirty only when their
-/// corresponding depth/stencil plane is not currently graphics-dirty (avoiding clobbering
-/// graphics-rendered depth targets on unrelated global UAV barriers).
+/// Apply a global UAV barrier to a single entry: mark materialized twins dirty.
+/// For `two_plane` depth+UAV buffers (e.g. console `D16_UNORM_S8_UINT` material-mask buffers),
+/// never let prior `DEPTH_WRITE` / `ClearDepthStencilView` (`depth_plane_dirty`) suppress twin
+/// flushing; keep single-plane depth maps (e.g. `fmt 53` shadow maps) guarded by `!depth_plane_dirty`
+/// so unrelated global UAV barriers do not clobber graphics-rendered shadow maps.
 fn mark_global_uav_dirty(e: &mut Entry) {
-    if e.depth_twin.is_some() && !e.depth_plane_dirty {
+    if e.depth_twin.is_some() && (e.plan.two_plane || !e.depth_plane_dirty) {
         e.depth_twin_dirty = true;
+        if e.plan.two_plane {
+            e.depth_plane_dirty = false;
+        }
     }
-    if e.stencil_twin.is_some() && !e.stencil_plane_dirty {
+    if e.stencil_twin.is_some() && (e.plan.two_plane || !e.stencil_plane_dirty) {
         e.stencil_twin_dirty = true;
+        if e.plan.two_plane {
+            e.stencil_plane_dirty = false;
+        }
     }
 }
 
@@ -1089,6 +1219,9 @@ pub(super) fn on_uav_barrier(res: usize) -> [usize; 2] {
     let d = match &e.depth_twin {
         Some(t) => {
             e.depth_twin_dirty = true;
+            if e.plan.two_plane {
+                e.depth_plane_dirty = false;
+            }
             t.as_raw() as usize
         }
         None => 0,
@@ -1096,6 +1229,9 @@ pub(super) fn on_uav_barrier(res: usize) -> [usize; 2] {
     let s = match &e.stencil_twin {
         Some(t) => {
             e.stencil_twin_dirty = true;
+            if e.plan.two_plane {
+                e.stencil_plane_dirty = false;
+            }
             t.as_raw() as usize
         }
         None => 0,
@@ -1809,6 +1945,21 @@ pub(super) unsafe fn execute_syncs(list: *mut c_void, ops: &[SyncOp]) {
                     continue;
                 };
 
+                if plan.two_plane {
+                    static SYNC_T2D_TWO_PLANE: AtomicU64 = AtomicU64::new(0);
+                    let k = SYNC_T2D_TWO_PLANE.fetch_add(1, Ordering::Relaxed);
+                    if k < 8 || k.is_power_of_two() {
+                        crate::xlog_info!(
+                            "D3D12.X: depth+UAV TwinToDepth sync #{k} on two_plane {res:#x} ({width}x{height}, depth_subs={}, stencil_subs={}, depth_twin={}, stencil_twin={}, kind={:?})",
+                            depth.len(),
+                            stencil.len(),
+                            depth_twin.is_some(),
+                            stencil_twin.is_some(),
+                            plan.depth_sync,
+                        );
+                    }
+                }
+
                 if !depth.is_empty() {
                     if let Some(twin) = depth_twin {
                         match plan.depth_sync {
@@ -1922,6 +2073,21 @@ pub(super) unsafe fn execute_syncs(list: *mut c_void, ops: &[SyncOp]) {
                 let Some((plan, width, height, array_size, mip_levels, per_plane, depth_twin, stencil_twin)) = snapshot else {
                     continue;
                 };
+
+                if plan.two_plane {
+                    static SYNC_D2T_TWO_PLANE: AtomicU64 = AtomicU64::new(0);
+                    let k = SYNC_D2T_TWO_PLANE.fetch_add(1, Ordering::Relaxed);
+                    if k < 8 || k.is_power_of_two() {
+                        crate::xlog_info!(
+                            "D3D12.X: depth+UAV DepthToTwin sync #{k} on two_plane {res:#x} ({width}x{height}, depth_subs={}, stencil_subs={}, depth_twin={}, stencil_twin={}, kind={:?})",
+                            depth.len(),
+                            stencil.len(),
+                            depth_twin.is_some(),
+                            stencil_twin.is_some(),
+                            plan.depth_sync,
+                        );
+                    }
+                }
 
                 if !depth.is_empty() {
                     if let Some(twin) = depth_twin {
@@ -2774,5 +2940,218 @@ mod tests {
                 m.remove(&(dev.as_raw() as usize));
             }
         }
+    }
+
+    #[test]
+    fn two_plane_global_and_enhanced_barriers_do_not_suppress_twin_dirty() {
+        #[repr(C)]
+        struct DummyCom {
+            vt: *const usize,
+        }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 {
+            1
+        }
+        let mut vt = [0usize; 4];
+        vt[1] = retain as usize;
+        vt[2] = retain as usize;
+        let mut d_obj = DummyCom { vt: vt.as_ptr() };
+        let mut s_obj = DummyCom { vt: vt.as_ptr() };
+        let mut sp_obj = DummyCom { vt: vt.as_ptr() };
+        let all = D3D12_BARRIER_SUBRESOURCE_RANGE {
+            IndexOrFirstMipLevel: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            NumMipLevels: 0,
+            FirstArraySlice: 0,
+            NumArraySlices: 0,
+            FirstPlane: 0,
+            NumPlanes: 0,
+        };
+
+        unsafe {
+            // 1. Two-plane D16_UNORM_S8_UINT (fmt 118, RAGE9 material mask):
+            //    starting in DEPTH_WRITE sets depth_plane_dirty = true, stencil_plane_dirty = true.
+            let plan = plan_for_console_format(118).unwrap();
+            let mut e = Entry::new(0x1, plan, 1920, 1080, 1, 1, STATE_DEPTH_WRITE, false);
+            e.depth_twin = Some(ID3D12Resource::from_raw(&mut d_obj as *mut _ as *mut c_void));
+            e.stencil_twin = Some(ID3D12Resource::from_raw(&mut s_obj as *mut _ as *mut c_void));
+            assert!(e.depth_plane_dirty && e.stencil_plane_dirty);
+            assert!(!e.depth_twin_dirty && !e.stencil_twin_dirty);
+
+            // Global UAV barrier must mark both twins dirty and clear plane_dirty even when plane_dirty was true.
+            mark_global_uav_dirty(&mut e);
+            assert!(e.depth_twin_dirty && e.stencil_twin_dirty);
+            assert!(!e.depth_plane_dirty && !e.stencil_plane_dirty);
+
+            // Non-DIRECT enhanced barrier must also mark both twins dirty when plane_dirty was true.
+            e.depth_twin_dirty = false;
+            e.stencil_twin_dirty = false;
+            e.depth_plane_dirty = true;
+            e.stencil_plane_dirty = true;
+            let op = decide_enhanced_texture_barrier(
+                &mut e,
+                D3D12_BARRIER_ACCESS(0),
+                D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ,
+                D3D12_BARRIER_LAYOUT_COMMON,
+                D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ,
+                &all,
+                D3D12_TEXTURE_BARRIER_FLAG_NONE,
+                false,
+            );
+            assert!(op.is_none());
+            assert!(e.depth_twin_dirty && e.stencil_twin_dirty);
+            assert!(!e.depth_plane_dirty && !e.stencil_plane_dirty);
+
+            // DIRECT enhanced barrier out of COMMON access must flush TwinToDepth even when plane_dirty was true.
+            e.depth_twin_dirty = false;
+            e.stencil_twin_dirty = false;
+            e.depth_plane_dirty = true;
+            e.stencil_plane_dirty = true;
+            let op = decide_enhanced_texture_barrier(
+                &mut e,
+                D3D12_BARRIER_ACCESS(0),
+                D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ,
+                D3D12_BARRIER_LAYOUT_COMMON,
+                D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ,
+                &all,
+                D3D12_TEXTURE_BARRIER_FLAG_NONE,
+                true,
+            );
+            assert!(matches!(op, Some(SyncOp::TwinToDepth { .. })), "expected TwinToDepth flush, got {op:?}");
+            assert!(!e.depth_plane_dirty && !e.stencil_plane_dirty);
+
+            // 2. Single-plane fmt 53 shadow map: global UAV barrier must stay guarded by !depth_plane_dirty.
+            let sp_plan = plan_for_console_format(53).unwrap();
+            let mut sp = Entry::new(0x1, sp_plan, 1024, 1024, 1, 1, STATE_DEPTH_WRITE, false);
+            sp.depth_twin = Some(ID3D12Resource::from_raw(&mut sp_obj as *mut _ as *mut c_void));
+            assert!(sp.depth_plane_dirty && !sp.depth_twin_dirty);
+            mark_global_uav_dirty(&mut sp);
+            assert!(!sp.depth_twin_dirty && sp.depth_plane_dirty, "single-plane shadow map must remain guarded");
+        }
+    }
+
+    #[test]
+    fn copy_dsv_copies_clears_and_handles_overlaps() {
+        let mut console_desc = [0u8; 0x38];
+        console_desc[0..4].copy_from_slice(&3u32.to_le_bytes()); // Texture2D
+        console_desc[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+        console_desc[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+        console_desc[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+        console_desc[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        console_desc[0x20..0x24].copy_from_slice(&118u32.to_le_bytes());
+        console_desc[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        console_desc[0x30..0x34].copy_from_slice(&6u32.to_le_bytes());
+
+        let res_a = 0x7001_0000usize;
+        let res_b = 0x7002_0000usize;
+        register_if_depth_uav(0x1 as *mut c_void, res_a as *mut c_void, &console_desc, STATE_COMMON, STATE_COMMON);
+        register_if_depth_uav(0x1 as *mut c_void, res_b as *mut c_void, &console_desc, STATE_COMMON, STATE_COMMON);
+
+        let base = 0x9000_0000usize;
+        let inc = 32usize;
+        // Slots: [0]=A(1), [1]=empty, [2]=B(2), [3]=A(3)
+        note_dsv(base, res_a, 1);
+        note_dsv(base + 2 * inc, res_b, 2);
+        note_dsv(base + 3 * inc, res_a, 3);
+
+        // Zero count / inc are no-ops
+        copy_dsv(base + 4 * inc, base, 0, inc);
+        copy_dsv(base + 4 * inc, base, 2, 0);
+
+        // Disjoint copy including clearing a pre-existing destination where src is empty
+        note_dsv(base + 5 * inc, res_b, 9);
+        copy_dsv(base + 4 * inc, base, 4, inc);
+        {
+            let g = DSV_TO_RES.lock().unwrap();
+            let m = g.as_ref().unwrap();
+            assert_eq!(m.get(&(base + 4 * inc)).copied(), Some((res_a, 1)));
+            assert_eq!(m.get(&(base + 5 * inc)).copied(), None);
+            assert_eq!(m.get(&(base + 6 * inc)).copied(), Some((res_b, 2)));
+            assert_eq!(m.get(&(base + 7 * inc)).copied(), Some((res_a, 3)));
+        }
+
+        // Overlapping forward copy: dst = base + inc, src = base, count = 3 -> [1]=A(1), [2]=empty, [3]=B(2)
+        copy_dsv(base + inc, base, 3, inc);
+        {
+            let g = DSV_TO_RES.lock().unwrap();
+            let m = g.as_ref().unwrap();
+            assert_eq!(m.get(&base).copied(), Some((res_a, 1)));
+            assert_eq!(m.get(&(base + inc)).copied(), Some((res_a, 1)));
+            assert_eq!(m.get(&(base + 2 * inc)).copied(), None);
+            assert_eq!(m.get(&(base + 3 * inc)).copied(), Some((res_b, 2)));
+        }
+
+        // Overlapping backward copy: dst = base + 4*inc, src = base + 5*inc, count = 3 -> [4]=empty, [5]=B(2), [6]=A(3)
+        copy_dsv(base + 4 * inc, base + 5 * inc, 3, inc);
+        {
+            let g = DSV_TO_RES.lock().unwrap();
+            let m = g.as_ref().unwrap();
+            assert_eq!(m.get(&(base + 4 * inc)).copied(), None);
+            assert_eq!(m.get(&(base + 5 * inc)).copied(), Some((res_b, 2)));
+            assert_eq!(m.get(&(base + 6 * inc)).copied(), Some((res_a, 3)));
+        }
+
+        forget(res_a);
+        forget(res_b);
+    }
+
+    #[test]
+    fn uav_twin_tracking_and_forget_cleanup() {
+        #[repr(C)]
+        struct DummyCom {
+            vt: *const usize,
+        }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 {
+            1
+        }
+        let mut vt = [0usize; 4];
+        vt[1] = retain as usize;
+        vt[2] = retain as usize;
+        let mut d_obj = DummyCom { vt: vt.as_ptr() };
+        let mut s_obj = DummyCom { vt: vt.as_ptr() };
+        let d_raw = &mut d_obj as *mut _ as usize;
+        let s_raw = &mut s_obj as *mut _ as usize;
+
+        let mut console_desc = [0u8; 0x38];
+        console_desc[0..4].copy_from_slice(&3u32.to_le_bytes());
+        console_desc[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+        console_desc[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+        console_desc[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+        console_desc[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        console_desc[0x20..0x24].copy_from_slice(&118u32.to_le_bytes());
+        console_desc[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        console_desc[0x30..0x34].copy_from_slice(&6u32.to_le_bytes());
+
+        let res = 0x7003_0000usize;
+        register_if_depth_uav(0x1 as *mut c_void, res as *mut c_void, &console_desc, STATE_DEPTH_WRITE, STATE_DEPTH_WRITE);
+        unsafe {
+            let mut g = ENTRIES.lock().unwrap();
+            let e = g.as_mut().unwrap().get_mut(&res).unwrap();
+            e.depth_twin = Some(ID3D12Resource::from_raw(d_raw as *mut c_void));
+            e.stencil_twin = Some(ID3D12Resource::from_raw(s_raw as *mut c_void));
+        }
+
+        let uav_d = 0xA000_0100usize;
+        let uav_s = 0xA000_0120usize;
+        let uav_other = 0xA000_0140usize;
+        let other_twin = 0x7004_0000usize;
+        note_uav_twin(uav_d, d_raw);
+        note_uav_twin(uav_s, s_raw);
+        note_uav_twin(uav_other, other_twin);
+
+        assert_eq!(twin_for_pc_uav(uav_d), Some(d_raw));
+        assert_eq!(twin_for_pc_uav(uav_s), Some(s_raw));
+        {
+            let g = ENTRIES.lock().unwrap();
+            let e = g.as_ref().unwrap().get(&res).unwrap();
+            assert!(e.depth_twin_dirty && e.stencil_twin_dirty);
+            assert!(!e.depth_plane_dirty && !e.stencil_plane_dirty);
+        }
+
+        // `forget(res)` must remove both depth and stencil UAV twin mappings while keeping unrelated ones.
+        forget(res);
+        assert_eq!(twin_for_pc_uav(uav_d), None);
+        assert_eq!(twin_for_pc_uav(uav_s), None);
+        assert_eq!(twin_for_pc_uav(uav_other), Some(other_twin));
+        clear_uav_twin(uav_other);
+        assert_eq!(twin_for_pc_uav(uav_other), None);
     }
 }

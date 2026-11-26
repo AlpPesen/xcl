@@ -21,8 +21,14 @@ const SEAL_EVERY: Duration = Duration::from_millis(10);
 /// how often the thread here looks for batches that can go
 const TICK: Duration = Duration::from_millis(4);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredItem {
+    Com(usize),
+    Uma { ptr: usize, sparse: bool },
+}
+
 struct Batch {
-    dead: Vec<usize>,
+    dead: Vec<DeferredItem>,
     /// (fence, value) a queue: all reached = nothing submitted before the batch closed is left
     marks: Vec<(ID3D12Fence, u64)>,
 }
@@ -31,7 +37,7 @@ struct Batch {
 struct Held {
     /// queue → its fence here and the last value signalled on it
     fences: HashMap<usize, (ID3D12Fence, u64)>,
-    open: Vec<usize>,
+    open: Vec<DeferredItem>,
     sealed: VecDeque<Batch>,
     last_seal: Option<Instant>,
 }
@@ -49,7 +55,7 @@ impl Held {
     }
 
     /// Take out the sealed batches every queue is past without touching `open`.
-    unsafe fn reap(&mut self) -> Vec<usize> {
+    unsafe fn reap(&mut self) -> Vec<DeferredItem> {
         let mut gone = Vec::new();
         while self.sealed.front().is_some_and(|b| b.marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v)) {
             gone.extend(self.sealed.pop_front().unwrap().dead);
@@ -58,8 +64,8 @@ impl Held {
     }
 
     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
-    /// and take out the batches every queue is past: the resources to release now.
-    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<usize> {
+    /// and take out the batches every queue is past: the items to release now.
+    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<DeferredItem> {
         if self.needs_seal(seal_now) {
             let mut marks = Vec::with_capacity(queues.len());
             let mut ok = true;
@@ -117,16 +123,12 @@ fn ensure_thread() {
     });
 }
 
-/// `res` (an adopted resource) holds one reference that is now this module's. With no work in
-/// flight it goes before this returns (the queues pass a fence value at once): a title that
-/// frees the memory under a resource right after its last `Release` finds it unpinned, as
-/// before. Otherwise the thread here lets it go.
-pub unsafe fn hold(res: usize) {
+unsafe fn enqueue(item: DeferredItem) {
     let busy = {
         let mut g = HELD.lock().unwrap();
         let h = g.get_or_insert_with(Held::default);
         let busy = !h.sealed.is_empty();
-        h.open.push(res);
+        h.open.push(item);
         busy
     };
     if busy {
@@ -146,6 +148,24 @@ pub unsafe fn hold(res: usize) {
         return;
     }
     ensure_thread();
+}
+
+/// `res` (an adopted resource) holds one reference that is now this module's. With no work in
+/// flight it goes before this returns (the queues pass a fence value at once): a title that
+/// frees the memory under a resource right after its last `Release` finds it unpinned, as
+/// before. Otherwise the thread here lets it go.
+pub unsafe fn hold(res: usize) {
+    enqueue(DeferredItem::Com(res));
+}
+
+/// Defer freeing a UMA block (`sparse::free` or `uma::Uma::free`) until every queue XCL knows
+/// of has passed the work submitted before this call, so in-flight GPU lists finish before the
+/// block is reused or decommitted.
+pub(super) fn hold_uma(ptr: usize, sparse: bool) {
+    if ptr == 0 {
+        return;
+    }
+    unsafe { enqueue(DeferredItem::Uma { ptr, sparse }) };
 }
 
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
@@ -181,17 +201,28 @@ pub unsafe fn drain_known(seal_now: bool) {
         }
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
-    for res in gone {
-        if super::vram::recycle_ready(res) {
-            continue;
+    for item in gone {
+        match item {
+            DeferredItem::Com(res) => {
+                if super::vram::recycle_ready(res) {
+                    continue;
+                }
+                let ptr = res as *mut c_void;
+                let f: unsafe extern "system" fn(*mut c_void) -> u32 = if super::real::is_adopted(ptr) {
+                    std::mem::transmute(super::real::orig_fn(ptr, 2))
+                } else {
+                    std::mem::transmute(*(*(ptr as *const *const usize)).add(2))
+                };
+                f(ptr);
+            }
+            DeferredItem::Uma { ptr, sparse } => {
+                if sparse {
+                    super::sparse::free(ptr);
+                } else if let Some(u) = crate::gpu::uma::get() {
+                    u.free(ptr);
+                }
+            }
         }
-        let ptr = res as *mut c_void;
-        let f: unsafe extern "system" fn(*mut c_void) -> u32 = if super::real::is_adopted(ptr) {
-            std::mem::transmute(super::real::orig_fn(ptr, 2))
-        } else {
-            std::mem::transmute(*(*(ptr as *const *const usize)).add(2))
-        };
-        f(ptr);
     }
 }
 
@@ -227,7 +258,7 @@ mod tests {
             let raw = res.unwrap().into_raw() as usize;
 
             let mut held = Held::default();
-            held.open.push(raw);
+            held.open.push(DeferredItem::Com(raw));
             let queues = [queue.clone()];
             assert!(held.drain(&queues, false).is_empty(), "the queue has not passed the batch's fence value");
             std::thread::sleep(Duration::from_millis(100));
@@ -241,7 +272,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
                 gone = held.drain(&queues, false);
             }
-            assert_eq!(gone, vec![raw], "released once the queue is past the batch");
+            assert_eq!(gone, vec![DeferredItem::Com(raw)], "released once the queue is past the batch");
             assert!(held.is_empty());
             drop(ID3D12Resource::from_raw(raw as *mut c_void));
         }
@@ -251,8 +282,8 @@ mod tests {
     #[test]
     fn without_queues_a_batch_goes_at_once() {
         let mut held = Held::default();
-        held.open.push(0x1000);
-        assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
+        held.open.push(DeferredItem::Com(0x1000));
+        assert_eq!(unsafe { held.drain(&[], false) }, vec![DeferredItem::Com(0x1000)]);
         assert!(held.is_empty());
     }
 
@@ -261,10 +292,37 @@ mod tests {
     fn reap_keeps_open_items_and_respects_seal_interval() {
         let mut held = Held::default();
         held.last_seal = Some(Instant::now());
-        held.open.push(0x2000);
+        held.open.push(DeferredItem::Com(0x2000));
         assert!(!held.needs_seal(false), "within SEAL_EVERY: batching defers sealing");
         assert!(held.needs_seal(true), "explicit seal_now seals immediately");
         assert!(unsafe { held.reap() }.is_empty());
-        assert_eq!(held.open, vec![0x2000]);
+        assert_eq!(held.open, vec![DeferredItem::Com(0x2000)]);
+    }
+
+    /// Deferred UMA blocks retire in FIFO order alongside COM releases and wait for active GPU queues.
+    #[test]
+    fn hold_uma_preserves_order_and_frees_on_idle_drain() {
+        let mut held = Held::default();
+        held.open.push(DeferredItem::Com(0x1000));
+        held.open.push(DeferredItem::Uma { ptr: 0x2000_0000, sparse: false });
+        held.open.push(DeferredItem::Uma { ptr: 0x3000_0000, sparse: true });
+        assert_eq!(
+            unsafe { held.drain(&[], false) },
+            vec![
+                DeferredItem::Com(0x1000),
+                DeferredItem::Uma { ptr: 0x2000_0000, sparse: false },
+                DeferredItem::Uma { ptr: 0x3000_0000, sparse: true },
+            ]
+        );
+        assert!(held.is_empty());
+
+        // Real UMA block deferred through `hold_uma` is returned once no GPU queues are busy.
+        let Some(u) = crate::gpu::uma::get() else { return };
+        let before = u.used();
+        let ptr = u.alloc(0x1_0000, 0x1_0000).expect("UMA alloc") as usize;
+        assert!(u.used() >= before + 0x1_0000);
+        hold_uma(ptr, false);
+        // With no active queues in unit tests, `hold_uma` drains synchronously and frees the block.
+        assert_eq!(u.used(), before, "deferred UMA block should be freed once queues are idle");
     }
 }

@@ -76,6 +76,106 @@ impl Heap {
 
 static HEAPS: RwLock<Vec<Heap>> = RwLock::new(Vec::new());
 
+/// Active destination descriptor leases for lock-free `CopyDescriptorsSimple` calls and any
+/// freed ranges whose return to `free` is deferred until overlapping copies complete.
+#[derive(Default)]
+struct LeasePool {
+    leased: Vec<(u32, u32)>,
+    deferred: Vec<(u32, u32)>,
+}
+
+fn ranges_overlap(a: (u32, u32), b: (u32, u32)) -> bool {
+    a.0 < b.0.saturating_add(b.1) && b.0 < a.0.saturating_add(a.1)
+}
+
+impl LeasePool {
+    fn acquire(&mut self, first: u32, count: u32) {
+        if count > 0 {
+            self.leased.push((first, count));
+        }
+    }
+
+    fn release_or_defer(&mut self, free: &mut Vec<(u32, u32)>, first: u32, count: u32) -> bool {
+        if self.leased.iter().any(|&l| ranges_overlap(l, (first, count))) {
+            self.deferred.push((first, count));
+            false
+        } else {
+            merge_release(free, first, count);
+            true
+        }
+    }
+
+    fn end_leases(&mut self, free: &mut Vec<(u32, u32)>, ranges: &[(u32, u32)]) -> bool {
+        for &r in ranges {
+            if let Some(i) = self.leased.iter().position(|&x| x == r) {
+                self.leased.swap_remove(i);
+            }
+        }
+        let mut promoted = false;
+        let mut i = 0;
+        while i < self.deferred.len() {
+            let r = self.deferred[i];
+            if !self.leased.iter().any(|&l| ranges_overlap(l, r)) {
+                self.deferred.swap_remove(i);
+                merge_release(free, r.0, r.1);
+                promoted = true;
+            } else {
+                i += 1;
+            }
+        }
+        promoted
+    }
+}
+
+struct SingleLease {
+    sampler: bool,
+    first: u32,
+    count: u32,
+}
+
+impl Drop for SingleLease {
+    fn drop(&mut self) {
+        if self.count == 0 {
+            return;
+        }
+        if self.sampler {
+            if let Some(s) = GLOBAL_SAMPLER.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                if s.leases.end_leases(&mut s.free, &[(self.first, self.count)]) {
+                    s.smallest_failed = u32::MAX;
+                }
+            }
+        } else if let Some(s) = GLOBAL.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            if s.leases.end_leases(&mut s.free, &[(self.first, self.count)]) {
+                s.smallest_failed = u32::MAX;
+            }
+        }
+    }
+}
+
+struct RangeLease {
+    sampler: bool,
+    ranges: Vec<(u32, u32)>,
+}
+
+impl Drop for RangeLease {
+    fn drop(&mut self) {
+        if self.ranges.is_empty() {
+            return;
+        }
+        if self.sampler {
+            if let Some(s) = GLOBAL_SAMPLER.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                if s.leases.end_leases(&mut s.free, &self.ranges) {
+                    s.smallest_failed = u32::MAX;
+                }
+            }
+        } else if let Some(s) = GLOBAL.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            if s.leases.end_leases(&mut s.free, &self.ranges) {
+                s.smallest_failed = u32::MAX;
+            }
+        }
+    }
+}
+
 /// Released descriptor range in `GLOBAL` or `GLOBAL_SAMPLER` awaiting active GPU queues before
 /// being returned to `free` (prevents overwriting shader-visible descriptors still read in flight).
 struct RetiredRange<F> {
@@ -88,6 +188,7 @@ struct RetiredRange<F> {
 fn drain_retired_ranges<F>(
     retired: &mut VecDeque<RetiredRange<F>>,
     free: &mut Vec<(u32, u32)>,
+    leases: &mut LeasePool,
     mut completed: impl FnMut(&F) -> u64,
 ) -> bool {
     let mut drained = false;
@@ -96,8 +197,9 @@ fn drain_retired_ranges<F>(
         .is_some_and(|r| r.marks.as_ref().is_some_and(|m| m.iter().all(|(f, v)| completed(f) >= *v)))
     {
         if let Some(r) = retired.pop_front() {
-            merge_release(free, r.first, r.count);
-            drained = true;
+            if leases.release_or_defer(free, r.first, r.count) {
+                drained = true;
+            }
         }
     }
     drained
@@ -162,6 +264,7 @@ struct Global {
     free: Vec<(u32, u32)>,
     /// released ranges awaiting live GPU queue completion before entering `free`
     retired: VecDeque<RetiredRange<ID3D12Fence>>,
+    leases: LeasePool,
     /// smallest allocation size that recently failed on a full/fragmented heap (`u32::MAX` = none)
     smallest_failed: u32,
 }
@@ -273,6 +376,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             next: crate::gpu::recomp::MEM_HEAP_NULL + 1,
             free: Vec::new(),
             retired: VecDeque::new(),
+            leases: LeasePool::default(),
             smallest_failed: u32::MAX,
         });
     }
@@ -367,7 +471,7 @@ unsafe fn set_window_views_checked(dev: &ID3D12Device, windows: &[(usize, usize)
 fn reserve_global(count: u32) -> Option<u32> {
     let mut g = GLOBAL.write().unwrap();
     let s = g.as_mut()?;
-    if unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) } {
+    if unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, &mut s.leases, |f| f.GetCompletedValue()) } {
         s.smallest_failed = u32::MAX;
     }
     if count >= s.smallest_failed {
@@ -408,7 +512,8 @@ fn page_of(h: &Heap, k: u32) -> Option<(u32, u32)> {
 }
 
 /// The shared range starting at `first` (`count` descriptors) is quarantined behind active GPU
-/// queues before returning to `free`, preventing overwrites of live shader-visible descriptors.
+/// queues (and any in-flight `publish` / `publish_range` destination leases) before returning to
+/// `free`, preventing overwrites of live shader-visible descriptors.
 pub fn release_global(first: u32, count: u32) {
     if count == 0 {
         return;
@@ -418,12 +523,13 @@ pub fn release_global(first: u32, count: u32) {
     let marks = unsafe { signal_live_queues_for(&dev) };
     if let Some(s) = GLOBAL.write().unwrap().as_mut() {
         if marks.as_ref().is_some_and(Vec::is_empty) {
-            merge_release(&mut s.free, first, count);
-            s.smallest_failed = u32::MAX;
+            if s.leases.release_or_defer(&mut s.free, first, count) {
+                s.smallest_failed = u32::MAX;
+            }
         } else {
             s.retired.push_back(RetiredRange { first, count, marks });
         }
-        if unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) } {
+        if unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, &mut s.leases, |f| f.GetCompletedValue()) } {
             s.smallest_failed = u32::MAX;
         }
     }
@@ -544,29 +650,39 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
 
 /// The heap object was released for good: its slots go back to unified memory.
 pub fn unregister(obj: usize) {
-    let gone = {
-        let mut heaps = HEAPS.write().unwrap();
-        heaps.iter().position(|h| h.obj == obj).map(|i| heaps.remove(i))
-    };
-    if let Some(h) = gone {
-        for (p, f) in h.pages.iter().enumerate().map(|(p, a)| (p, a.load(Ordering::Relaxed))).filter(|&(_, f)| f != UNMAPPED) {
-            if h.sampler {
-                release_global_sampler(f, sampler_page_descriptors(h.n, p as u32));
-            } else {
-                release_global(f, page_descriptors(h.n, p as u32));
+    if let Some(h) = take(obj) {
+        free(h);
+    }
+}
+
+/// A heap `take` removed: `free` gives its slots and shadow memory back.
+pub struct Taken(Heap);
+
+/// `unregister`'s first half: the heap is no longer found by its object's address.
+pub fn take(obj: usize) -> Option<Taken> {
+    let mut heaps = HEAPS.write().unwrap();
+    heaps.iter().position(|h| h.obj == obj).map(|i| Taken(heaps.remove(i)))
+}
+
+/// `unregister`'s second half.
+pub fn free(Taken(h): Taken) {
+    for (p, f) in h.pages.iter().enumerate().map(|(p, a)| (p, a.load(Ordering::Relaxed))).filter(|&(_, f)| f != UNMAPPED) {
+        if h.sampler {
+            release_global_sampler(f, sampler_page_descriptors(h.n, p as u32));
+        } else {
+            release_global(f, page_descriptors(h.n, p as u32));
+        }
+    }
+    match h.memory {
+        Memory::Sparse => {
+            unsafe { super::sparse::free(h.shadow) };
+        }
+        Memory::Uma => {
+            if let Some(u) = crate::gpu::uma::get() {
+                u.free(h.shadow);
             }
         }
-        match h.memory {
-            Memory::Sparse => {
-                unsafe { super::sparse::free(h.shadow) };
-            }
-            Memory::Uma => {
-                if let Some(u) = crate::gpu::uma::get() {
-                    u.free(h.shadow);
-                }
-            }
-            Memory::Title => unsafe { crate::hle::kernelx::runtime_free(h.shadow, crate::hle::kernelx::D3D_DESCRIPTOR_HEAP) },
-        }
+        Memory::Title => unsafe { crate::hle::kernelx::runtime_free(h.shadow, crate::hle::kernelx::D3D_DESCRIPTOR_HEAP) },
     }
 }
 
@@ -649,58 +765,123 @@ pub unsafe fn publish(s: &Slot, uav: bool) {
         return;
     }
     if s.sampler {
-        let dev = GLOBAL_SAMPLER.read().unwrap().as_ref().map(|g| g.dev.clone());
-        if let Some(dev) = dev {
-            dev.CopyDescriptorsSimple(
-                1,
-                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
-                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
-                D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-            );
-        }
+        let Some((dev, lease)) = GLOBAL_SAMPLER.write().unwrap().as_mut().map(|g| {
+            let lease = if g.inc > 0 && s.shared_srv >= g.cpu {
+                let idx = ((s.shared_srv - g.cpu) / g.inc as u64) as u32;
+                g.leases.acquire(idx, 1);
+                SingleLease { sampler: true, first: idx, count: 1 }
+            } else {
+                SingleLease { sampler: true, first: 0, count: 0 }
+            };
+            (g.dev.clone(), lease)
+        }) else {
+            return;
+        };
+        let _lease = lease;
+        dev.CopyDescriptorsSimple(
+            1,
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
+            D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+        );
         return;
     }
-    let target = GLOBAL.read().unwrap().as_ref().map(|g| (g.dev.clone(), g.inc));
-    if let Some((dev, inc)) = target {
-        let (dst, src) = if uav { (s.shared_srv + inc as u64, s.pc_uav) } else { (s.shared_srv, s.pc_srv) };
-        dev.CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    }
+    let Some((dev, dst, src, lease)) = GLOBAL.write().unwrap().as_mut().map(|g| {
+        let (dst, src) = if uav { (s.shared_srv + g.inc as u64, s.pc_uav) } else { (s.shared_srv, s.pc_srv) };
+        let lease = if g.inc > 0 && dst >= g.cpu {
+            let idx = ((dst - g.cpu) / g.inc as u64) as u32;
+            g.leases.acquire(idx, 1);
+            SingleLease { sampler: false, first: idx, count: 1 }
+        } else {
+            SingleLease { sampler: false, first: 0, count: 0 }
+        };
+        (g.dev.clone(), dst, src, lease)
+    }) else {
+        return;
+    };
+    let _lease = lease;
+    dev.CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
 /// `n` view or sampler slots from `first` were copied (in the title's heap): they go to the shared heap,
-/// a run per page (a heap's pages lie apart there).
+/// a run per page (a heap's pages lie apart there), clamped to the heap's bounds.
 pub unsafe fn publish_range(first: &Slot, n: u32) {
+    if n == 0 {
+        return;
+    }
+    let mul = if first.sampler { 1u32 } else { 2u32 };
     let page_slots = if first.sampler { SAMPLER_PAGE_SLOTS } else { PAGE_SLOTS };
-    let step = if first.sampler { SAMPLER_SLOT } else { SLOT };
-    let dev = if first.sampler {
-        GLOBAL_SAMPLER.read().unwrap().as_ref().map(|g| g.dev.clone())
-    } else {
-        GLOBAL.read().unwrap().as_ref().map(|g| g.dev.clone())
-    };
-    let Some(dev) = dev else { return };
-    let mut done = 0;
-    while done < n {
-        let s = if done == 0 { Some(*first) } else { slot((first.at + (done * step) as usize) as u64) };
-        let Some(s) = s else { return };
-        let run = (page_slots - s.k % page_slots).min(n - done);
-        if s.shared_srv != 0 {
-            if s.sampler {
-                dev.CopyDescriptorsSimple(
-                    run,
-                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
-                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
-                    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                );
-            } else {
-                dev.CopyDescriptorsSimple(
-                    2 * run,
-                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
-                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
-                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                );
+    let mut runs: Vec<(u32, u64, u32)> = Vec::new();
+    let mut leased_ranges: Vec<(u32, u32)> = Vec::new();
+    // Hold `HEAPS` while acquiring leases under `GLOBAL*` (strict `HEAPS -> GLOBAL*` lock order)
+    // so `unregister` cannot release and recycle these destination ranges before the leases exist.
+    let (dev, g_cpu, g_inc) = {
+        let heaps = HEAPS.read().unwrap();
+        let mut standalone: Option<(u64, u64, u32)> = None;
+        if let Some(h) = find_heap_by_addr(&heaps, first.at as u64).filter(|h| h.sampler == first.sampler) {
+            let start_k = ((first.at - h.shadow) / h.slot_bytes() as usize) as u32;
+            let limit = n.min(h.n.saturating_sub(start_k));
+            let mut done = 0u32;
+            while done < limit {
+                let k = start_k + done;
+                let run = (page_slots - k % page_slots).min(limit - done);
+                let page = if h.sampler { sampler_page_of(h, k) } else { page_of(h, k) };
+                if let Some((first_idx, k0)) = page {
+                    let dst_idx = first_idx + mul * (k - k0);
+                    let src = h.pc_cpu + (mul as u64 * k as u64) * h.inc as u64;
+                    runs.push((dst_idx, src, mul * run));
+                }
+                done += run;
             }
+        } else if first.shared_srv != 0 {
+            let run = (page_slots - first.k % page_slots).min(n);
+            standalone = Some((first.shared_srv, first.pc_srv, mul * run));
         }
-        done += run;
+        if runs.is_empty() && standalone.is_none() {
+            return;
+        }
+        let snap = if first.sampler {
+            GLOBAL_SAMPLER.write().unwrap().as_mut().map(|g| {
+                if let Some((dst_ptr, src, cnt)) = standalone {
+                    if g.inc > 0 && dst_ptr >= g.cpu {
+                        runs.push((((dst_ptr - g.cpu) / g.inc as u64) as u32, src, cnt));
+                    }
+                }
+                for &(idx, _, cnt) in &runs {
+                    g.leases.acquire(idx, cnt);
+                    leased_ranges.push((idx, cnt));
+                }
+                (g.dev.clone(), g.cpu, g.inc)
+            })
+        } else {
+            GLOBAL.write().unwrap().as_mut().map(|g| {
+                if let Some((dst_ptr, src, cnt)) = standalone {
+                    if g.inc > 0 && dst_ptr >= g.cpu {
+                        runs.push((((dst_ptr - g.cpu) / g.inc as u64) as u32, src, cnt));
+                    }
+                }
+                for &(idx, _, cnt) in &runs {
+                    g.leases.acquire(idx, cnt);
+                    leased_ranges.push((idx, cnt));
+                }
+                (g.dev.clone(), g.cpu, g.inc)
+            })
+        };
+        let Some(snap) = snap else {
+            return;
+        };
+        snap
+    };
+    let _lease = RangeLease { sampler: first.sampler, ranges: leased_ranges };
+    let heap_ty = if first.sampler { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER } else { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV };
+    for (dst_idx, src, count) in runs {
+        let dst = g_cpu + (dst_idx as u64) * (g_inc as u64);
+        dev.CopyDescriptorsSimple(
+            count,
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst as usize },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src as usize },
+            heap_ty,
+        );
     }
 }
 
@@ -949,6 +1130,7 @@ struct GlobalSampler {
     next: u32,
     free: Vec<(u32, u32)>,
     retired: VecDeque<RetiredRange<ID3D12Fence>>,
+    leases: LeasePool,
     smallest_failed: u32,
 }
 
@@ -1018,6 +1200,7 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
             next: 1,
             free: Vec::new(),
             retired: VecDeque::new(),
+            leases: LeasePool::default(),
             smallest_failed: u32::MAX,
         });
     }
@@ -1027,7 +1210,7 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
 fn reserve_global_sampler(count: u32) -> Option<u32> {
     let mut g = GLOBAL_SAMPLER.write().unwrap();
     let s = g.as_mut()?;
-    if unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) } {
+    if unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, &mut s.leases, |f| f.GetCompletedValue()) } {
         s.smallest_failed = u32::MAX;
     }
     if count >= s.smallest_failed {
@@ -1073,12 +1256,13 @@ fn release_global_sampler(first: u32, count: u32) {
     let marks = unsafe { signal_live_queues_for(&dev) };
     if let Some(s) = GLOBAL_SAMPLER.write().unwrap().as_mut() {
         if marks.as_ref().is_some_and(Vec::is_empty) {
-            merge_release(&mut s.free, first, count);
-            s.smallest_failed = u32::MAX;
+            if s.leases.release_or_defer(&mut s.free, first, count) {
+                s.smallest_failed = u32::MAX;
+            }
         } else {
             s.retired.push_back(RetiredRange { first, count, marks });
         }
-        if unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, |f| f.GetCompletedValue()) } {
+        if unsafe { drain_retired_ranges(&mut s.retired, &mut s.free, &mut s.leases, |f| f.GetCompletedValue()) } {
             s.smallest_failed = u32::MAX;
         }
     }
@@ -1194,7 +1378,7 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
-                next: crate::gpu::recomp::MEM_HEAP_NULL + 1, free: Vec::new(), retired: VecDeque::new(), smallest_failed: u32::MAX,
+                next: crate::gpu::recomp::MEM_HEAP_NULL + 1, free: Vec::new(), retired: VecDeque::new(), leases: LeasePool::default(), smallest_failed: u32::MAX,
             });
             let window = (&mut resource as *mut _ as usize, 0x10000);
             assert!(set_window_views_checked(&dev, &[window], true));
@@ -1389,7 +1573,7 @@ mod tests {
             *GLOBAL_SAMPLER.write().unwrap() = Some(GlobalSampler {
                 dev: ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
-                cpu: 0x1000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(), smallest_failed: u32::MAX,
+                cpu: 0x1000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(), leases: LeasePool::default(), smallest_failed: u32::MAX,
             });
             assert_eq!(reserve_global_sampler(4), Some(1));
             assert_eq!(reserve_global_sampler(4), Some(5));
@@ -1449,12 +1633,12 @@ mod tests {
             *GLOBAL.write().unwrap() = Some(Global {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut view_heap as *mut _ as *mut c_void),
-                cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024, next: 64, free: Vec::new(), retired: VecDeque::new(), smallest_failed: u32::MAX,
+                cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024, next: 64, free: Vec::new(), retired: VecDeque::new(), leases: LeasePool::default(), smallest_failed: u32::MAX,
             });
             *GLOBAL_SAMPLER.write().unwrap() = Some(GlobalSampler {
                 dev,
                 heap: ID3D12DescriptorHeap::from_raw(&mut sampler_heap as *mut _ as *mut c_void),
-                cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(), smallest_failed: u32::MAX,
+                cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(), leases: LeasePool::default(), smallest_failed: u32::MAX,
             });
             if crate::gpu::uma::get().is_some() {
                 assert!(register(0xC100, 16, 0x9000, 0, 16, true, true, true));
@@ -1523,24 +1707,25 @@ mod tests {
         let f2 = Arc::new(AtomicU64::new(0));
         let mut retired: VecDeque<RetiredRange<Arc<AtomicU64>>> = VecDeque::new();
         let mut free: Vec<(u32, u32)> = Vec::new();
+        let mut leases = LeasePool::default();
         retired.push_back(RetiredRange { first: 64, count: 16, marks: Some(vec![(f1.clone(), 1), (f2.clone(), 1)]) });
         retired.push_back(RetiredRange { first: 80, count: 16, marks: Some(vec![(f1.clone(), 2), (f2.clone(), 1)]) });
         retired.push_back(RetiredRange { first: 96, count: 16, marks: None });
 
         // While f2 is still pending, neither range may re-enter `free`.
         f1.store(1, Ordering::SeqCst);
-        drain_retired_ranges(&mut retired, &mut free, |f| f.load(Ordering::SeqCst));
+        drain_retired_ranges(&mut retired, &mut free, &mut leases, |f| f.load(Ordering::SeqCst));
         assert!(free.is_empty() && retired.len() == 3);
 
         // Once both queues pass mark 1, only range 1 returns; range 2 waits for f1 == 2.
         f2.store(1, Ordering::SeqCst);
-        drain_retired_ranges(&mut retired, &mut free, |f| f.load(Ordering::SeqCst));
+        drain_retired_ranges(&mut retired, &mut free, &mut leases, |f| f.load(Ordering::SeqCst));
         assert_eq!(free, vec![(64, 16)]);
         assert_eq!(retired.len(), 2);
 
         // Passing mark 2 coalesces [80, 96) with [64, 80); failed-signal range stays quarantined.
         f1.store(2, Ordering::SeqCst);
-        drain_retired_ranges(&mut retired, &mut free, |f| f.load(Ordering::SeqCst));
+        drain_retired_ranges(&mut retired, &mut free, &mut leases, |f| f.load(Ordering::SeqCst));
         assert_eq!(free, vec![(64, 32)]);
         assert_eq!(retired.len(), 1);
     }
@@ -1568,5 +1753,229 @@ mod tests {
         assert_eq!(words_at(rel(sm + 3 * SAMPLER_SLOT as u64)).unwrap()[..4], [4, 5, 6, 0xDEF0_0003]);
         unregister(0xD100);
         unregister(0xD101);
+    }
+
+    #[test]
+    fn publish_and_publish_range_do_not_hold_locks_during_device_calls() {
+        const CHILD: &str = "XCL_TEST_PUBLISH_LOCKS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::publish_and_publish_range_do_not_hold_locks_during_device_calls", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static UNLOCKED: AtomicBool = AtomicBool::new(true);
+        static CALLS: Mutex<Vec<(u32, u64, u64, i32)>> = Mutex::new(Vec::new());
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn copy_simple(_this: *mut c_void, n: u32, dst: D3D12_CPU_DESCRIPTOR_HANDLE, src: D3D12_CPU_DESCRIPTOR_HANDLE, ty: D3D12_DESCRIPTOR_HEAP_TYPE) {
+            let ok = GLOBAL.try_write().is_ok() && GLOBAL_SAMPLER.try_write().is_ok() && HEAPS.try_write().is_ok();
+            UNLOCKED.fetch_and(ok, Ordering::Relaxed);
+            CALLS.lock().unwrap().push((n, dst.ptr as u64, src.ptr as u64, ty.0));
+        }
+        let mut vt = [0usize; 25];
+        vt[1] = retain as usize;
+        vt[2] = retain as usize;
+        vt[24] = copy_simple as usize;
+        let (mut device, mut vheap, mut sheap) = (Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() });
+        let view_shadow = vec![0u8; (260 * SLOT) as usize];
+        let samp_shadow = vec![0u8; (12 * SAMPLER_SLOT) as usize];
+        unsafe {
+            let dev = ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void);
+            *GLOBAL.write().unwrap() = Some(Global { dev: dev.clone(), heap: ID3D12DescriptorHeap::from_raw(&mut vheap as *mut _ as *mut c_void), cpu: 0x10_0000, gpu: 0x18_0000, inc: 32, cap: 4096, next: 64, free: Vec::new(), retired: VecDeque::new(), leases: LeasePool::default(), smallest_failed: u32::MAX });
+            *GLOBAL_SAMPLER.write().unwrap() = Some(GlobalSampler { dev, heap: ID3D12DescriptorHeap::from_raw(&mut sheap as *mut _ as *mut c_void), cpu: 0x20_0000, inc: 16, cap: 256, next: 1, free: Vec::new(), retired: VecDeque::new(), leases: LeasePool::default(), smallest_failed: u32::MAX });
+            {
+                let mut heaps = HEAPS.write().unwrap();
+                heaps.push(Heap { obj: 0xA1, shadow: view_shadow.as_ptr() as usize, n: 260, pc_cpu: 0x30_0000, pc_gpu: 0, inc: 32, sampler: false, pages: (0..2).map(|_| AtomicU32::new(UNMAPPED)).collect(), visible: true, memory: Memory::Uma });
+                heaps.push(Heap { obj: 0xA2, shadow: samp_shadow.as_ptr() as usize, n: 12, pc_cpu: 0x40_0000, pc_gpu: 0, inc: 16, sampler: true, pages: (0..2).map(|_| AtomicU32::new(UNMAPPED)).collect(), visible: true, memory: Memory::Uma });
+                heaps.sort_by_key(|h| h.shadow);
+            }
+            let vs = slot(view_shadow.as_ptr() as u64).unwrap();
+            let ss = slot(samp_shadow.as_ptr() as u64).unwrap();
+            publish(&vs, false);
+            publish(&vs, true);
+            publish(&ss, false);
+            let v250 = slot(view_shadow.as_ptr() as u64 + (250 * SLOT) as u64).unwrap();
+            publish_range(&v250, 10);
+            let s6 = slot(samp_shadow.as_ptr() as u64 + (6 * SAMPLER_SLOT) as u64).unwrap();
+            publish_range(&s6, 6);
+            HEAPS.write().unwrap().clear();
+            *GLOBAL_SAMPLER.write().unwrap() = None;
+            *GLOBAL.write().unwrap() = None;
+        }
+        assert!(UNLOCKED.load(Ordering::Relaxed), "CopyDescriptorsSimple ran while GLOBAL, GLOBAL_SAMPLER, or HEAPS was locked");
+        let calls = CALLS.lock().unwrap();
+        assert_eq!(calls.len(), 7, "3 single publish + 2 view pages + 2 sampler pages");
+        assert_eq!(calls[0], (1, 0x10_0000 + 64 * 32, 0x30_0000, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0));
+        assert_eq!(calls[1], (1, 0x10_0000 + 65 * 32, 0x30_0000 + 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0));
+        assert_eq!(calls[2], (1, 0x20_0000 + 16, 0x40_0000, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0));
+        assert_eq!(calls[3], (12, 0x10_0000 + (64 + 500) * 32, 0x30_0000 + 500 * 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0));
+        assert_eq!(calls[4], (8, 0x10_0000 + (64 + 512) * 32, 0x30_0000 + 512 * 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0));
+        assert_eq!(calls[5], (2, 0x20_0000 + 7 * 16, 0x40_0000 + 6 * 16, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0));
+        assert_eq!(calls[6], (4, 0x20_0000 + 9 * 16, 0x40_0000 + 8 * 16, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0));
+    }
+
+    #[test]
+    fn publish_range_clamps_to_heap_bounds_without_overrunning_tail_pages() {
+        const CHILD: &str = "XCL_TEST_PUBLISH_BOUNDS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::publish_range_clamps_to_heap_bounds_without_overrunning_tail_pages", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use std::ffi::c_void;
+        static CALLS: Mutex<Vec<(u32, u64, u64, i32)>> = Mutex::new(Vec::new());
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn copy_simple(_this: *mut c_void, n: u32, dst: D3D12_CPU_DESCRIPTOR_HANDLE, src: D3D12_CPU_DESCRIPTOR_HANDLE, ty: D3D12_DESCRIPTOR_HEAP_TYPE) {
+            CALLS.lock().unwrap().push((n, dst.ptr as u64, src.ptr as u64, ty.0));
+        }
+        let mut vt = [0usize; 25];
+        vt[1] = retain as usize;
+        vt[2] = retain as usize;
+        vt[24] = copy_simple as usize;
+        let (mut device, mut vheap, mut sheap) = (Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() });
+        let v4_shadow = vec![0u8; (4 * SLOT) as usize];
+        let s3_shadow = vec![0u8; (3 * SAMPLER_SLOT) as usize];
+        let v260_shadow = vec![0u8; (260 * SLOT) as usize];
+        unsafe {
+            let dev = ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void);
+            *GLOBAL.write().unwrap() = Some(Global { dev: dev.clone(), heap: ID3D12DescriptorHeap::from_raw(&mut vheap as *mut _ as *mut c_void), cpu: 0x10_0000, gpu: 0x18_0000, inc: 32, cap: 4096, next: 64, free: Vec::new(), retired: VecDeque::new(), leases: LeasePool::default(), smallest_failed: u32::MAX });
+            *GLOBAL_SAMPLER.write().unwrap() = Some(GlobalSampler { dev, heap: ID3D12DescriptorHeap::from_raw(&mut sheap as *mut _ as *mut c_void), cpu: 0x20_0000, inc: 16, cap: 256, next: 1, free: Vec::new(), retired: VecDeque::new(), leases: LeasePool::default(), smallest_failed: u32::MAX });
+            {
+                let mut heaps = HEAPS.write().unwrap();
+                heaps.push(Heap { obj: 0xB1, shadow: v4_shadow.as_ptr() as usize, n: 4, pc_cpu: 0x30_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![AtomicU32::new(UNMAPPED)], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { obj: 0xB2, shadow: s3_shadow.as_ptr() as usize, n: 3, pc_cpu: 0x40_0000, pc_gpu: 0, inc: 16, sampler: true, pages: vec![AtomicU32::new(UNMAPPED)], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { obj: 0xB3, shadow: v260_shadow.as_ptr() as usize, n: 260, pc_cpu: 0x50_0000, pc_gpu: 0, inc: 32, sampler: false, pages: (0..2).map(|_| AtomicU32::new(UNMAPPED)).collect(), visible: true, memory: Memory::Uma });
+                heaps.sort_by_key(|h| h.shadow);
+            }
+            let v4_s1 = slot(v4_shadow.as_ptr() as u64 + SLOT as u64).unwrap();
+            publish_range(&v4_s1, 0);
+            publish_range(&v4_s1, 10);
+            let s3_s1 = slot(s3_shadow.as_ptr() as u64 + SAMPLER_SLOT as u64).unwrap();
+            publish_range(&s3_s1, 10);
+            let v260_s250 = slot(v260_shadow.as_ptr() as u64 + (250 * SLOT) as u64).unwrap();
+            publish_range(&v260_s250, 20);
+            HEAPS.write().unwrap().clear();
+            *GLOBAL_SAMPLER.write().unwrap() = None;
+            *GLOBAL.write().unwrap() = None;
+        }
+        let calls = CALLS.lock().unwrap();
+        assert_eq!(
+            *calls,
+            vec![
+                // 4-slot view heap (allocated 64..72): k=1..4 => 6 descriptors (ending at 72, 0 overrun)
+                (6, 0x10_0000 + 66 * 32, 0x30_0000 + 2 * 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0),
+                // 3-slot sampler heap (allocated 1..4): k=1..3 => 2 descriptors (ending at 4, 0 overrun)
+                (2, 0x20_0000 + 2 * 16, 0x40_0000 + 16, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0),
+                // 260-slot view heap: page 0 (72..584) k=250..256 => 12 descs; tail page 1 (584..592) k=256..260 => 8 descs
+                (12, 0x10_0000 + (72 + 500) * 32, 0x50_0000 + 500 * 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0),
+                (8, 0x10_0000 + 584 * 32, 0x50_0000 + 512 * 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0),
+            ],
+            "publish_range must clamp strictly to heap bounds with 0 tail-page overrun"
+        );
+    }
+
+    #[test]
+    fn publish_leases_prevent_unregister_range_reuse_while_copy_in_flight() {
+        const CHILD: &str = "XCL_TEST_PUBLISH_LEASES_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::publish_leases_prevent_unregister_range_reuse_while_copy_in_flight", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use std::ffi::c_void;
+        use std::sync::{Arc, Barrier, OnceLock};
+        static GATE: OnceLock<(Arc<Barrier>, Arc<Barrier>)> = OnceLock::new();
+        static LOCKS_FREE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn blocking_copy(_this: *mut c_void, _n: u32, _dst: D3D12_CPU_DESCRIPTOR_HANDLE, _src: D3D12_CPU_DESCRIPTOR_HANDLE, _ty: D3D12_DESCRIPTOR_HEAP_TYPE) {
+            let ok = GLOBAL.try_write().is_ok() && GLOBAL_SAMPLER.try_write().is_ok() && HEAPS.try_write().is_ok();
+            LOCKS_FREE.fetch_and(ok, std::sync::atomic::Ordering::Relaxed);
+            let (entered, release) = GATE.get().unwrap();
+            entered.wait();
+            release.wait();
+        }
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        GATE.set((entered.clone(), release.clone())).ok();
+        let mut vt = [0usize; 25];
+        vt[1] = retain as usize;
+        vt[2] = retain as usize;
+        vt[24] = blocking_copy as usize;
+        let (mut device, mut vheap, mut sheap) = (Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() });
+        let v1_shadow = vec![0u8; (4 * SLOT) as usize];
+        let v2_shadow = vec![0u8; (4 * SLOT) as usize];
+        let s1_shadow = vec![0u8; (3 * SAMPLER_SLOT) as usize];
+        unsafe {
+            let dev = ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void);
+            *GLOBAL.write().unwrap() = Some(Global { dev: dev.clone(), heap: ID3D12DescriptorHeap::from_raw(&mut vheap as *mut _ as *mut c_void), cpu: 0x10_0000, gpu: 0x18_0000, inc: 32, cap: 4096, next: 64, free: Vec::new(), retired: VecDeque::new(), leases: LeasePool::default(), smallest_failed: u32::MAX });
+            *GLOBAL_SAMPLER.write().unwrap() = Some(GlobalSampler { dev, heap: ID3D12DescriptorHeap::from_raw(&mut sheap as *mut _ as *mut c_void), cpu: 0x20_0000, inc: 16, cap: 256, next: 1, free: Vec::new(), retired: VecDeque::new(), leases: LeasePool::default(), smallest_failed: u32::MAX });
+            {
+                let mut heaps = HEAPS.write().unwrap();
+                heaps.push(Heap { obj: 0xD1, shadow: v1_shadow.as_ptr() as usize, n: 4, pc_cpu: 0x30_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![AtomicU32::new(UNMAPPED)], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { obj: 0xD2, shadow: v2_shadow.as_ptr() as usize, n: 4, pc_cpu: 0x31_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![AtomicU32::new(UNMAPPED)], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { obj: 0xD3, shadow: s1_shadow.as_ptr() as usize, n: 3, pc_cpu: 0x40_0000, pc_gpu: 0, inc: 16, sampler: true, pages: vec![AtomicU32::new(UNMAPPED)], visible: true, memory: Memory::Uma });
+                heaps.sort_by_key(|h| h.shadow);
+            }
+            // 1. Single `publish` holds a lease until CopyDescriptorsSimple returns.
+            let vs1 = slot(v1_shadow.as_ptr() as u64).unwrap();
+            assert_eq!(vs1.index, 64);
+            let t1 = std::thread::spawn(move || publish(&vs1, false));
+            entered.wait();
+            unregister(0xD1);
+            let new_v = reserve_global(8).unwrap();
+            assert!(!ranges_overlap((new_v, 8), (64, 8)), "new heap reused leased publish range [64, 72): got {new_v}");
+            release.wait();
+            t1.join().unwrap();
+            assert_eq!(reserve_global(8), Some(64), "deferred view range must return to free once publish completes");
+            release_global(64, 8);
+
+            // 2. `publish_range` (view) holds leases across unregister and releases them on completion.
+            let vs2 = slot(v2_shadow.as_ptr() as u64).unwrap();
+            assert_eq!(vs2.index, 64);
+            let t2 = std::thread::spawn(move || publish_range(&vs2, 4));
+            entered.wait();
+            unregister(0xD2);
+            let new_v2 = reserve_global(8).unwrap();
+            assert!(!ranges_overlap((new_v2, 8), (64, 8)), "new heap reused leased publish_range view range [64, 72): got {new_v2}");
+            release.wait();
+            t2.join().unwrap();
+            assert_eq!(reserve_global(8), Some(64), "deferred publish_range view range must return to free on completion");
+
+            // 3. `publish_range` (sampler) holds leases across unregister and releases them on completion.
+            let ss1 = slot(s1_shadow.as_ptr() as u64).unwrap();
+            assert_eq!(ss1.index, 1);
+            let t3 = std::thread::spawn(move || publish_range(&ss1, 3));
+            entered.wait();
+            unregister(0xD3);
+            let new_s = reserve_global_sampler(3).unwrap();
+            assert!(!ranges_overlap((new_s, 3), (1, 3)), "new sampler heap reused leased range [1, 4): got {new_s}");
+            release.wait();
+            t3.join().unwrap();
+            assert_eq!(reserve_global_sampler(3), Some(1), "deferred sampler range must return to free on completion");
+
+            HEAPS.write().unwrap().clear();
+            *GLOBAL_SAMPLER.write().unwrap() = None;
+            *GLOBAL.write().unwrap() = None;
+        }
+        assert!(LOCKS_FREE.load(std::sync::atomic::Ordering::Relaxed), "CopyDescriptorsSimple must still run with all locks released");
     }
 }
