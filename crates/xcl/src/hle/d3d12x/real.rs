@@ -9333,6 +9333,7 @@ pub fn drain_gpu() {
                 Err(e) => {
                     crate::xlog_error!("D3D12 queue drain: {e}");
                     if matches!(e, FenceError::Removed(_)) {
+                        log_device_removed();
                         return;
                     }
                 }
@@ -9346,6 +9347,9 @@ pub fn drain_gpu() {
                     Ok(value) => pending |= value < 1,
                     Err(e) => {
                         crate::xlog_error!("D3D12 queue drain: {e}");
+                        if matches!(e, FenceError::Removed(_)) {
+                            log_device_removed();
+                        }
                         return;
                     }
                 }
