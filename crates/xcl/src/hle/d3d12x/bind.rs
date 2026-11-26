@@ -3333,7 +3333,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         }
         return;
     }
-    if super::pso_async::is_pending(raw_pso) {
+    if super::pso_async::bound_unbuilt(raw_pso, pso) {
         count(DRAWS_SKIPPED);
         return;
     }
@@ -3364,7 +3364,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
-    let unbuilt_compute = signature_dispatches(sig) && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
+    let unbuilt_compute = signature_dispatches(sig)
+        && super::pso_async::is_pending(raw_pso)
+        && !super::pso_async::is_spared(raw_pso)
+        && super::real::is_console_compute(raw_pso);
     if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
         return super::pso_async::need_by_submit(raw_pso);
     }
@@ -3457,7 +3460,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // call with that pair is invalid (debug layer 953, "the currently set Root Signature
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(raw_pso) {
+        if super::pso_async::bound_unbuilt(raw_pso, pso) {
             note_skipped_indirect(this, sig);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -4358,7 +4361,10 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         s.inline_guard = None;
         s.pso
     });
-    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
+    if super::pso_async::is_pending(pso)
+        && !super::pso_async::is_spared(pso)
+        && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z))
+    {
         return super::pso_async::need_by_submit(pso);
     }
     let pso = super::pso_async::resolve_wait(pso);

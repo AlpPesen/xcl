@@ -8,8 +8,11 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+
+/// Sentinel for `Pending::waited_frame`: no frame has spent graphics wait budget on this PSO yet.
+const UNWAITED: u64 = u64::MAX;
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
@@ -38,6 +41,9 @@ struct Pending {
     /// heavyweight RT/compute shader (`>= 512 KiB` DXIL / BVH traversal): lower worker queue
     /// priority than normal/MS PSOs so world-entry draws finish ahead of slow RT compiles
     deprioritized: std::sync::atomic::AtomicBool,
+    /// first frame that waited on this graphics PSO within `XCL_PSO_FRAME_BUDGET_MS` (`UNWAITED`
+    /// if never waited yet): later frames skip waiting while workers finish compiling it
+    waited_frame: AtomicU64,
     demand: Mutex<Demand>,
 }
 
@@ -337,6 +343,16 @@ impl PsoQueue {
     fn pop(&self) -> Work {
         let mut g = self.items.lock().unwrap();
         loop {
+            if let Some(pos) = g.iter().position(|item| {
+                item.pending.as_ref().is_some_and(|p| {
+                    p.compute
+                        && !p.spared.load(Ordering::Acquire)
+                        && !p.bvh_traversal.load(Ordering::Acquire)
+                        && p.demand.lock().unwrap().wanted
+                })
+            }) {
+                return g.remove(pos).unwrap().work;
+            }
             if let Some(pos) = g.iter().position(|item| item.pending.as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted)) {
                 return g.remove(pos).unwrap().work;
             }
@@ -579,6 +595,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, flag
         spared: std::sync::atomic::AtomicBool::new(flags.spared),
         bvh_traversal: std::sync::atomic::AtomicBool::new(flags.bvh_traversal),
         deprioritized: std::sync::atomic::AtomicBool::new(flags.deprioritized),
+        waited_frame: AtomicU64::new(UNWAITED),
         demand: Default::default(),
     });
     PENDING.write().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -1371,6 +1388,7 @@ pub fn submit_gated(standin: usize, driver: usize) {
         spared: std::sync::atomic::AtomicBool::new(false),
         bvh_traversal: std::sync::atomic::AtomicBool::new(true),
         deprioritized: std::sync::atomic::AtomicBool::new(true),
+        waited_frame: AtomicU64::new(UNWAITED),
         demand: Default::default(),
     });
     PENDING.write().unwrap().get_or_insert_with(HashMap::new).insert(standin, p);
@@ -1406,8 +1424,12 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built within the per-frame wait window
-/// (`XCL_PSO_FRAME_BUDGET_MS`, default 12 s per kind per frame).
+/// `resolve`, waiting for a pipeline still being built:
+/// - non-spared memory-writing producer compute pipelines always wait (never skipped by
+///   `XCL_PSO_FRAME_BUDGET_MS`, because skipping a producer compute dispatch corrupts title memory);
+/// - graphics pipelines wait within the per-frame graphics window (`XCL_PSO_FRAME_BUDGET_MS`,
+///   default 12 s) and stamp `waited_frame` so a slow graphics PSO stalls at most one frame;
+/// - `spared` (`image_only`) and `bvh_traversal` compute pipelines use `resolve_spared`.
 pub fn resolve_wait(pso: usize) -> usize {
     resolve_wait_for(pso, wait_budget())
 }
@@ -1484,8 +1506,8 @@ fn set_submit_wait_for_test(most: Option<std::time::Duration>) {
     SUBMIT_WAIT_FOR_TEST.with(|b| b.set(most));
 }
 
-/// `resolve_wait`, waiting at most `budget` per pipeline (and at most the remaining
-/// per-frame window for this pipeline's kind).
+/// `resolve_wait`, waiting at most `budget` per pipeline (and for graphics pipelines, at most
+/// the remaining per-frame graphics window).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
@@ -1493,15 +1515,19 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
         return resolve_spared(&p, pso);
     }
     let frame = super::present::presents();
-    resolve_wait_in(&p, pso, budget, frame_budget(), frame, kind_frame_budget(p.compute))
+    // Memory-writing producer compute PSOs (`!spared && !bvh_traversal`) are never skipped by the
+    // per-frame graphics wait window: skipping a producer dispatch leaves title memory/tables
+    // uninitialized and causes Window-3 pointer corruption several frames later.
+    let fcap = if p.compute { None } else { frame_budget() };
+    resolve_wait_in(&p, pso, budget, fcap, frame, &FRAME_BUDGET_GFX)
 }
 
-/// Default per-frame pipeline wait window (`12 s`) for each kind (`graphics`, `compute`).
+/// Default per-frame graphics pipeline wait window (`12 s`).
 const DEFAULT_FRAME_BUDGET_MS: u64 = 12_000;
 
 /// Parses `XCL_PSO_FRAME_BUDGET_MS`: unset/empty defaults to `12_000 ms` (`12 s`), `0` skips
 /// waiting immediately, `off` / `none` disables the per-frame cap, and a positive integer sets
-/// the per-frame window in milliseconds for each kind (`graphics`, `compute`).
+/// the per-frame graphics wait window in milliseconds.
 fn parse_frame_budget(val: Option<&str>) -> Option<std::time::Duration> {
     let Some(raw) = val.map(str::trim).filter(|s| !s.is_empty()) else {
         return Some(std::time::Duration::from_millis(DEFAULT_FRAME_BUDGET_MS));
@@ -1521,17 +1547,13 @@ fn frame_budget() -> Option<std::time::Duration> {
 }
 
 static FRAME_BUDGET_GFX: Mutex<FrameWaitBudget> = Mutex::new(FrameWaitBudget::new());
-static FRAME_BUDGET_CS: Mutex<FrameWaitBudget> = Mutex::new(FrameWaitBudget::new());
-
-fn kind_frame_budget(compute: bool) -> &'static Mutex<FrameWaitBudget> {
-    if compute { &FRAME_BUDGET_CS } else { &FRAME_BUDGET_GFX }
-}
 
 /// Waits for `p` within both an optional per-PSO cap (`budget`) and an optional per-frame
-/// per-kind window (`frame_cap` tracked in `frame_state` for `frame`). Builds run on
+/// graphics window (`frame_cap` tracked in `frame_state` for `frame`). Builds run on
 /// `xcl-pso-*` workers (prioritized as `wanted`) so the caller always wakes when the window
-/// expires; once a frame's window is spent, remaining unready draws/dispatches return the
-/// stand-in for this frame and retry with a fresh window on the next frame.
+/// expires; once a graphics PSO has spent budget on a frame (`waited_frame`), subsequent frames
+/// skip waiting on it immediately until workers complete it. Non-spared memory-writing producer
+/// compute pipelines pass `frame_cap = None` and always wait to completion.
 fn resolve_wait_in(
     p: &Arc<Pending>,
     pso: usize,
@@ -1596,10 +1618,17 @@ fn resolve_wait_in(
         }
         return built(p);
     };
+    // A slow graphics PSO that already got its wait turn on an earlier frame keeps compiling in
+    // the background without re-burning `frame`'s graphics wait window every frame.
+    let prev_waited = p.waited_frame.load(Ordering::Acquire);
+    if prev_waited != UNWAITED && prev_waited != frame {
+        return p.stand(pso);
+    }
     let rem = frame_state.lock().unwrap().begin_wait(frame, fcap, std::time::Instant::now());
     if rem.is_zero() {
         return p.stand(pso);
     }
+    let _ = p.waited_frame.compare_exchange(UNWAITED, frame, Ordering::AcqRel, Ordering::Acquire);
     let (wait_for, per_pso_binding) = match budget {
         Some(b) if b <= rem => (b, true),
         _ => (rem, false),
@@ -1625,15 +1654,11 @@ fn resolve_wait_in(
             );
         }
     } else {
-        // Do NOT set `p.late` so the pipeline is retried with a fresh window on the next frame.
         static N_GFX: AtomicUsize = AtomicUsize::new(0);
-        static N_CS: AtomicUsize = AtomicUsize::new(0);
-        let counter = if p.compute { &N_CS } else { &N_GFX };
-        let n = counter.fetch_add(1, Ordering::Relaxed);
+        let n = N_GFX.fetch_add(1, Ordering::Relaxed);
         if n < 16 || n.is_power_of_two() {
-            let kind = if p.compute { "compute" } else { "graphics" };
             crate::xlog_warn!(
-                "D3D12.X: {kind} pipeline wait window ({} ms) spent on frame {frame}: skipping remaining unready {kind} work until next frame ({} so far)",
+                "D3D12.X: graphics pipeline wait window ({} ms) spent on frame {frame}: skipping remaining unready graphics work until next frame ({} so far)",
                 fcap.as_millis(),
                 n + 1
             );
@@ -1674,17 +1699,10 @@ pub fn waits_bounded() -> bool {
     wait_budget().is_some()
 }
 
-/// Whether per-frame pipeline wait windows (`XCL_PSO_FRAME_BUDGET_MS`) are active.
-pub fn frame_budget_enabled() -> bool {
-    frame_budget().is_some()
-}
-
-/// Whether the current frame's compute pipeline wait window has already been spent.
-pub fn compute_frame_budget_spent() -> bool {
-    frame_budget().is_some_and(|cap| {
-        let frame = super::present::presents();
-        FRAME_BUDGET_CS.lock().unwrap().remaining_at(frame, cap, std::time::Instant::now()).is_zero()
-    })
+/// `pso` is a stand-in marked `spared` (`image_only`) or `bvh_traversal`, whose dispatches do
+/// not block or defer to submit segments.
+pub fn is_spared(pso: usize) -> bool {
+    entry(pso).is_some_and(|p| p.spared.load(Ordering::Acquire) || p.bvh_traversal.load(Ordering::Acquire))
 }
 
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
@@ -1806,6 +1824,7 @@ impl FrameWaitBudget {
         self.spent.saturating_add(in_flight)
     }
 
+    #[cfg(test)]
     fn remaining_at(&mut self, frame: u64, cap: std::time::Duration, now: std::time::Instant) -> std::time::Duration {
         self.advance(frame, now);
         cap.saturating_sub(self.effective_spent(now))
@@ -1947,6 +1966,19 @@ pub fn is_stand_in(pso: usize) -> bool {
     entry(pso).is_some_and(|p| p.real.load(Ordering::Acquire) == 0)
 }
 
+/// Whether `bound` (returned by `resolve*` for `standin`) is an unbuilt stand-in rather than the
+/// real pipeline — remains `true` even if a worker finishes building `standin` between `resolve*`
+/// and the caller's check (`#2598`), while returning `false` if the build failed (`real == 0`).
+pub fn bound_unbuilt(standin: usize, bound: usize) -> bool {
+    entry(standin).is_some_and(|p| {
+        if !*p.done.lock().unwrap() {
+            return true;
+        }
+        let real = p.real.load(Ordering::Acquire);
+        real != 0 && bound != real
+    })
+}
+
 /// One of the title's threads is about to wait for `pso`.
 pub fn want(pso: usize) {
     if let Some(p) = entry(pso) {
@@ -1991,8 +2023,47 @@ mod pso_queue_tests {
             spared: Default::default(),
             bvh_traversal: Default::default(),
             deprioritized: std::sync::atomic::AtomicBool::new(deprioritized),
+            waited_frame: AtomicU64::new(UNWAITED),
             demand: Mutex::new(Demand { wanted, by_submit: false, preload_thread: 0 }),
         })
+    }
+
+    fn dummy_compute_pending(wanted: bool, spared: bool) -> Arc<Pending> {
+        Arc::new(Pending {
+            job: Mutex::new(None),
+            sent: std::sync::atomic::AtomicBool::new(true),
+            real: AtomicUsize::new(0),
+            driver: AtomicUsize::new(0),
+            done: Mutex::new(false),
+            cv: Condvar::new(),
+            compute: true,
+            key: 0,
+            used: Default::default(),
+            orphan: Default::default(),
+            late: Default::default(),
+            spared: std::sync::atomic::AtomicBool::new(spared),
+            bvh_traversal: Default::default(),
+            deprioritized: Default::default(),
+            waited_frame: AtomicU64::new(UNWAITED),
+            demand: Mutex::new(Demand { wanted, by_submit: false, preload_thread: 0 }),
+        })
+    }
+
+    #[test]
+    fn pso_queue_prioritizes_wanted_producer_compute_over_wanted_graphics() {
+        let q = PsoQueue::new();
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let push = |name: &'static str, p: Arc<Pending>| {
+            let o = order.clone();
+            q.push(Box::new(move || o.lock().unwrap().push(name)), Some(p));
+        };
+        push("gfx_wanted", dummy_pending(true, false));
+        push("cs_spared_wanted", dummy_compute_pending(true, true));
+        push("cs_producer_wanted", dummy_compute_pending(true, false));
+        for _ in 0..3 {
+            (q.pop())();
+        }
+        assert_eq!(*order.lock().unwrap(), ["cs_producer_wanted", "gfx_wanted", "cs_spared_wanted"]);
     }
 
     #[test]
@@ -2123,14 +2194,13 @@ mod pso_queue_tests {
     }
 
     #[test]
-    fn frame_budget_waits_within_window_skips_rest_of_frame_and_retries_next_frame() {
+    fn frame_budget_waits_within_window_stamps_slow_gfx_once_and_never_skips_producer_compute() {
         use std::time::{Duration, Instant};
 
         let gfx_budget = Mutex::new(FrameWaitBudget::new());
-        let cs_budget = Mutex::new(FrameWaitBudget::new());
         let cap = Some(Duration::from_millis(60));
 
-        let (g_fast, g_slow1, g_slow2, c_fast) = (0x7E57_F001usize, 0x7E57_F002usize, 0x7E57_F003usize, 0x7E57_F004usize);
+        let (g_fast, g_slow1, g_slow2, c_prod) = (0x7E57_F001usize, 0x7E57_F002usize, 0x7E57_F003usize, 0x7E57_F004usize);
         let (go_tx, go_rx) = mpsc::channel::<()>();
         let (go2_tx, go2_rx) = mpsc::channel::<()>();
         submit_lazy(g_fast, false, Box::new(|| {
@@ -2145,36 +2215,53 @@ mod pso_queue_tests {
             let _ = go2_rx.recv();
             0xF103
         }), 0);
-        submit_lazy(c_fast, true, Box::new(|| {
-            std::thread::sleep(Duration::from_millis(10));
+        submit_lazy(c_prod, true, Box::new(|| {
+            std::thread::sleep(Duration::from_millis(90));
             0xF104
         }), 0);
+        heavy_compute(c_prod);
 
         // Frame 1: fast graphics PSO finishes within the 60 ms graphics window.
         let p_fast = entry(g_fast).unwrap();
         assert_eq!(resolve_wait_in(&p_fast, g_fast, None, cap, 1, &gfx_budget), 0xF101);
 
-        // Frame 1: slow graphics PSO spends the rest of frame 1's graphics window and skips.
+        // Frame 1: slow graphics PSO spends the rest of frame 1's graphics window, stamps
+        // waited_frame = 1, and skips.
         let p_slow1 = entry(g_slow1).unwrap();
         assert_eq!(resolve_wait_in(&p_slow1, g_slow1, None, cap, 1, &gfx_budget), g_slow1);
 
-        // Frame 1: second unready graphics PSO sees 0 ms remaining and skips immediately.
+        // Frame 1: second unready graphics PSO sees 0 ms remaining and skips immediately WITHOUT
+        // stamping waited_frame (so it gets a fresh turn on Frame 2).
         let p_slow2 = entry(g_slow2).unwrap();
         let t0 = Instant::now();
         assert_eq!(resolve_wait_in(&p_slow2, g_slow2, None, cap, 1, &gfx_budget), g_slow2);
         assert!(t0.elapsed() < Duration::from_millis(25), "spent frame budget must skip immediately ({:?})", t0.elapsed());
+        assert_eq!(p_slow2.waited_frame.load(Ordering::Acquire), UNWAITED);
 
-        // Frame 1: compute has its own independent per-frame window and completes cleanly!
-        let p_cs = entry(c_fast).unwrap();
-        assert_eq!(resolve_wait_in(&p_cs, c_fast, None, cap, 1, &cs_budget), 0xF104);
+        // Non-spared producer compute PSO (`!spared`, longer than 60 ms graphics window) MUST wait
+        // to completion instead of being skipped!
+        assert!(!is_spared(c_prod));
+        assert_eq!(resolve_wait_for(c_prod, None), 0xF104);
 
-        // Release both slow graphics workers and retry on Frame 2: both resolve (not stuck `late`)!
-        go_tx.send(()).unwrap();
+        // Frame 2: g_slow1 already spent its wait turn on Frame 1 -> skips immediately without
+        // burning Frame 2's graphics budget!
+        let t1 = Instant::now();
+        assert_eq!(resolve_wait_in(&p_slow1, g_slow1, None, Some(Duration::from_secs(5)), 2, &gfx_budget), g_slow1);
+        assert!(t1.elapsed() < Duration::from_millis(25), "already-waited slow graphics PSO must skip immediately on next frame ({:?})", t1.elapsed());
+
+        // Frame 2: g_slow2 never waited yet, so it gets Frame 2's full window and resolves once ready!
         go2_tx.send(()).unwrap();
-        assert_eq!(resolve_wait_in(&p_slow1, g_slow1, None, Some(Duration::from_secs(5)), 2, &gfx_budget), 0xF102);
         assert_eq!(resolve_wait_in(&p_slow2, g_slow2, None, Some(Duration::from_secs(5)), 2, &gfx_budget), 0xF103);
 
-        for s in [g_fast, g_slow1, g_slow2, c_fast] {
+        // Once g_slow1's worker completes, it immediately resolves to its real pipeline!
+        go_tx.send(()).unwrap();
+        let wait_start = Instant::now();
+        while is_pending(g_slow1) && wait_start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(resolve_wait_in(&p_slow1, g_slow1, None, Some(Duration::from_secs(5)), 3, &gfx_budget), 0xF102);
+
+        for s in [g_fast, g_slow1, g_slow2, c_prod] {
             let _ = released(s);
         }
     }
@@ -2206,5 +2293,38 @@ mod pso_queue_tests {
         assert_eq!(b.begin_wait(1468, cap, t0 + Duration::from_secs(13)), Duration::from_secs(12));
         b.end_wait(1468, cap, t0 + Duration::from_secs(14), false);
         assert_eq!(b.remaining_at(1468, cap, t0 + Duration::from_secs(14)), Duration::from_secs(11));
+    }
+
+    #[test]
+    fn bound_unbuilt_detects_standin_even_after_worker_finishes() {
+        let (standin_ok, standin_fail, native) = (0x7E57_9801usize, 0x7E57_9802usize, 0x7E57_9803usize);
+        let (tx, rx) = mpsc::channel::<()>();
+        submit_lazy(standin_ok, false, Box::new(move || {
+            let _ = rx.recv();
+            0x9801
+        }), 0);
+        // While pending: bound stand-in is unbuilt.
+        assert!(bound_unbuilt(standin_ok, standin_ok));
+        // Finish the build after the caller already got `standin_ok`.
+        let _ = resolve(standin_ok);
+        tx.send(()).unwrap();
+        let t0 = std::time::Instant::now();
+        while is_pending(standin_ok) && t0.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!is_pending(standin_ok));
+        assert!(bound_unbuilt(standin_ok, standin_ok), "stale stand-in must still read unbuilt after worker completes");
+        assert!(!bound_unbuilt(standin_ok, 0x9801), "resolved real pipeline must not read unbuilt");
+
+        // Failed build (real == 0) is not treated as an in-flight unbuilt stand-in.
+        submit(standin_fail, true, Box::new(|| 0));
+        assert_eq!(resolve_wait(standin_fail), standin_fail);
+        assert!(!bound_unbuilt(standin_fail, standin_fail));
+
+        // Unknown / native PC pipeline is never unbuilt.
+        assert!(!bound_unbuilt(native, native));
+
+        let _ = released(standin_ok);
+        let _ = released(standin_fail);
     }
 }
