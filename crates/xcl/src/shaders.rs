@@ -1452,6 +1452,7 @@ impl Pipelines {
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
             let sel = crate::gpu::adapter::Selector::from_env_or("auto");
             let (adapter, desc) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+            crate::hle::d3d12x::real::driver_cache::note_vendor(desc.VendorId);
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
             // Match `real::init`'s adapter string verbatim so offline `--precompile --pipelines`
             // opens and populates the exact same `pso-library/<hash>/gen-*.plib` directory.
