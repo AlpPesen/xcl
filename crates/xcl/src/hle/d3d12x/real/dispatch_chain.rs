@@ -104,7 +104,7 @@ struct Chain {
     builder: Arc<PipelineBuilder>,
     tail: Vec<ID3D12PipelineState>,
     words: u32,
-    whole_code: Vec<u8>,
+    whole_code: Arc<Vec<u8>>,
     whole: OnceLock<Option<ID3D12PipelineState>>,
     whole_started: AtomicBool,
     /// after a whole build that ran out of memory: when it may be tried, once more
@@ -286,7 +286,7 @@ unsafe fn signature_for(dev: &ID3D12Device, samplers: &[pso::StaticSampler]) -> 
 }
 
 pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
-    iid: *const GUID, result: *mut *mut c_void, record: u64, whole: &[u8], samplers: &[pso::StaticSampler],
+    iid: *const GUID, result: *mut *mut c_void, record: u64, whole: Arc<Vec<u8>>, samplers: &[pso::StaticSampler],
     plan: Arc<DispatchChain>) -> Option<usize> {
     if result.is_null() || iid.is_null() || plan.pieces.len() < 2 { return None; }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
@@ -313,7 +313,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
         builder,
         tail: pieces.collect(),
         words: plan.dwords_per_group,
-        whole_code: whole.to_vec(),
+        whole_code: whole,
         whole: OnceLock::new(),
         whole_started: AtomicBool::new(false),
         retry_at: Mutex::new(None),
