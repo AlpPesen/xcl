@@ -1840,13 +1840,36 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             _ => merged.push((a, n)),
         }
     }
-    s.rb_value += 1;
-    let v = s.rb_value;
-    if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.rb_queue.Wait(&s.rb_fence, v);
-        super::list_x::note_internal_wait(s.rb_queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
+    if let Some((f, v)) = readback_after(&s.rb_queue, queue) {
+        super::list_x::note_internal_wait(s.rb_queue.as_raw() as usize, "sparse readback behind a title queue", &f, v);
     }
     s.readback_ranges(&merged);
+}
+
+/// The sparse readback queue `rb_queue` waits until `q` has done what it was given so far, on a
+/// fence of `q`'s own: (fence, value), None if `q` could not signal it.
+///
+/// One fence for all the title's queues, each signalling the next value, went back down: a queue
+/// signals 11 and is done, another one still busy signals 10 after it – and the readback queue's
+/// wait for 11 never ended. A retail title's frames stopped behind it (every title queue idle,
+/// the readback queue stuck with work pending until the device was removed). A queue runs its
+/// work in order, so the values of its own fence only go up.
+unsafe fn readback_after(rb_queue: &ID3D12CommandQueue, q: &ID3D12CommandQueue) -> Option<(ID3D12Fence, u64)> {
+    static FENCES: Mutex<Option<HashMap<usize, (ID3D12Fence, u64)>>> = Mutex::new(None);
+    let key = q.as_raw() as usize;
+    let mut g = FENCES.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if !m.contains_key(&key) {
+        let mut dev: Option<ID3D12Device> = None;
+        q.GetDevice(&mut dev).ok()?;
+        let f: ID3D12Fence = dev?.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        m.insert(key, (f, 0));
+    }
+    let e = m.get_mut(&key)?;
+    e.1 += 1;
+    q.Signal(&e.0, e.1).ok()?;
+    let _ = rb_queue.Wait(&e.0, e.1);
+    Some((e.0.clone(), e.1))
 }
 
 /// Pooled per-`Map` synchronous readback resources so concurrent `ID3D12Resource::Map` readbacks
@@ -2380,11 +2403,8 @@ impl State {
                 continue;
             }
             seen.push(raw);
-            self.rb_value += 1;
-            let v = self.rb_value;
-            if q.Signal(&self.rb_fence, v).is_ok() {
-                let _ = self.rb_queue.Wait(&self.rb_fence, v);
-                super::list_x::note_internal_wait(rb_q, "sparse readback behind a title queue", &self.rb_fence, v);
+            if let Some((f, v)) = readback_after(&self.rb_queue, q) {
+                super::list_x::note_internal_wait(rb_q, "sparse readback behind a title queue", &f, v);
             }
         }
     }
