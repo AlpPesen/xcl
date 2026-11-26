@@ -1604,6 +1604,16 @@ impl Pipelines {
                 }
             }
         }
+        // a pipeline the driver did not come back from in an earlier run is not given to it again
+        // (`driver_crash`); this one is named there while the driver has it
+        let crash_key = crate::hle::d3d12x::driver_crash::compute_key(record);
+        if crate::hle::d3d12x::driver_crash::blocked(&crash_key) {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            eprintln!("  pipeline left out: the driver did not come back from record {record:016x} in an earlier run");
+            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+            return;
+        }
+        let _building = crate::hle::d3d12x::driver_crash::building(&crash_key, &[("cs.dxil".to_string(), dxil)]);
         use crate::hle::d3d12x::real::driver_cache;
         let path = path_override.or_else(|| {
             #[cfg(test)]

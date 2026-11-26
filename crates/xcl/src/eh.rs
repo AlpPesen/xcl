@@ -62,6 +62,9 @@ pub fn set_title_filter(f: usize) -> usize {
 }
 
 unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i32 {
+    // a crash inside the driver's compiler: the pipeline it was given is noted first, so the next
+    // run does not end at it too
+    crate::hle::d3d12x::driver_crash::on_crash();
     crate::hle::d3d12x::real::log_device_removed();
     if !info.is_null() && !(*info).ExceptionRecord.is_null() {
         let rec = &*(*info).ExceptionRecord;

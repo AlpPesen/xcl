@@ -20,6 +20,7 @@ pub mod device_x;
 pub mod dxgi_device;
 mod cpu_writes;
 pub mod dred;
+pub mod driver_crash;
 mod fence_x;
 mod format_alias;
 pub mod frame;

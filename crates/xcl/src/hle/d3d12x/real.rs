@@ -5862,6 +5862,14 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         crate::xlog_warn!("D3D12.X: compute PSO of record {record:016x} ({} B DXIL) not built: over XCL_PSO_MAX_KB{}", dxil.len(), if !has_isa_blob { " and without a saved blob" } else { " (it has a saved blob)" });
         return (E_OUTOFMEMORY, std::time::Duration::ZERO, false);
     }
+    // one the driver crashed on in an earlier run, here or in a preparation worker, is not
+    // given to it again (`driver_crash`): its dispatches are left out like a refused program's
+    let crash_key = super::driver_crash::compute_key(record);
+    if super::driver_crash::blocked(&crash_key) {
+        note_translation_error(format!("the driver crashed building the compute pipeline of record {record:016x} in an earlier run (driver-crashes.txt beside the DXIL cache) – not built"));
+        return (E_OUTOFMEMORY, std::time::Duration::ZERO, false);
+    }
+    let _building = super::driver_crash::building(&crash_key, &[("cs.dxil".to_string(), dxil)]);
     // in the background, a few at a time and within the commit headroom the program asks for
     let (mut hr, mut in_driver) = driver_compile_identified(
         "compute",
@@ -6872,6 +6880,17 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
             .map(std::sync::Arc::new);
     }
     let has_isa_blob = cached_blob_has_isa(cached.as_deref().map(Vec::as_slice));
+    // a pipeline the driver crashed on in an earlier run, here or in a preparation worker, is not
+    // given to it again (`driver_crash`): its draws are left out like a refused pipeline's
+    let crash_key = format!("g-{:016x}-{:x}", gkey.0, gkey.1);
+    if super::driver_crash::blocked(&crash_key) {
+        note_translation_error(format!("the driver crashed building the graphics pipeline {crash_key} in an earlier run (driver-crashes.txt beside the DXIL cache) – not built"));
+        return Some(E_INVALIDARG);
+    }
+    let mut crash_shaders: Vec<(String, &[u8])> = vec![("vs.dxil".to_string(), &vs_dxil[..])];
+    crash_shaders.extend(ps_dxil.as_deref().map(|p| ("ps.dxil".to_string(), &p[..])));
+    crash_shaders.extend(rect_gs.as_deref().map(|g| ("gs.dxil".to_string(), g)));
+    let _building = super::driver_crash::building(&crash_key, &crash_shaders);
     let build = create_graphics_pso_cached(
         &mut copy,
         has_isa_blob.then(|| cached.as_deref().map(Vec::as_slice)).flatten(),
@@ -7846,14 +7865,41 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<std::syn
     }
 }
 
+/// A pipeline state stream (its state; the pointers in it mean nothing later) and its shaders,
+/// each with the ending of the file `driver_crash` dumps it to, then the console shaders they
+/// were translated from (`console`: stage, container).
+unsafe fn crash_dump_shaders<'a>(stream: &'a [u8], console: &[(&str, Option<&'a [u8]>)]) -> Vec<(String, &'a [u8])> {
+    let mut shaders = vec![("stream.bin".to_string(), stream)];
+    for (ty, payload) in stream_subobjects(stream).unwrap_or_default() {
+        if !SHADER_SUBOBJECTS.iter().any(|t| t.0 as u32 == ty) {
+            continue;
+        }
+        let stage = match D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(ty as i32) {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS => "ms".to_string(),
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS => "ps".to_string(),
+            _ => format!("stage{ty}"),
+        };
+        if let Some(code) = payload_shader(payload) {
+            shaders.push((format!("{stage}.dxil"), code));
+        }
+    }
+    shaders.extend(console.iter().filter_map(|(stage, code)| Some((format!("console-{stage}.bin"), (*code)?))));
+    shaders
+}
+
 /// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
-/// the title gets the mesh pipeline state.
+/// the title gets the mesh pipeline state. `console`: the title's shaders it is made from (for
+/// `driver_crash`).
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, console: &[(&str, Option<&[u8]>)], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
     let mesh_lib_key = pso_lib::stream_key(&stream.0, mesh_rs as usize, stream.shader_bytes());
+    if super::driver_crash::blocked(&mesh_lib_key) {
+        note_translation_error(format!("the driver crashed building the mesh pipeline {mesh_lib_key} from the console {kind} in an earlier run (driver-crashes.txt beside the DXIL cache) – not built"));
+        return E_INVALIDARG;
+    }
     let cs_lib_key = pso_lib::compute_key(&tp.cs, &tp.samplers, 0);
     // Try loading both halves from the memory-mapped pipeline library before acquiring any cold
     // compile slot so warm runs bypass `big_compile_turn` and commit waits completely.
@@ -7883,6 +7929,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let hr = if mesh_loaded {
         S_OK
     } else {
+        let _building = super::driver_crash::building(&mesh_lib_key, &crash_dump_shaders(&stream.0, console));
         driver_compile(kind, stream.shader_bytes(), false, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv))
     };
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
@@ -8219,7 +8266,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    let hr = finish_two_pass(this, &out, tp, rs, "MS", riid, ppv);
+    let hr = finish_two_pass(this, &out, tp, rs, "MS", &[("ms", Some(ms)), ("ps", console_ps)], riid, ppv);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
         super::ambient::note_graphics_pso(*ppv as usize, console_ps);
@@ -8298,7 +8345,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    let hr = finish_two_pass(this, &out, tp, rs, "GS", riid, ppv);
+    let hr = finish_two_pass(this, &out, tp, rs, "GS", &[("vs", Some(vs)), ("gs", Some(gs)), ("ps", shader_bytes(&d.PS))], riid, ppv);
     if hr >= 0 {
         super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("gs", Some(gs)), ("ps", shader_bytes(&d.PS))]);
         super::ambient::note_graphics_pso(*ppv as usize, shader_bytes(&d.PS));
@@ -10819,12 +10866,16 @@ mod mesh_stream_tests {
         }
     }
 
+    /// calls of `fake_create_pso_null_ok`
+    static FAKE_PSO_CALLS: AtomicU64 = AtomicU64::new(0);
+
     unsafe extern "system" fn fake_create_pso_null_ok(
         _: *mut c_void,
         _: *const c_void,
         _: *const GUID,
         ppv: *mut *mut c_void,
     ) -> HRESULT {
+        FAKE_PSO_CALLS.fetch_add(1, Ordering::SeqCst);
         if !ppv.is_null() {
             *ppv = std::ptr::null_mut();
         }
@@ -10895,13 +10946,22 @@ mod mesh_stream_tests {
         unsafe {
             // Case 1: driver returns S_OK but leaves *ppv == null
             let mut out: *mut c_void = std::ptr::null_mut();
-            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, "MS", &iid, &mut out);
+            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, "MS", &[], &iid, &mut out);
             assert_eq!(hr, E_INVALIDARG);
             assert!(out.is_null());
 
             // Case 2: caller passes ppv == null
-            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, "MS", &iid, std::ptr::null_mut());
+            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, "MS", &[], &iid, std::ptr::null_mut());
             assert_eq!(hr, E_INVALIDARG);
+
+            // Case 3: the driver crashed on this pipeline in an earlier run – it is not given to it
+            let calls = FAKE_PSO_CALLS.load(Ordering::SeqCst);
+            assert!(calls >= 2, "the driver was asked in cases 1 and 2");
+            super::super::driver_crash::block(&pso_lib::stream_key(&stream.0, 0x1234_5678, stream.shader_bytes()));
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, "MS", &[], &iid, &mut out);
+            assert_eq!(hr, E_INVALIDARG);
+            assert_eq!(FAKE_PSO_CALLS.load(Ordering::SeqCst), calls, "a pipeline of driver-crashes.txt reached the driver");
         }
     }
 }
