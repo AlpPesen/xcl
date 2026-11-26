@@ -1924,6 +1924,9 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     // the start of the PC resource, before the address for a buffer placed below it)
     if let Some((p, bytes)) = console_buffer(this as usize) {
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(p)) {
+            // If this buffer uses a lazy VRAM-only sparse backing (`alloc_vram_only`, #2582),
+            // commit its CPU pages before readback or returning the pointer to the title.
+            let _opened = crate::hle::kernelx::lazy::ensure(p, bytes);
             if !range.is_null() {
                 let r = *(range as *const D3D12_RANGE);
                 if r.End > r.Begin {

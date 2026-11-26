@@ -47,6 +47,9 @@ unsafe fn commit(page: usize) -> bool {
     // (a view of a physical page committed here is writable, not guarded: count it as written)
     super::guards::committed(page);
     super::alias::committed_at(page);
+    // If this lazy page belongs to a VRAM-only sparse backing (`sparse::alloc_vram_only`),
+    // queue it lock-free of `sparse::STATE` so the next execute/readback clears its hole mask.
+    crate::hle::d3d12x::sparse::note_lazy_commit(page);
     true
 }
 
@@ -90,7 +93,7 @@ pub fn is_lazy(page: usize) -> bool {
 }
 
 /// `page` is unmapped: true if it was never used (nothing to keep of it).
-pub(super) fn unmark(page: usize) -> bool {
+pub(crate) fn unmark(page: usize) -> bool {
     LAZY.write().unwrap_or_else(|e| e.into_inner()).remove(&page)
 }
 
