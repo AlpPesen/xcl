@@ -8,11 +8,29 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 /// Sentinel for `Pending::waited_frame`: no frame has spent graphics wait budget on this PSO yet.
 const UNWAITED: u64 = u64::MAX;
+
+/// Lifecycle states for tracking whether a `Pending` pipeline currently counts toward
+/// `WANTED_ACTIVE_COUNT`:
+/// - `WANTED_NONE` (0): not wanted yet and not finished
+/// - `WANTED_ACTIVE` (1): actively wanted and still queued/building (contributes +1)
+/// - `WANTED_DONE` (2): completed, dropped unstarted, or permanently gated (contributes 0)
+const WANTED_NONE: u8 = 0;
+const WANTED_ACTIVE: u8 = 1;
+const WANTED_DONE: u8 = 2;
+
+/// Number of `wanted` pipelines currently queued or building on workers. While non-zero,
+/// speculative `xcl-pso-pre-*` preload pauses so background builds never steal RAM/CPU from
+/// pipelines the current frame actually needs.
+static WANTED_ACTIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn wanted_active() -> usize {
+    WANTED_ACTIVE_COUNT.load(Ordering::Acquire)
+}
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
@@ -44,7 +62,15 @@ struct Pending {
     /// first frame that waited on this graphics PSO within `XCL_PSO_FRAME_BUDGET_MS` (`UNWAITED`
     /// if never waited yet): later frames skip waiting while workers finish compiling it
     waited_frame: AtomicU64,
+    /// tracks whether this entry currently contributes to `WANTED_ACTIVE_COUNT`
+    wanted_state: AtomicU8,
     demand: Mutex<Demand>,
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.clear_wanted_active();
+    }
 }
 
 /// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
@@ -104,6 +130,22 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
 }
 
 impl Pending {
+    fn mark_wanted_active(&self) {
+        if self
+            .wanted_state
+            .compare_exchange(WANTED_NONE, WANTED_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            WANTED_ACTIVE_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn clear_wanted_active(&self) {
+        if self.wanted_state.swap(WANTED_DONE, Ordering::AcqRel) == WANTED_ACTIVE {
+            WANTED_ACTIVE_COUNT.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
     /// One of the title's threads is about to wait for it: the worker building it goes on now,
     /// at a normal priority.
     fn want(&self) {
@@ -124,6 +166,7 @@ impl Pending {
             first
         };
         if became_wanted {
+            self.mark_wanted_active();
             crate::gpu::recomp::dxc::notify_wanted();
             notify_queue_wanted();
             super::real::notify_big_compile_wanted();
@@ -142,6 +185,7 @@ static PENDING: std::sync::RwLock<Option<HashMap<usize, Arc<Pending>>>> = std::s
 
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
+    p.clear_wanted_active();
     if real == 0 {
         FAILED.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -299,6 +343,7 @@ fn next_needed() -> Option<Arc<Pending>> {
 
 /// Drop an unstarted orphaned job outside all locks and wake any concurrent waiter.
 fn drop_unstarted_job(p: &Pending) {
+    p.clear_wanted_active();
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
         {
@@ -375,14 +420,40 @@ fn notify_queue_wanted() {
     }
 }
 
+/// Number of `xcl-pso-*` worker threads: honors `XCL_PSO_THREADS` (or explicit `XCL_DXC_THREADS`),
+/// otherwise caps default concurrency to `2..=6` so DXIL translation saturates without triggering
+/// a multi-worker AMD LLVM commit/pagefile thrash storm on 32 GB systems.
+fn pso_worker_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("XCL_PSO_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .or_else(|| {
+                std::env::var("XCL_DXC_THREADS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .filter(|&n| n > 0)
+            })
+            .map(|n| n.clamp(1, 64))
+            .unwrap_or_else(|| crate::gpu::recomp::dxc::compile_threads().min(6).max(2))
+    })
+}
+
+/// Number of low-priority `xcl-pso-pre-*` preload threads (`1..=2` by default).
+fn preload_worker_threads() -> usize {
+    (pso_worker_threads() / 3).clamp(1, 2)
+}
+
 fn queue() -> &'static Arc<PsoQueue> {
     WORK_QUEUE.get_or_init(|| {
         let q = Arc::new(PsoQueue::new());
         // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
+        let n = pso_worker_threads();
         for k in 0..n {
             let q = q.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(16 << 20).spawn(move || loop {
                 while let Some(p) = next_needed() {
                     build_queued(&p);
                 }
@@ -405,11 +476,12 @@ fn enqueue(p: Arc<Pending>) {
     );
 }
 
-/// Commit-headroom thresholds (`GlobalMemoryStatusEx::ullAvailPageFile`) for throttling background
-/// PSO compilation under memory pressure (`XCL_PSO_MEM_THROTTLE=0`: off).
-const PRELOAD_PAUSE_COMMIT: u64 = 4 << 30;
-const WORKER_CAP_2_COMMIT: u64 = 4 << 30;
-const WORKER_CAP_1_COMMIT: u64 = 2 << 30;
+/// Physical RAM & commit headroom thresholds (`min(ullAvailPhys, ullAvailPageFile)`) for
+/// throttling background PSO compilation well before Windows starts paging out the title
+/// (`XCL_PSO_MEM_THROTTLE=0`: off).
+const PRELOAD_PAUSE_COMMIT: u64 = 6 << 30;
+const WORKER_CAP_2_COMMIT: u64 = 5 << 30;
+const WORKER_CAP_1_COMMIT: u64 = 3 << 30;
 
 fn mem_throttle_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -420,11 +492,11 @@ fn avail_commit_bytes() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile)
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPhys.min(m.ullAvailPageFile))
 }
 
-/// Maximum concurrent top-level PSO worker builds allowed for the current available commit bytes:
-/// `< 2 GiB` -> 1 worker (never 0, no deadlock), `< 4 GiB` -> at most 2, otherwise `max_workers`.
+/// Maximum concurrent top-level PSO worker builds allowed for the current available RAM/commit:
+/// `< 3 GiB` -> 1 worker (never 0, no deadlock), `< 5 GiB` -> at most 2, otherwise `max_workers`.
 fn worker_cap_for_commit(avail_commit: Option<u64>, max_workers: usize) -> usize {
     let max_workers = max_workers.max(1);
     match avail_commit {
@@ -434,9 +506,15 @@ fn worker_cap_for_commit(avail_commit: Option<u64>, max_workers: usize) -> usize
     }
 }
 
-/// Pause speculative `xcl-pso-pre-*` preload builds while available commit is below 4 GiB.
+/// Pause speculative `xcl-pso-pre-*` preload builds while available RAM/commit is below 6 GiB.
 fn should_pause_preload(avail_commit: Option<u64>) -> bool {
     avail_commit.is_some_and(|avail| avail < PRELOAD_PAUSE_COMMIT)
+}
+
+/// Pause speculative preload whenever ANY `wanted` pipeline is actively queued/in-flight OR
+/// available RAM/commit headroom is below `PRELOAD_PAUSE_COMMIT`.
+fn should_pause_preload_with_demand(avail_commit: Option<u64>, wanted: usize) -> bool {
+    wanted > 0 || should_pause_preload(avail_commit)
 }
 
 struct ActiveWorkerGate {
@@ -469,7 +547,7 @@ fn acquire_worker_slot(max_workers: usize) -> ActiveWorkerGuard {
                 static LOGGED: std::sync::Once = std::sync::Once::new();
                 LOGGED.call_once(|| {
                     crate::xlog_info!(
-                        "D3D12.X: throttling PSO workers to {cap} under low commit headroom ({} MiB free)",
+                        "D3D12.X: throttling PSO workers to {cap} under low RAM/commit headroom ({} MiB free)",
                         avail.unwrap_or(0) >> 20
                     );
                 });
@@ -487,7 +565,7 @@ fn build_queued(p: &Arc<Pending>) {
         drop_unstarted_job(p);
         return;
     }
-    let _slot = acquire_worker_slot(crate::gpu::recomp::dxc::compile_threads());
+    let _slot = acquire_worker_slot(pso_worker_threads());
     if p.orphan.load(Ordering::Acquire) {
         drop_unstarted_job(p);
         return;
@@ -512,7 +590,7 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     };
     // the helpers build for this worker's pipeline: the title waiting for it waits for them too
     let parent = BUILDING.with(|b| b.borrow().clone());
-    for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
+    for _ in 1..count.min(pso_worker_threads()) {
         let (drain, parent_run, parent_q) = (drain.clone(), parent.clone(), parent.clone());
         queue().push(
             Box::new(move || {
@@ -596,6 +674,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, flag
         bvh_traversal: std::sync::atomic::AtomicBool::new(flags.bvh_traversal),
         deprioritized: std::sync::atomic::AtomicBool::new(flags.deprioritized),
         waited_frame: AtomicU64::new(UNWAITED),
+        wanted_state: AtomicU8::new(WANTED_NONE),
         demand: Default::default(),
     });
     PENDING.write().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -1055,9 +1134,9 @@ fn preload() -> Option<&'static Preload> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
+        let n = preload_worker_threads();
         for k in 0..n {
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(16 << 20).spawn(move || {
                 unsafe {
                     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
                     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
@@ -1086,19 +1165,28 @@ fn preload() -> Option<&'static Preload> {
                     {
                         continue;
                     }
-                    // Pause speculative preload under low commit headroom (< 4 GiB) unless a bind
-                    // actively wants this pipeline; leave `p.job` untouched so binds can take it.
-                    while mem_throttle_enabled()
-                        && !p.orphan.load(Ordering::Acquire)
+                    // Pause speculative preload whenever ANY `wanted` pipeline is actively
+                    // queued/in-flight or free RAM/commit headroom is below 6 GiB; leave `p.job`
+                    // untouched so binds can take it immediately.
+                    while !p.orphan.load(Ordering::Acquire)
                         && !p.demand.lock().unwrap().wanted
                         && p.job.lock().unwrap().is_some()
-                        && should_pause_preload(avail_commit_bytes())
                     {
-                        static PAUSED_LOG: std::sync::Once = std::sync::Once::new();
-                        PAUSED_LOG.call_once(|| {
-                            crate::xlog_info!("D3D12.X: pausing speculative PSO preload under low commit headroom (< 4 GiB)");
-                        });
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        let avail = mem_throttle_enabled().then(avail_commit_bytes).flatten();
+                        let low_mem = should_pause_preload(avail);
+                        if !should_pause_preload_with_demand(avail, wanted_active()) {
+                            break;
+                        }
+                        if low_mem {
+                            static PAUSED_LOG: std::sync::Once = std::sync::Once::new();
+                            PAUSED_LOG.call_once(|| {
+                                crate::xlog_info!(
+                                    "D3D12.X: pausing speculative PSO preload under low RAM/commit headroom (< 6 GiB, {} MiB free)",
+                                    avail.unwrap_or(0) >> 20
+                                );
+                            });
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
                     }
                     if p.orphan.load(Ordering::Acquire) {
                         drop_unstarted_job(&p);
@@ -1252,7 +1340,7 @@ mod used_tests {
     #[test]
     fn a_pipeline_a_submit_needs_is_built_before_the_queue() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let backlog = 8 * crate::gpu::recomp::dxc::compile_threads();
+        let backlog = 8 * pso_worker_threads();
         let standins: Vec<usize> = (0..=backlog).map(|i| 0x7E57_E000usize + i).collect();
         for &standin in &standins {
             let order = order.clone();
@@ -1613,7 +1701,7 @@ mod used_tests {
             }
         }
 
-        let n = crate::gpu::recomp::dxc::compile_threads();
+        let n = pso_worker_threads();
         let (started_tx, started_rx) = mpsc::channel();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let mut blockers = Vec::with_capacity(n);
@@ -1707,7 +1795,7 @@ mod used_tests {
     fn a_submit_builds_a_late_pipeline_no_worker_has_started() {
         let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::time::{Duration, Instant};
-        let n = crate::gpu::recomp::dxc::compile_threads();
+        let n = pso_worker_threads();
         let (started_tx, started_rx) = mpsc::channel();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let mut blockers = Vec::with_capacity(n);
@@ -1827,7 +1915,7 @@ mod used_tests {
         }
 
         // Saturate normal workers and verify released() drops the queued job immediately.
-        let n = crate::gpu::recomp::dxc::compile_threads();
+        let n = pso_worker_threads();
         let (started_tx, started_rx) = mpsc::channel();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let open_normal = OpenGate(gate.clone());
@@ -1869,7 +1957,7 @@ mod used_tests {
         }
 
         // Saturate preload workers and verify released() drops the preloaded job immediately.
-        let m = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
+        let m = preload_worker_threads();
         let (p_tx, p_rx) = mpsc::channel();
         let p_gate = Arc::new((Mutex::new(false), Condvar::new()));
         let open_pre = OpenGate(p_gate.clone());
@@ -1952,6 +2040,7 @@ pub fn submit_gated(standin: usize, driver: usize) {
         bvh_traversal: std::sync::atomic::AtomicBool::new(true),
         deprioritized: std::sync::atomic::AtomicBool::new(true),
         waited_frame: AtomicU64::new(UNWAITED),
+        wanted_state: AtomicU8::new(WANTED_DONE),
         demand: Default::default(),
     });
     PENDING.write().unwrap().get_or_insert_with(HashMap::new).insert(standin, p);
@@ -2584,6 +2673,7 @@ mod pso_queue_tests {
             bvh_traversal: Default::default(),
             deprioritized: std::sync::atomic::AtomicBool::new(deprioritized),
             waited_frame: AtomicU64::new(UNWAITED),
+            wanted_state: AtomicU8::new(WANTED_NONE),
             demand: Mutex::new(Demand { wanted, by_submit: false, preload_thread: 0 }),
         })
     }
@@ -2605,6 +2695,7 @@ mod pso_queue_tests {
             bvh_traversal: Default::default(),
             deprioritized: Default::default(),
             waited_frame: AtomicU64::new(UNWAITED),
+            wanted_state: AtomicU8::new(WANTED_NONE),
             demand: Mutex::new(Demand { wanted, by_submit: false, preload_thread: 0 }),
         })
     }
@@ -2670,19 +2761,43 @@ mod pso_queue_tests {
 
     #[test]
     fn commit_headroom_throttles_workers_and_pauses_preload() {
-        assert_eq!(worker_cap_for_commit(None, 8), 8);
-        assert_eq!(worker_cap_for_commit(Some(6 << 30), 8), 8);
-        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_2_COMMIT), 8), 8);
-        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_2_COMMIT - 1), 8), 2);
-        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_1_COMMIT), 8), 2);
-        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_1_COMMIT - 1), 8), 1);
-        assert_eq!(worker_cap_for_commit(Some(0), 8), 1, "must never drop to 0 workers");
+        assert_eq!(PRELOAD_PAUSE_COMMIT, 6 << 30);
+        assert_eq!(WORKER_CAP_2_COMMIT, 5 << 30);
+        assert_eq!(WORKER_CAP_1_COMMIT, 3 << 30);
+
+        assert_eq!(worker_cap_for_commit(None, 6), 6);
+        assert_eq!(worker_cap_for_commit(Some(7 << 30), 6), 6);
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_2_COMMIT), 6), 6);
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_2_COMMIT - 1), 6), 2);
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_1_COMMIT), 6), 2);
+        assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_1_COMMIT - 1), 6), 1);
+        assert_eq!(worker_cap_for_commit(Some(0), 6), 1, "must never drop to 0 workers");
         assert_eq!(worker_cap_for_commit(Some(WORKER_CAP_2_COMMIT - 1), 1), 1);
 
         assert!(!should_pause_preload(None));
         assert!(!should_pause_preload(Some(PRELOAD_PAUSE_COMMIT)));
         assert!(should_pause_preload(Some(PRELOAD_PAUSE_COMMIT - 1)));
         assert!(should_pause_preload(Some(0)));
+
+        // Any active wanted pipeline pauses speculative preload even with ample free RAM.
+        assert!(!should_pause_preload_with_demand(Some(16 << 30), 0));
+        assert!(should_pause_preload_with_demand(Some(16 << 30), 1));
+        assert!(should_pause_preload_with_demand(None, 2));
+        assert!(should_pause_preload_with_demand(Some(PRELOAD_PAUSE_COMMIT - 1), 0));
+
+        // Preload worker pool stays tightly bounded (1..=2).
+        let m = preload_worker_threads();
+        assert!((1..=2).contains(&m), "expected preload_worker_threads in 1..=2, got {m}");
+
+        // Active wanted counter transitions cleanly without leaking on complete/drop.
+        let p = dummy_pending(false, false);
+        p.mark_wanted_active();
+        p.mark_wanted_active(); // idempotent
+        assert!(wanted_active() >= 1);
+        p.clear_wanted_active();
+        p.clear_wanted_active(); // idempotent
+        p.mark_wanted_active(); // post-DONE must not re-increment
+        assert_eq!(p.wanted_state.load(Ordering::Acquire), WANTED_DONE);
     }
 
     #[test]

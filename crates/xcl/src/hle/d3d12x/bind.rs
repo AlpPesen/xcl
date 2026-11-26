@@ -2408,7 +2408,7 @@ pub(super) unsafe fn prelude_list_for(seg: *mut c_void) -> Option<*mut c_void> {
                     s.uma_windows = Some(w);
                 }
                 let w = s.uma_windows.as_deref().unwrap();
-                let first = w[0];
+                let first = w.iter().copied().find(|&v| v != 0).ok_or("unified memory is not open on the GPU")?;
                 Ok([
                     first,
                     w.get(1).copied().filter(|&v| v != 0).unwrap_or(first),
@@ -2644,6 +2644,18 @@ fn align_root_uav(va: u64) -> Result<(u64, u32), String> {
     Ok((va & !255, (va & 255) as u32))
 }
 
+/// Resolve an optional auxiliary root UAV address (`u4`: count buffer in `SCALE_ARGS_HLSL`,
+/// group-limit buffer in `GUARD_ARGS_HLSL`), guaranteeing a valid non-null GPU VA by falling
+/// back to `fallback_va` whenever `primary_va` is `None` or `Some(0)` so drivers never
+/// speculatively fetch from GPU VA `0x0`.
+fn resolve_aux_uav_va(primary_va: Option<u64>, fallback_va: u64) -> Result<u64, String> {
+    match primary_va.filter(|&va| va != 0) {
+        Some(va) => Ok(va),
+        None if fallback_va != 0 => Ok(fallback_va),
+        None => Err("missing valid non-null fallback GPU VA for auxiliary root UAV (u4)".into()),
+    }
+}
+
 /// Validate `SCALE_ARGS_HLSL`'s command-buffer layout and return the source byte span (`max * stride`).
 fn validate_scale_args_layout(max: u32, stride: u32, mesh_offset: u32) -> Result<u64, String> {
     if max == 0 {
@@ -2808,12 +2820,16 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     }
     with(this, |s| s.inline_guard = None);
     let (dst, dst_off, slot, prev_state) = scratch_args_pingpong(this, &dev, 256)?;
-    let lim_off = (crate::gpu::recomp::IO_GROUP_LIMIT * 4) as u32;
     let dst_va = dst.GetGPUVirtualAddress() + dst_off;
+    if dst_va == 0 {
+        return Err("indirect guard scratch buffer has null GPU VA".into());
+    }
+    let lim_off = if dispatch_io_va != 0 { (crate::gpu::recomp::IO_GROUP_LIMIT * 4) as u32 } else { 0 };
     if super::console_heap::window_views_ready() {
         if let Some((src_slot, src_off)) = uma_heap_slot_off(u, src, 12) {
             let (rs, pso) = guard_indirect_heap_pipeline(&dev)?;
             let consts = [src_slot, src_off, most_groups(), lim_off];
+            let lim_va = resolve_aux_uav_va((dispatch_io_va != 0).then_some(dispatch_io_va), dst_va)?;
             ensure_heaps_cached(this);
             // the title's writes of the arguments before this (`fresh_indirect_arguments`)
             emit_uav_and_transition(list, &dst, prev_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2821,7 +2837,7 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
             list.SetPipelineState(&pso);
             list.SetComputeRoot32BitConstants(0, consts.len() as u32, consts.as_ptr() as *const c_void, 0);
             list.SetComputeRootUnorderedAccessView(1, dst_va);
-            list.SetComputeRootUnorderedAccessView(2, dispatch_io_va);
+            list.SetComputeRootUnorderedAccessView(2, lim_va);
             list.Dispatch(1, 1, 1);
             emit_transition_and_uav(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, GUARDED_ARGS_STATE);
             with(this, |s| {
@@ -2839,6 +2855,7 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     let p = with(this, |s| s.arena.take(u, std::mem::size_of_val(&consts), 256, &mut s.uma)).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr().cast::<u8>(), p, std::mem::size_of_val(&consts));
     let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
+    let lim_va = resolve_aux_uav_va((dispatch_io_va != 0).then_some(dispatch_io_va), consts_va)?;
     // the title's writes of the arguments before this (`fresh_indirect_arguments`)
     emit_uav_and_transition(list, &dst, prev_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list.SetComputeRootSignature(&rs);
@@ -2846,7 +2863,7 @@ unsafe fn guard_dispatch_args(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     list.SetComputeRootUnorderedAccessView(0, consts_va);
     list.SetComputeRootUnorderedAccessView(1, src_base);
     list.SetComputeRootUnorderedAccessView(2, dst_va);
-    list.SetComputeRootUnorderedAccessView(3, dispatch_io_va);
+    list.SetComputeRootUnorderedAccessView(3, lim_va);
     list.Dispatch(1, 1, 1);
     // Transition scratch to INDIRECT_ARGUMENT | NON_PIXEL_SHADER_RESOURCE and flush the
     // `IO_GROUP_LIMIT` store in `dispatch_io_va`.
@@ -2908,6 +2925,9 @@ unsafe fn guard_draw_args(
     with(this, |s| s.inline_guard = None);
     let (dst, dst_off, slot, prev_state) = scratch_args_pingpong(this, &dev, commands)?;
     let dst_va = dst.GetGPUVirtualAddress() + dst_off;
+    if dst_va == 0 {
+        return Err("indirect draw guard scratch buffer has null GPU VA".into());
+    }
     if super::console_heap::window_views_ready() {
         if let Some((src_slot, src_off)) = uma_heap_slot_off(u, src, commands as usize) {
             let (rs, pso) = guard_draw_heap_pipeline(&dev)?;
@@ -3228,6 +3248,9 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     with(this, |s| s.inline_guard = None);
     let (dst, dst_off, slot, prev_state) = scratch_args_pingpong(this, &dev, commands.saturating_mul(2))?;
     let dst_va = dst.GetGPUVirtualAddress() + dst_off;
+    if dst_va == 0 {
+        return Err("scaled indirect scratch buffer has null GPU VA".into());
+    }
     if super::console_heap::window_views_ready() {
         if let Some((src_slot, src_off)) = uma_heap_slot_off(u, src, commands as usize) {
             let cnt_loc = match count {
@@ -3272,9 +3295,10 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     let p = with(this, |s| s.arena.take(u, std::mem::size_of_val(&consts), 256, &mut s.uma)).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr().cast::<u8>(), p, std::mem::size_of_val(&consts));
     let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
-    // Bind u4 unconditionally (to `consts_va` when no count buffer is supplied) because
-    // `SCALE_ARGS_HLSL` statically references `cnt : register(u4)`.
-    let cnt_base = count_bound.map_or(consts_va, |(base, _)| base);
+    // Bind u4 unconditionally to a valid non-null GPU VA (falling back to `consts_va` when no
+    // count buffer is supplied) because `SCALE_ARGS_HLSL` statically declares `cnt : register(u4)`
+    // and AMD/NVIDIA hardware may speculatively fetch unbound/null root UAVs.
+    let cnt_base = resolve_aux_uav_va(count_bound.map(|(base, _)| base), consts_va)?;
     // the title's writes of the arguments before this (`fresh_indirect_arguments`)
     emit_uav_and_transition(list, &dst, prev_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list.SetComputeRootSignature(&rs);
@@ -6772,6 +6796,26 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
         assert_eq!(draw_sig_of(sig), Some(DrawSig { byte_stride: 20, draw_offset: 0, indexed: true }));
         note_draw_signature(sig, None);
         assert_eq!(draw_sig_of(sig), None);
+    }
+
+    #[test]
+    fn aux_uav_u4_fallback_and_non_poisoning_zero_max_guards() {
+        // Primary non-null GPU VA is preserved; None or Some(0) falls back to valid non-null VA.
+        assert_eq!(resolve_aux_uav_va(Some(0x1_0000_0100), 0x2_0000_0200).unwrap(), 0x1_0000_0100);
+        assert_eq!(resolve_aux_uav_va(None, 0x2_0000_0200).unwrap(), 0x2_0000_0200);
+        assert_eq!(resolve_aux_uav_va(Some(0), 0x2_0000_0200).unwrap(), 0x2_0000_0200);
+        // Never allows GPU VA 0x0 to be bound on u4 even if fallback is also 0.
+        assert!(resolve_aux_uav_va(None, 0).is_err());
+        assert!(resolve_aux_uav_va(Some(0), 0).is_err());
+
+        // max == 0 is rejected immediately before emitting any scale/draw guard pass.
+        assert!(validate_scale_args_layout(0, 16, 4).is_err());
+
+        // Per-record indirect draw guard is strictly non-poisoning: a garbage record zeroes only
+        // itself and never rejects subsequent valid records.
+        let records = [(u32::MAX, u32::MAX), (3000, 4), (DRAW_VERTS_PER_INST_LIMIT, 1), (1024, 16)];
+        let rejected: Vec<bool> = records.iter().map(|&(v, i)| draw_record_rejected(v, i)).collect();
+        assert_eq!(rejected, vec![true, false, true, false]);
     }
 
     #[test]

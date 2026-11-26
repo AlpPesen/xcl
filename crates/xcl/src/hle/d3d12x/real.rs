@@ -570,6 +570,7 @@ pub fn init() -> Result<String, String> {
             for (adapter, desc) in list {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
                     driver_cache::note_vendor(desc.VendorId);
+                    super::gpu_awake::start(&dev, desc.VendorId);
                     device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
                     break;
@@ -5227,12 +5228,12 @@ fn big_compile_headroom(dxil_len: usize) -> u64 {
     (3u64 << 30).max(dxil_len as u64 * 512)
 }
 
-/// That much commit is free (true when that is not known).
+/// That much physical RAM and commit is free (true when that is not known).
 fn big_compile_commit_free(need: u64) -> bool {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= need }
+    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPhys.min(m.ullAvailPageFile) >= need }
 }
 
 #[cfg(test)]
@@ -9138,6 +9139,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    super::pcores::pin_current_thread_fast();
+    super::gpu_awake::note_activity();
     // from here to the end: XCL's uploads and tile mappings before the lists, then the driver's
     // own work in the submission. Where that takes long, it is not the title's time
     // (`pso_async::title_held`)
