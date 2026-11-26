@@ -2143,6 +2143,7 @@ pub fn submit_gated(standin: usize, driver: usize) {
         waited_frame: AtomicU64::new(UNWAITED),
         wanted_state: AtomicU8::new(WANTED_DONE),
         demand: Default::default(),
+        on_use: Default::default(),
     });
     PENDING.write().unwrap().get_or_insert_with(HashMap::new).insert(standin, p);
 }
@@ -2776,6 +2777,7 @@ mod pso_queue_tests {
             waited_frame: AtomicU64::new(UNWAITED),
             wanted_state: AtomicU8::new(WANTED_NONE),
             demand: Mutex::new(Demand { wanted, by_submit: false, preload_thread: 0 }),
+            on_use: Default::default(),
         })
     }
 
@@ -2798,6 +2800,7 @@ mod pso_queue_tests {
             waited_frame: AtomicU64::new(UNWAITED),
             wanted_state: AtomicU8::new(WANTED_NONE),
             demand: Mutex::new(Demand { wanted, by_submit: false, preload_thread: 0 }),
+            on_use: Default::default(),
         })
     }
 

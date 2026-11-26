@@ -5818,6 +5818,10 @@ pub(crate) mod driver_cache {
     static STALE: AtomicU64 = AtomicU64::new(0);
     static STORED: AtomicU64 = AtomicU64::new(0);
 
+    pub fn stats() -> (u64, u64, u64) {
+        (HITS.load(Ordering::Relaxed), STALE.load(Ordering::Relaxed), STORED.load(Ordering::Relaxed))
+    }
+
     /// The file of the pipeline made from `dxil` with `flags`.
     pub fn name(dxil: &[u8], flags: i32) -> String {
         name_for(dxil, flags, false)
@@ -7657,6 +7661,12 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
 #[allow(dead_code)] // Consumed by the stacked driver-cache integration.
 mod two_pass_identity;
 use two_pass_identity::Fnv64;
+
+/// Persistent driver-cache counters for the current process: (hits, rejected, saved).
+#[doc(hidden)]
+pub fn driver_cache_stats() -> (u64, u64, u64) {
+    driver_cache::stats()
+}
 
 /// The adapter of `device` and its driver (vendor, device, subsystem, revision, user-mode
 /// driver version), for the names of the driver blobs kept on disk: the driver refuses another
