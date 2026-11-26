@@ -3005,6 +3005,8 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
     let v = (view as *const D3D12_UNORDERED_ACCESS_VIEW_DESC).read_unaligned();
     if v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER {
         let Some(slot) = super::console_heap::slot(cpu) else { return };
+        note_unaligned_delta_uav(slot.pc_uav as usize, false);
+        super::depth_uav::clear_uav_twin(slot.pc_uav as usize);
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, false);
