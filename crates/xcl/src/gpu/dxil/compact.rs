@@ -515,8 +515,10 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
         vec![ALL_SGPRS_MASK | SCC_LIVE_BIT; mblocks.len()]
     };
 
-    // a loop head's guard names its loop region: heads of two regions are two classes
-    let regions = crate::gpu::recomp::budget_regions(&crate::gpu::recomp::loop_ranges(&cfg.insts));
+    // a loop head's guard names its loop region and what an iteration spends (`loop_cost`):
+    // heads of two regions, or of two costs, are two classes
+    let loops = crate::gpu::recomp::loop_ranges(&cfg.insts);
+    let regions = crate::gpu::recomp::budget_regions(&loops);
     let build = |param_lit: bool, param_pc: bool| {
         let mut ids: HashMap<(Vec<u64>, &'static str), u32> = HashMap::new();
         let (mut class, mut rep, mut next, mut blk_lit) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -525,7 +527,9 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
             let p_lit = if param_lit { single_param_lit(cfg, blk) } else { None };
             blk_lit.push(p_lit);
             let region = if blk.is_header {
-                crate::gpu::recomp::budget_region(&regions, cfg.blocks[order[n]].pc).unwrap_or(0) as u64
+                let pc = cfg.blocks[order[n]].pc;
+                let cost = crate::gpu::recomp::loop_cost(&loops, pc) as u64;
+                crate::gpu::recomp::budget_region(&regions, pc).unwrap_or(0) as u64 + ((cost - 1) << 32)
             } else {
                 0
             };
@@ -804,7 +808,8 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
 
     let (at, to) = (lw.tmp_var(), lw.tmp_var());
     let (at, to, budget) = (slot(lw, at), slot(lw, to), slot(lw, VAR_BUDGET));
-    let regions = crate::gpu::recomp::budget_regions(&crate::gpu::recomp::loop_ranges(&cfg.insts));
+    let loops = crate::gpu::recomp::loop_ranges(&cfg.insts);
+    let regions = crate::gpu::recomp::budget_regions(&loops);
     let owner = if regions.is_empty() { None } else { Some((slot(lw, VAR_BUDGET_OWNER), slot(lw, VAR_BUDGET_TOTAL))) };
     lw.s.m.set_block(head);
     let b = lw.s.m.load(at, 4);
@@ -919,6 +924,8 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
         if blk.is_header {
             // a loop head spends the loop budget (of its region: the recompiler's `loop_guard`)
             let region = owner.zip(crate::gpu::recomp::budget_region(&regions, cfg.blocks[p.order[r]].pc));
+            // (1 for a short loop: the guard's instructions are then what they always were)
+            let cost = crate::gpu::recomp::loop_cost(&loops, cfg.blocks[p.order[r]].pc);
             let mut left = lw.s.m.load(budget, 4);
             if let Some(((own_at, total_at), reg)) = region {
                 let own = lw.s.m.load(own_at, 4);
@@ -927,10 +934,10 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
                 let rv = lw.c(reg);
                 lw.s.m.store(own_at, rv, 4);
                 let total = lw.s.m.load(total_at, 4);
-                let spent = lw.cmpc(Pred::Eq, total, 0);
+                let spent = if cost == 1 { lw.cmpc(Pred::Eq, total, 0) } else { lw.cmpc(Pred::ULt, total, cost) };
                 left = lw.selc(spent, 0, left);
             }
-            let none = lw.cmpc(Pred::Eq, left, 0);
+            let none = if cost == 1 { lw.cmpc(Pred::Eq, left, 0) } else { lw.cmpc(Pred::ULt, left, cost) };
             let (out, body) = (lw.block(Some(1)), lw.block(Some(1)));
             lw.cond_br(none, out, body);
             lw.s.m.set_block(out);
@@ -938,7 +945,7 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
             lw.s.m.store(to, end, 4);
             lw.s.m.br(target_latch);
             lw.s.m.set_block(body);
-            let one = lw.c(1);
+            let one = lw.c(cost);
             let l = lw.sub(left, one);
             lw.s.m.store(budget, l, 4);
             if let Some(((_, total_at), _)) = region {

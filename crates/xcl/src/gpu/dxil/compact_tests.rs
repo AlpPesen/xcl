@@ -106,6 +106,34 @@ fn gpu_compact_form_spends_the_loop_budget_as_the_plain_form() {
     assert_eq!(&c.sgpr[..2], &p.sgpr[..2]);
 }
 
+/// In both of the direct translator's forms an iteration of a long loop spends more of the loop
+/// budget (`recomp::loop_cost`): a loop of 80 instructions (320 B) that never ends runs half the
+/// budget's iterations, as on the HLSL path
+/// (`recomp::tests::gpu_an_endless_long_loop_stops_after_the_budget_by_its_cost`).
+#[test]
+fn gpu_an_endless_long_loop_stops_after_the_budget_by_its_cost_in_both_forms() {
+    match (runner::adapter(), runner::wave64_programs_supported(), crate::gpu::recomp::dxc::location()) {
+        (Ok(_), Ok(true), Ok(_)) => {}
+        (a, _, d) => return runner::skip_test(if a.is_err() { "no GPU" } else if d.is_err() { "no DXC" } else { "no wave64" }),
+    }
+    let o = KernelOptions { wave64: true, split: runner::split_wave64(), mem_windows: 1, sampler_base: 0 };
+    let i = |nm: &str, e: &str, f: &[(&str, u64)], lit: Option<u32>| encode(nm, e, f, lit).unwrap_or_else(|x| panic!("{nm}: {x}"));
+    let mut v = Vec::new();
+    v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None));
+    v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+    for _ in 0..77 {
+        v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 129)], None));
+    }
+    v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None));
+    v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFB0)], None));
+    v.extend(i("S_ENDPGM", "ENC_SOPP", &[], None));
+    for compact in [true, false] {
+        let k = translate_full_as(&v, o, compact).unwrap_or_else(|e| panic!("compact {compact}: {e}"));
+        let r = runner::run_with_statics(&k.dxil, &KernelState::default(), &[], &[], &[], &k.static_samplers).expect("GPU run");
+        assert_eq!(r.sgpr[0], (1 << 16) / 2, "compact {compact}");
+    }
+}
+
 /// The direct translator's forms give each loop region its own budget as the HLSL path does
 /// (`recomp::tests::gpu_a_loop_after_a_spin_to_the_budget_still_runs`).
 #[test]

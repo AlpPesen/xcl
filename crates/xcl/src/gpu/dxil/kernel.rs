@@ -429,7 +429,14 @@ fn translate_on_this_thread(
             None => super::compact::emit(&mut lw, &cfg, p, h0, exit)?,
         }
     }
-    let regions = crate::gpu::recomp::budget_regions(&crate::gpu::recomp::loop_ranges(&cfg.insts));
+    // Per-region loop budgets target compute spin-wait passes (PR #2793); keep graphics/mesh
+    // stages on the single-budget CFG so AMD LLPC does not trip on multi-PHI mesh loop headers.
+    let loops = crate::gpu::recomp::loop_ranges(&cfg.insts);
+    let regions = if compute || kernel {
+        crate::gpu::recomp::budget_regions(&loops)
+    } else {
+        Vec::new()
+    };
     for &b in cfg.rpo.iter().filter(|_| plan.is_none()) {
         let h = head(&mut lw, b);
         lw.s.m.set_block(h);
@@ -447,6 +454,9 @@ fn translate_on_this_thread(
         if cfg.headers.contains(&b) {
             // a lane's loop iterations are capped (the recompiler's LOOP_GUARD / loop_guard)
             let region = crate::gpu::recomp::budget_region(&regions, cfg.blocks[b].pc);
+            // an iteration of a long loop spends more than 1 (the recompiler's `loop_cost`);
+            // with 1 the guard is the instructions it always was
+            let cost = crate::gpu::recomp::loop_cost(&loops, cfg.blocks[b].pc);
             let mut left = lw.rd(VAR_BUDGET);
             if let Some(r) = region {
                 let own = lw.rd(VAR_BUDGET_OWNER);
@@ -455,14 +465,14 @@ fn translate_on_this_thread(
                 let rv = lw.c(r);
                 lw.wr(VAR_BUDGET_OWNER, rv);
                 let total = lw.rd(VAR_BUDGET_TOTAL);
-                let spent = lw.cmpc(Pred::Eq, total, 0);
+                let spent = if cost == 1 { lw.cmpc(Pred::Eq, total, 0) } else { lw.cmpc(Pred::ULt, total, cost) };
                 left = lw.selc(spent, 0, left);
             }
-            let none = lw.cmpc(Pred::Eq, left, 0);
+            let none = if cost == 1 { lw.cmpc(Pred::Eq, left, 0) } else { lw.cmpc(Pred::ULt, left, cost) };
             let cont = lw.block(Some(1));
             lw.cond_br(none, end, cont);
             lw.s.m.set_block(cont);
-            let one = lw.c(1);
+            let one = lw.c(cost);
             let l = lw.sub(left, one);
             lw.wr(VAR_BUDGET, l);
             if region.is_some() {

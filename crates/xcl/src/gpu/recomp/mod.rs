@@ -812,19 +812,47 @@ pub(crate) fn budget_region(regions: &[(u64, u64)], head: u64) -> Option<u32> {
     regions.iter().position(|&(a, b)| a <= head && head < b).map(|k| k as u32 + 1)
 }
 
+/// An iteration of a loop spends one of the loop budget for every this many bytes of the loop's
+/// code ([`loop_cost`]) ...
+pub(crate) const LOOP_COST_BYTES: u64 = 128;
+/// ... and at most this many: the longest loop still gets 256 iterations of one budget.
+pub(crate) const LOOP_COST_MOST: u32 = 256;
+
+/// What an iteration of the loop headed at `head` spends of the loop budget: 1 for a short
+/// loop, more for a long one (the innermost of `loops` that holds `head`, a unit for every
+/// [`LOOP_COST_BYTES`] of it). The budget counts iterations, and what an iteration costs the GPU
+/// grows with the loop: a retail program's 9 KB loop nest, given what made every one of its
+/// loops run on, spent its 131 072 iterations in one group of 64 lanes for more than 20 s, and
+/// the driver was reset. With the cost that nest stops after 1 771 iterations. A loop shorter
+/// than twice the unit costs 1, and its guard is what it was. A ray-tracing program's budget is
+/// small already (`dxil::kernel::RT_LOOP_BUDGET`): its loops cost 1.
+pub(crate) fn loop_cost(loops: &[(u64, u64)], head: u64) -> u32 {
+    if crate::gpu::dxil::kernel::loop_budget() == crate::gpu::dxil::kernel::RT_LOOP_BUDGET {
+        return 1;
+    }
+    let innermost = loops.iter().filter(|&&(a, b)| a <= head && head < b).map(|&(a, b)| b - a).min();
+    innermost.map_or(1, |len| (len / LOOP_COST_BYTES).clamp(1, LOOP_COST_MOST as u64) as u32)
+}
+
 /// The guard of the loop headed at `head`. In a program with loop regions, each region starts
 /// with [`LOOP_BUDGETS_PER_REGION`] budgets, and `xcl_btotal` keeps all of them to
 /// [`LOOP_BUDGETS_IN_ALL`]: a title's own spin that gives up after 0x10000 tries, the budget,
 /// otherwise left every loop after it without an iteration (a retail FSR pass then published a
 /// flag made from a register its main loop never set, and the pass waiting on that flag spun
 /// 260 ms a frame).
-fn loop_guard(regions: &[(u64, u64)], head: u64) -> String {
-    match budget_region(regions, head) {
-        Some(r) => format!(
+/// An iteration spends [`loop_cost`] of them (of `loops`, the ranges the loops are emitted from).
+fn loop_guard(regions: &[(u64, u64)], loops: &[(u64, u64)], head: u64) -> String {
+    match (budget_region(regions, head), loop_cost(loops, head)) {
+        (Some(r), 1) => format!(
             "if (xcl_bown != {r}u) {{ xcl_bown = {r}u; xcl_budget = {}u; }} if (xcl_budget == 0u || xcl_btotal == 0u) break; xcl_budget--; xcl_btotal--;",
             LOOP_BUDGETS_PER_REGION << 16
         ),
-        None => LOOP_GUARD.to_string(),
+        (Some(r), k) => format!(
+            "if (xcl_bown != {r}u) {{ xcl_bown = {r}u; xcl_budget = {}u; }} if (xcl_budget < {k}u || xcl_btotal < {k}u) break; xcl_budget -= {k}u; xcl_btotal -= {k}u;",
+            LOOP_BUDGETS_PER_REGION << 16
+        ),
+        (None, 1) => LOOP_GUARD.to_string(),
+        (None, k) => format!("if (xcl_budget < {k}u) break; xcl_budget -= {k}u;"),
     }
 }
 
@@ -1279,7 +1307,7 @@ fn emit_structured(
         }
         let raised: BTreeSet<u64> = match it {
             Item::Loop { a, b, latch, entry } => {
-                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {}\n", loop_guard(c.regions, a)));
+                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {}\n", loop_guard(c.regions, c.loops, a)));
                 let (lcont, lin) = if entry.is_none() { (cont.enter(Some(a)), &inner) } else { (cont.enter(None), &none) };
                 let mut r = emit_structured(c, em, body, entry.unwrap_or(a), latch, None, nest + 1, &lcont, lin, d + 1, blocks, flags);
                 for &t in &r {
@@ -1400,7 +1428,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let start = c.leaders[i];
         let inner = c.loops.iter().filter(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)).max_by_key(|x| x.1).copied();
         if let Some((a, b)) = inner {
-            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {}\n", loop_guard(c.regions, a)));
+            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {}\n", loop_guard(c.regions, c.loops, a)));
             emit_range(c, em, body, a, b, depth + 1, blocks, flags);
             body.push_str(&format!("{pad}}}\n"));
             i = c.leaders.partition_point(|&l| l < b);
@@ -1846,7 +1874,13 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         // (optimising one big dispatcher loop took minutes on large retail programs).
         let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
         let loops = loop_ranges(&insts);
-        let regions = budget_regions(&loops);
+        // Per-region loop budgets target compute spin-wait passes (PR #2793); keep graphics/mesh
+        // stages on the single-budget CFG.
+        let regions = if matches!(opt.mode, Mode::Compute(_) | Mode::Kernel) {
+            budget_regions(&loops)
+        } else {
+            Vec::new()
+        };
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
         let phase_split = gs_jump.is_some_and(|t| t.is_some()) && opt.split_wave64 && opt.wave64;
         let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, regions: &regions, edges: &edges, phase_split, memo: Default::default() };

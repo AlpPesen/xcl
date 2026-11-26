@@ -1495,6 +1495,95 @@ fn gpu_endless_loops_in_many_regions_stop_after_four_budgets() {
     assert_eq!(r.sgpr[0], super::LOOP_BUDGETS_IN_ALL << 16, "four budgets of iterations in all");
 }
 
+/// A loop of 80 instructions (320 B) that never ends: `s0 += 1`, 77 more adds, a compare that
+/// holds until s0 wraps, the branch back. `after`: what follows the loop.
+fn long_endless_loop(after: &[(&'static str, &'static str, &'static [(&'static str, u64)], Option<u32>)]) -> Vec<u8> {
+    let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
+    list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+    for _ in 0..77 {
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 129)], None));
+    }
+    list.push(("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None));
+    list.push(("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFB0)], None));
+    list.extend_from_slice(after);
+    prog(&list)
+}
+
+/// An iteration of a short loop spends 1 of the loop budget, one of a long loop more: a unit for
+/// every `LOOP_COST_BYTES` of the innermost loop that holds the head, `LOOP_COST_MOST` at most.
+/// A ray-tracing program's loops spend 1 of its small budget.
+#[test]
+fn a_long_loop_spends_more_of_the_budget_an_iteration() {
+    let u = super::LOOP_COST_BYTES;
+    let loops = [(0x100, 0x100 + 40 * u), (0x100 + 8 * u, 0x100 + 13 * u), (0x9000, 0x9010), (0x10000, 0x10000 + 1000 * u)];
+    assert_eq!(super::loop_cost(&loops, 0x100), 40);
+    assert_eq!(super::loop_cost(&loops, 0x100 + 8 * u), 5, "the innermost loop that holds the head");
+    assert_eq!(super::loop_cost(&loops, 0x9000), 1);
+    assert_eq!(super::loop_cost(&loops, 0x8000), 1, "no loop holds it");
+    assert_eq!(super::loop_cost(&loops, 0x10000), super::LOOP_COST_MOST);
+    assert_eq!(super::loop_cost(&[(0, 2 * u - 4)], 0), 1, "under two units");
+    crate::gpu::dxil::kernel::RT_ALL_MISS_FOR_TEST.with(|c| c.set(Some(true)));
+    let rt = crate::gpu::dxil::kernel::with_rt_program(true, || super::loop_cost(&loops, 0x100));
+    crate::gpu::dxil::kernel::RT_ALL_MISS_FOR_TEST.with(|c| c.set(None));
+    assert_eq!(rt, 1, "a ray-tracing program");
+
+    // the guards: a short loop's is the text it was, the 320 B loop's spends 2 an iteration
+    let short = prog(&[
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None),
+    ]);
+    let t = translate(&short, &Options { mode: Mode::Kernel, ..Default::default() }).unwrap();
+    assert!(t.hlsl.contains(super::LOOP_GUARD), "{}", t.hlsl);
+    let t = translate(&long_endless_loop(&[]), &Options { mode: Mode::Kernel, ..Default::default() }).unwrap();
+    assert!(t.hlsl.contains("if (xcl_budget < 2u) break; xcl_budget -= 2u;") && !t.hlsl.contains(super::LOOP_GUARD), "{}", t.hlsl);
+}
+
+/// A long loop that never ends stops after as many iterations as its cost leaves of the budget:
+/// half of them for a loop of 320 B.
+#[test]
+fn gpu_an_endless_long_loop_stops_after_the_budget_by_its_cost() {
+    if !gpu_ready() {
+        return;
+    }
+    let t = translate(&long_endless_loop(&[]), &runner::options(Mode::Kernel)).unwrap();
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let r = runner::run(&dxil, &KernelState::default(), &[]).unwrap();
+    assert_eq!(r.sgpr[0], (1 << 16) / 2);
+}
+
+/// Per-region loop budgets (`xcl_bown` / `xcl_btotal`) are compute-only: Compute and Kernel
+/// modes emit them for multi-region loops, while Pixel and Mesh stages keep the single-budget
+/// CFG (avoiding multi-PHI mesh loop headers that crash AMD LLPC).
+#[test]
+fn per_region_loop_budgets_are_compute_only() {
+    let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
+    for _ in 0..2 {
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+        list.push(("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 130)], None));
+        list.push(("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None));
+    }
+    let code = prog(&list);
+
+    let cs = super::CsInterface { threads: [64, 1, 1], ..Default::default() };
+    let ps = super::PsInterface::default();
+    let ms = super::MsInterface { threads: 64, max_vertices: 64, max_primitives: 64, ..Default::default() };
+
+    for mode in [Mode::Kernel, Mode::Compute(cs.clone())] {
+        let t = translate(&code, &Options { mode, ..Default::default() }).unwrap();
+        assert!(t.hlsl.contains("xcl_bown") && t.hlsl.contains("xcl_btotal"), "compute/kernel should emit per-region budgets");
+    }
+    for mode in [Mode::Pixel(ps), Mode::Mesh(ms.clone())] {
+        let t = translate(&code, &Options { mode, ..Default::default() }).unwrap();
+        assert!(!t.hlsl.contains("xcl_bown") && !t.hlsl.contains("xcl_btotal"), "pixel/mesh must not emit per-region budgets");
+    }
+
+    // Direct DXIL compute & mesh both translate cleanly for a multi-region loop program.
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    assert!(!crate::gpu::dxil::kernel::translate_compute(&code, o, &cs).unwrap().dxil.is_empty());
+    assert!(!crate::gpu::dxil::kernel::translate_mesh(&code, o, &ms).unwrap().dxil.is_empty());
+}
+
 #[test]
 fn gpu_divergence_through_exec() {
     if !gpu_ready() {
