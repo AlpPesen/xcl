@@ -347,14 +347,20 @@ fn score_dispatch_target(rd: &D3D12_RESOURCE_DESC, view_fmt: i32, groups: [u32; 
     }
     let max_w = groups[0].saturating_mul(64);
     let max_h = groups[1].saturating_mul(64);
-    let min_w = groups[0].saturating_mul(2);
-    let min_h = groups[1].saturating_mul(2);
+    let min_w = (groups[0] / 2).max(64);
+    let min_h = (groups[1] / 2).max(64);
     if w < min_w || w > max_w || h < min_h || h > max_h {
         return None;
     }
-    let ideal_w = groups[0].saturating_mul(8) as i64;
-    let ideal_h = groups[1].saturating_mul(8) as i64;
-    Some((w as i64 - ideal_w).unsigned_abs() + (h as i64 - ideal_h).unsigned_abs())
+    // Console compute shaders commonly use [8, 8, 1] or Wave32 [8, 4, 1] thread groups
+    // (e.g. [320, 360, 1] -> 2560x1440 at 8x4 or 1280x720 at 4x2); score by closest fit.
+    let d88 = (w as i64 - groups[0].saturating_mul(8) as i64).unsigned_abs()
+        + (h as i64 - groups[1].saturating_mul(8) as i64).unsigned_abs();
+    let d84 = (w as i64 - groups[0].saturating_mul(8) as i64).unsigned_abs()
+        + (h as i64 - groups[1].saturating_mul(4) as i64).unsigned_abs();
+    let d42 = (w as i64 - groups[0].saturating_mul(4) as i64).unsigned_abs()
+        + (h as i64 - groups[1].saturating_mul(2) as i64).unsigned_abs();
+    Some(d88.min(d84).min(d42))
 }
 
 #[cfg(test)]
@@ -840,17 +846,59 @@ pub(super) unsafe fn after_draw(list: *mut c_void, pso_resolved: usize) {
 /// (covers >1.24M-slot console shader-visible view heaps).
 const MAX_SLOT_INDEX: u32 = 2_000_000;
 
+/// Decode a CBV / buffer `V#` descriptor (`gpu::desc::cbv_words` / `buffer_words`) into
+/// `(va, byte_len)` if it is a readable buffer descriptor (`w3 >> 28 < 8` and dst_sel `0xFAC`).
+fn decode_cbv_vsharp(w: [u32; 4]) -> Option<(usize, usize)> {
+    if (w[3] >> 28) >= 8 || (w[3] & 0xFFF) != 0xFAC {
+        return None;
+    }
+    let va = (w[0] as u64 | ((w[1] as u64 & 0xFFFF) << 32)) as usize;
+    if va == 0 {
+        return None;
+    }
+    let stride = ((w[1] >> 16) & 0x3FFF) as usize;
+    let records = w[2] as usize;
+    let bytes = if stride == 0 { records } else { records.saturating_mul(stride) };
+    (bytes >= 4).then_some((va, bytes.min(2048)))
+}
+
+/// Scan up to `max_bytes` (capped at 2048 B) of readable constant-buffer memory at `va` in
+/// 256-byte chunks and feed candidate bindless descriptor indices `< MAX_SLOT_INDEX` into `push_idx`.
+unsafe fn scan_cbv_indices(va: usize, max_bytes: usize, push_idx: &mut impl FnMut(u32)) {
+    if va == 0 || max_bytes < 4 {
+        return;
+    }
+    let total = max_bytes.min(2048);
+    let mut off = 0usize;
+    while off < total {
+        let chunk = (total - off).min(256);
+        let base = va + off;
+        if !crate::gpu::shader::readable(base, chunk) {
+            break;
+        }
+        let words = chunk / 4;
+        for k in 0..words {
+            let v = ((base + 4 * k) as *const u32).read_unaligned();
+            if v != 0 {
+                push_idx(v);
+            }
+        }
+        off += chunk;
+    }
+}
+
 /// Inspect a compute dispatch's bound descriptor tables, SM 6.6 directly-indexed view heap
-/// (`view_heap_base`), and root constants/CBVs to locate its output screen-space float UAV
+/// (`view_heap_base`), and root/table CBVs to locate its output screen-space float UAV
 /// (and optional depth SRV for crease AO).
 unsafe fn find_dispatch_views(
     layout: &Layout,
     args: &[u8],
     groups: [u32; 3],
     view_heap_base: u32,
-) -> (Option<(usize, i32, u32, u32)>, Option<(usize, i32, u32, u32)>, usize, usize) {
-    let Some(u) = crate::gpu::uma::get() else { return (None, None, 0, 0) };
+) -> (Option<(usize, i32, u32, u32)>, Option<(usize, i32, u32, u32)>, usize, usize, usize) {
+    let Some(u) = crate::gpu::uma::get() else { return (None, None, 0, 0, 0) };
     let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let mut param_tables: Vec<u32> = Vec::new();
     let mut tables: Vec<u32> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
@@ -875,83 +923,104 @@ unsafe fn find_dispatch_views(
                 let lo = word(at as usize).unwrap_or(0) as u64;
                 let hi = word(at as usize + 4).unwrap_or(0) as u64;
                 let va = (lo | (hi << 32)) as usize;
-                if va != 0 {
-                    // Scan up to 2048 bytes (512 u32s) in 256-byte readable chunks so bindless
-                    // pass/frame CBVs larger than 256 bytes are covered safely.
-                    for chunk in 0..8usize {
-                        let base = va + chunk * 256;
-                        if !crate::gpu::shader::readable(base, 256) {
-                            break;
-                        }
-                        for k in 0..64usize {
-                            let v = ((base + 4 * k) as *const u32).read_unaligned();
-                            if v != 0 {
-                                push_idx(v);
-                            }
-                        }
-                    }
-                }
+                scan_cbv_indices(va, 2048, &mut push_idx);
             }
             Param::Table { at } => {
                 if let Some(t) = word(at as usize) {
-                    if t != 0 && !tables.contains(&t) {
-                        tables.push(t);
+                    if t != 0 {
+                        if !param_tables.contains(&t) {
+                            param_tables.push(t);
+                        }
+                        if !tables.contains(&t) {
+                            tables.push(t);
+                        }
                     }
                 }
             }
         }
     }
-    // Also probe direct table slots 0..16 in case descriptors are bound directly without bindless indices.
-    for k in 0..16u32 {
-        push_idx(k);
+
+    // Scan direct slots `0..64` of every bound `Param::Table` for BOTH direct image T# descriptors
+    // and CBV V# descriptors (whose buffer contents often carry bindless indices into `view_heap`).
+    let mut table_cbvs = 0usize;
+    let mut direct_addrs: Vec<usize> = Vec::new();
+    for &t in &param_tables {
+        for k in 0..64usize {
+            let Some(off) = (t as usize).checked_add(32 * k) else { break };
+            let Some(addr) = u.base().checked_add(off) else { break };
+            if !u.contains(addr) || !crate::gpu::shader::readable(addr, 16) {
+                break;
+            }
+            let w = [
+                (addr as *const u32).read_unaligned(),
+                ((addr + 4) as *const u32).read_unaligned(),
+                ((addr + 8) as *const u32).read_unaligned(),
+                ((addr + 12) as *const u32).read_unaligned(),
+            ];
+            if (w[3] >> 28) >= 8 {
+                direct_addrs.push(addr);
+            } else if k < 32 {
+                if let Some((cbv_va, cbv_len)) = decode_cbv_vsharp(w) {
+                    table_cbvs += 1;
+                    scan_cbv_indices(cbv_va, cbv_len, &mut push_idx);
+                }
+            }
+        }
     }
 
     let mut uav_hit: Option<(u64, usize, i32, u32, u32)> = None;
     let mut depth_hit: Option<(usize, i32, u32, u32)> = None;
     let slots = VIEW_SLOTS.read().unwrap();
-    let Some(vs) = slots.as_ref() else { return (None, None, tables.len(), indices.len()) };
+    let Some(vs) = slots.as_ref() else { return (None, None, tables.len(), indices.len(), table_cbvs) };
 
+    let mut check_slot = |addr: usize| {
+        if !u.contains(addr) || !crate::gpu::shader::readable(addr, 16) {
+            return;
+        }
+        let w0 = (addr as *const u32).read_unaligned();
+        let w3 = ((addr + 12) as *const u32).read_unaligned();
+        // Image T# descriptors have type >= 8 in bits [31:28] of word 3.
+        if (w3 >> 28) < 8 {
+            return;
+        }
+        let Some(&ve) = vs
+            .by_addr
+            .get(&addr)
+            .or_else(|| (w0 != 0).then(|| vs.by_idx.get(&w0)).flatten())
+        else {
+            return;
+        };
+        let ptr = ve.res as *mut c_void;
+        let Some(res) = ID3D12Resource::from_raw_borrowed(&ptr) else { return };
+        let rd = res.GetDesc();
+        if ve.is_uav {
+            if let Some(score) = score_dispatch_target(&rd, ve.fmt, groups) {
+                if uav_hit.is_none_or(|(best, _, _, _, _)| score < best) {
+                    uav_hit = Some((score, ve.res, ve.fmt, rd.Width as u32, rd.Height));
+                }
+            }
+        } else if depth_hit.is_none()
+            && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && rd.DepthOrArraySize == 1
+            && rd.SampleDesc.Count == 1
+            && rd.Width >= 64
+            && rd.Height >= 64
+        {
+            depth_hit = Some((ve.res, ve.fmt, rd.Width as u32, rd.Height));
+        }
+    };
+
+    for addr in direct_addrs {
+        check_slot(addr);
+    }
     for &t in &tables {
         for &idx in &indices {
             let Some(off) = (t as usize).checked_add(32usize.saturating_mul(idx as usize)) else { continue };
             let Some(addr) = u.base().checked_add(off) else { continue };
-            if !u.contains(addr) || !crate::gpu::shader::readable(addr, 16) {
-                continue;
-            }
-            let w0 = (addr as *const u32).read_unaligned();
-            let w3 = ((addr + 12) as *const u32).read_unaligned();
-            // Image T# descriptors have type >= 8 in bits [31:28] of word 3.
-            if (w3 >> 28) < 8 {
-                continue;
-            }
-            let Some(&ve) = vs
-                .by_addr
-                .get(&addr)
-                .or_else(|| (w0 != 0).then(|| vs.by_idx.get(&w0)).flatten())
-            else {
-                continue;
-            };
-            let ptr = ve.res as *mut c_void;
-            let Some(res) = ID3D12Resource::from_raw_borrowed(&ptr) else { continue };
-            let rd = res.GetDesc();
-            if ve.is_uav {
-                if let Some(score) = score_dispatch_target(&rd, ve.fmt, groups) {
-                    if uav_hit.is_none_or(|(best, _, _, _, _)| score < best) {
-                        uav_hit = Some((score, ve.res, ve.fmt, rd.Width as u32, rd.Height));
-                    }
-                }
-            } else if depth_hit.is_none()
-                && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
-                && rd.DepthOrArraySize == 1
-                && rd.SampleDesc.Count == 1
-                && rd.Width >= 64
-                && rd.Height >= 64
-            {
-                depth_hit = Some((ve.res, ve.fmt, rd.Width as u32, rd.Height));
-            }
+            check_slot(addr);
         }
     }
-    (uav_hit.map(|(_, r, f, w, h)| (r, f, w, h)), depth_hit, tables.len(), indices.len())
+    (uav_hit.map(|(_, r, f, w, h)| (r, f, w, h)), depth_hit, tables.len(), indices.len(), table_cbvs)
 }
 
 /// Called right after a translated compute dispatch completes: when RT is gated off and a sky
@@ -992,12 +1061,12 @@ pub(super) unsafe fn after_compute_dispatch(
         return;
     }
 
-    let (uav_opt, depth_opt, n_tables, n_indices) = find_dispatch_views(layout, args, groups, view_heap_base);
+    let (uav_opt, depth_opt, n_tables, n_indices, n_cbvs) = find_dispatch_views(layout, args, groups, view_heap_base);
     let Some((uav_res, uav_fmt, w, h)) = uav_opt else {
         static MISS: AtomicU64 = AtomicU64::new(0);
         if MISS.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_info!(
-                "D3D12.X: ambient: {role:?} ({groups:?}) found no matching UAV (tables={n_tables}, view_heap={view_heap_base:#x}, indices={n_indices})"
+                "D3D12.X: ambient: {role:?} ({groups:?}) found no matching UAV (tables={n_tables}, view_heap={view_heap_base:#x}, table_cbvs={n_cbvs}, indices={n_indices})"
             );
         }
         return;
@@ -1175,6 +1244,18 @@ mod tests {
         // Texture2DArray must be rejected for TEXTURE2D view creation.
         let arr = D3D12_RESOURCE_DESC { DepthOrArraySize: 4, ..typeless };
         assert!(score_dispatch_target(&arr, DXGI_FORMAT_R16G16B16A16_FLOAT.0, [240, 135, 1]).is_none());
+
+        // [320, 360, 1] Wave32 [8, 4, 1] / half-res probe grid matches 2560x1440, 1280x720, and 640x360.
+        let qhd = D3D12_RESOURCE_DESC { Width: 2560, Height: 1440, ..typeless };
+        let half = D3D12_RESOURCE_DESC { Width: 640, Height: 360, ..typeless };
+        assert_eq!(score_dispatch_target(&qhd, DXGI_FORMAT_R16G16B16A16_FLOAT.0, [320, 360, 1]), Some(0));
+        assert!(score_dispatch_target(&half, DXGI_FORMAT_R16G16B16A16_FLOAT.0, [320, 360, 1]).is_some());
+
+        // CBV V# in a descriptor table decodes back to its buffer VA and byte size.
+        let cbv = crate::gpu::desc::cbv_words(0x7_1234_5600, 512);
+        assert_eq!(decode_cbv_vsharp(cbv), Some((0x7_1234_5600, 512)));
+        let img = crate::gpu::desc::xcl_image_for_view(42, 0, crate::gpu::desc::ImageType::D2, 64, 64, 1, 1);
+        assert_eq!(decode_cbv_vsharp([img[0], img[1], img[2], img[3]]), None);
 
         // Two distinct CPU-only heap slots (`global_index == 0`) at different addresses must not collide
         // before being copied to the shader-visible heap.

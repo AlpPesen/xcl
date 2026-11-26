@@ -2908,7 +2908,8 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, true));
     }
-    super::ambient::note_descriptor(slot.at, amb_idx, res as usize, desc.as_ref().map_or(rdesc.Format.0, |v| v.Format.0), rdesc.Format.0, false);
+    let amb_fmt = desc.as_ref().map(|v| v.Format.0).filter(|&f| f != 0).unwrap_or(rdesc.Format.0);
+    super::ambient::note_descriptor(slot.at, amb_idx, res as usize, amb_fmt, rdesc.Format.0, false);
     match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
         Some(t) => super::console_heap::write(&slot, &t),
         None => {
@@ -3343,7 +3344,8 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         }
         None => (rd.Format, resource_dim_to_view(&rd), rd.DepthOrArraySize as u32, 0),
     };
-    super::ambient::note_descriptor(slot.at, amb_idx, uav_res as usize, format.0, rd.Format.0, true);
+    let amb_fmt = if format.0 != 0 { format.0 } else { rd.Format.0 };
+    super::ambient::note_descriptor(slot.at, amb_idx, uav_res as usize, amb_fmt, rd.Format.0, true);
     let Some((fmt, ty, w, h, d, _)) = view_shape(r, format, dim, array, 1) else {
         note_buffer_view();
         return super::console_heap::write(&slot, &[0; 8]);
