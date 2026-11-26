@@ -1596,7 +1596,7 @@ fn resolve_wait_in(
         }
         return built(p);
     };
-    let rem = frame_state.lock().unwrap().remaining(frame, fcap);
+    let rem = frame_state.lock().unwrap().begin_wait(frame, fcap, std::time::Instant::now());
     if rem.is_zero() {
         return p.stand(pso);
     }
@@ -1605,17 +1605,15 @@ fn resolve_wait_in(
         _ => (rem, false),
     };
     let _held = Held::new();
-    let t0 = std::time::Instant::now();
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), wait_for, |d| !*d).unwrap();
     let finished = *done;
     drop(done);
-    let elapsed = t0.elapsed();
+    let frame_timed_out = !finished && !per_pso_binding;
+    frame_state.lock().unwrap().end_wait(frame, fcap, std::time::Instant::now(), frame_timed_out);
     if finished {
-        frame_state.lock().unwrap().record(frame, elapsed);
         return built(p);
     }
     if per_pso_binding {
-        frame_state.lock().unwrap().record(frame, elapsed);
         p.late.store(true, Ordering::Release);
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -1627,10 +1625,7 @@ fn resolve_wait_in(
             );
         }
     } else {
-        // Clamp recorded wait to `rem` on frame-budget timeout so OS timer jitter cannot leave a
-        // sub-millisecond sliver causing subsequent unready calls on this frame to spin.
         // Do NOT set `p.late` so the pipeline is retried with a fresh window on the next frame.
-        frame_state.lock().unwrap().record(frame, elapsed.max(rem));
         static N_GFX: AtomicUsize = AtomicUsize::new(0);
         static N_CS: AtomicUsize = AtomicUsize::new(0);
         let counter = if p.compute { &N_CS } else { &N_GFX };
@@ -1671,6 +1666,25 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn set_wait_budget_for_test(budget: Option<std::time::Duration>) {
     BUDGET_FOR_TEST.with(|b| b.set(budget));
+}
+
+/// Binds wait at most `XCL_PSO_WAIT_MS`: a dispatch is then not put off to the submit
+/// (`list_x::defer`), where it would only wait as long.
+pub fn waits_bounded() -> bool {
+    wait_budget().is_some()
+}
+
+/// Whether per-frame pipeline wait windows (`XCL_PSO_FRAME_BUDGET_MS`) are active.
+pub fn frame_budget_enabled() -> bool {
+    frame_budget().is_some()
+}
+
+/// Whether the current frame's compute pipeline wait window has already been spent.
+pub fn compute_frame_budget_spent() -> bool {
+    frame_budget().is_some_and(|cap| {
+        let frame = super::present::presents();
+        FRAME_BUDGET_CS.lock().unwrap().remaining_at(frame, cap, std::time::Instant::now()).is_zero()
+    })
 }
 
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
@@ -1770,21 +1784,69 @@ fn frame_wait_budget() -> Option<std::time::Duration> {
 struct FrameWaitBudget {
     frame: u64,
     spent: std::time::Duration,
+    active_waiters: usize,
+    active_since: Option<std::time::Instant>,
 }
 
 impl FrameWaitBudget {
     const fn new() -> Self {
-        Self { frame: 0, spent: std::time::Duration::ZERO }
+        Self { frame: 0, spent: std::time::Duration::ZERO, active_waiters: 0, active_since: None }
     }
 
-    fn remaining(&mut self, frame: u64, cap: std::time::Duration) -> std::time::Duration {
+    fn advance(&mut self, frame: u64, now: std::time::Instant) {
         if frame > self.frame {
             self.frame = frame;
             self.spent = std::time::Duration::ZERO;
+            self.active_since = (self.active_waiters > 0).then_some(now);
         }
-        cap.saturating_sub(self.spent)
     }
 
+    fn effective_spent(&self, now: std::time::Instant) -> std::time::Duration {
+        let in_flight = self.active_since.map_or(std::time::Duration::ZERO, |s| now.saturating_duration_since(s));
+        self.spent.saturating_add(in_flight)
+    }
+
+    fn remaining_at(&mut self, frame: u64, cap: std::time::Duration, now: std::time::Instant) -> std::time::Duration {
+        self.advance(frame, now);
+        cap.saturating_sub(self.effective_spent(now))
+    }
+
+    /// Reserve a wait slot on `frame`: tracks wall-clock overlap across concurrent threads so
+    /// staggered callers share one hard `cap` ceiling per frame and can never cascade past `cap`.
+    fn begin_wait(&mut self, frame: u64, cap: std::time::Duration, now: std::time::Instant) -> std::time::Duration {
+        self.advance(frame, now);
+        let rem = cap.saturating_sub(self.effective_spent(now));
+        if rem.is_zero() {
+            return std::time::Duration::ZERO;
+        }
+        if self.active_waiters == 0 {
+            self.active_since = Some(now);
+        }
+        self.active_waiters += 1;
+        rem
+    }
+
+    fn end_wait(&mut self, frame: u64, cap: std::time::Duration, now: std::time::Instant, frame_timed_out: bool) {
+        self.advance(frame, now);
+        if self.active_waiters > 0 {
+            self.active_waiters -= 1;
+            if self.active_waiters == 0 {
+                if let Some(since) = self.active_since.take() {
+                    self.spent = self.spent.saturating_add(now.saturating_duration_since(since));
+                }
+            }
+        }
+        if frame_timed_out && frame == self.frame {
+            self.spent = self.spent.max(cap);
+        }
+    }
+
+    #[cfg(test)]
+    fn remaining(&mut self, frame: u64, cap: std::time::Duration) -> std::time::Duration {
+        self.remaining_at(frame, cap, std::time::Instant::now())
+    }
+
+    #[cfg(test)]
     fn record(&mut self, frame: u64, elapsed: std::time::Duration) {
         if frame > self.frame {
             self.frame = frame;
@@ -1815,13 +1877,12 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
             if !p.bvh_traversal.load(Ordering::Acquire) && !p.late.load(Ordering::Acquire) {
                 if let Some(cap) = frame_wait_budget() {
                     let frame = super::present::presents();
-                    let rem = FRAME_WAIT.lock().unwrap().remaining(frame, cap);
+                    let rem = FRAME_WAIT.lock().unwrap().begin_wait(frame, cap, std::time::Instant::now());
                     if !rem.is_zero() {
-                        let t0 = std::time::Instant::now();
                         let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), rem, |d| !*d).unwrap();
                         let finished = *done;
                         drop(done);
-                        FRAME_WAIT.lock().unwrap().record(frame, t0.elapsed());
+                        FRAME_WAIT.lock().unwrap().end_wait(frame, cap, std::time::Instant::now(), !finished);
                         if finished {
                             return match p.real.load(Ordering::Acquire) {
                                 0 => p.stand(pso),
@@ -2116,5 +2177,34 @@ mod pso_queue_tests {
         for s in [g_fast, g_slow1, g_slow2, c_fast] {
             let _ = released(s);
         }
+    }
+
+    #[test]
+    fn wall_clock_frame_budget_prevents_staggered_multithread_cascade() {
+        use std::time::{Duration, Instant};
+
+        let cap = Duration::from_secs(12);
+        let t0 = Instant::now();
+        let mut b = FrameWaitBudget::new();
+
+        // Thread 1 starts waiting at t=0: full 12 s.
+        assert_eq!(b.begin_wait(1467, cap, t0), Duration::from_secs(12));
+        // Thread 2 arrives staggered at t=10 s while thread 1 is still waiting: only 2 s left!
+        assert_eq!(b.begin_wait(1467, cap, t0 + Duration::from_secs(10)), Duration::from_secs(2));
+        // Thread 3 arrives at t=11.5 s: only 0.5 s left!
+        assert_eq!(b.begin_wait(1467, cap, t0 + Duration::from_millis(11_500)), Duration::from_millis(500));
+        // Thread 4 arrives at t=12.0 s: 0 ms left immediately (no cascade!).
+        assert_eq!(b.begin_wait(1467, cap, t0 + Duration::from_secs(12)), Duration::ZERO);
+
+        // All 3 active waiters finish at t=12 s -> budget spent on frame 1467.
+        b.end_wait(1467, cap, t0 + Duration::from_secs(12), true);
+        b.end_wait(1467, cap, t0 + Duration::from_secs(12), true);
+        b.end_wait(1467, cap, t0 + Duration::from_secs(12), true);
+        assert_eq!(b.remaining_at(1467, cap, t0 + Duration::from_secs(12)), Duration::ZERO);
+
+        // Advancing to frame 1468 resets the wall-clock window cleanly.
+        assert_eq!(b.begin_wait(1468, cap, t0 + Duration::from_secs(13)), Duration::from_secs(12));
+        b.end_wait(1468, cap, t0 + Duration::from_secs(14), false);
+        assert_eq!(b.remaining_at(1468, cap, t0 + Duration::from_secs(14)), Duration::from_secs(11));
     }
 }

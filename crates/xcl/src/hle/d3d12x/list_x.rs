@@ -3104,10 +3104,58 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     Some(next_pc)
 }
 
+/// Cap on deferred compute segments per frame when per-frame wait windows are active so a cold
+/// burst of thousands of unbuilt dispatches never exhausts command-list memory (`#2581`).
+const MAX_DEFERRED_PER_FRAME: u32 = 16;
+
+struct FrameDeferCap {
+    frame: u64,
+    count: u32,
+}
+
+impl FrameDeferCap {
+    const fn new() -> Self {
+        Self { frame: 0, count: 0 }
+    }
+
+    fn has_slot(&mut self, frame: u64, limit: u32) -> bool {
+        if frame > self.frame {
+            self.frame = frame;
+            self.count = 0;
+        }
+        self.count < limit
+    }
+
+    fn record(&mut self, frame: u64) {
+        if frame > self.frame {
+            self.frame = frame;
+            self.count = 1;
+        } else if frame == self.frame {
+            self.count = self.count.saturating_add(1);
+        }
+    }
+}
+
+static FRAME_DEFER_CAP: Mutex<FrameDeferCap> = Mutex::new(FrameDeferCap::new());
+
 /// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
 pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
+    // With bounded per-PSO waits (`XCL_PSO_WAIT_MS`, #2581) or an exhausted per-frame compute
+    // wait window (`XCL_PSO_FRAME_BUDGET_MS`), record at once instead of allocating a segment
+    // per unbuilt dispatch (thousands of deferred segments can OOM command lists -> 0x887a0001).
+    if super::pso_async::waits_bounded() || super::pso_async::compute_frame_budget_spent() {
+        return false;
+    }
+    let bounded_frame = super::pso_async::frame_budget_enabled();
+    let frame = if bounded_frame { super::present::presents() } else { 0 };
+    if bounded_frame && !FRAME_DEFER_CAP.lock().unwrap().has_slot(frame, MAX_DEFERRED_PER_FRAME) {
+        return false;
+    }
     if split(list, Some(what)).is_none() {
         return false;
+    }
+    if bounded_frame {
+        FRAME_DEFER_CAP.lock().unwrap().record(frame);
     }
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3115,6 +3163,29 @@ pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
         crate::xlog_info!("D3D12.X: dispatch with a pipeline still being built put off to the submit (#{n})");
     }
     true
+}
+
+#[cfg(test)]
+mod defer_cap_tests {
+    use super::FrameDeferCap;
+
+    #[test]
+    fn frame_defer_cap_bounds_segments_per_frame_and_resets_on_new_frame() {
+        let mut cap = FrameDeferCap::new();
+        for _ in 0..3 {
+            assert!(cap.has_slot(1, 3));
+            cap.record(1);
+        }
+        assert!(!cap.has_slot(1, 3), "must stop deferring once per-frame segment cap is reached");
+        assert!(cap.has_slot(2, 3), "advancing frame must reset the per-frame defer cap");
+        cap.record(2);
+        // Stale lower frame must not disturb frame 2's count.
+        cap.record(1);
+        assert!(cap.has_slot(2, 3));
+        cap.record(2);
+        cap.record(2);
+        assert!(!cap.has_slot(2, 3));
+    }
 }
 
 /// Builds of a submit's put-off calls that go on without the commit headroom, as a title thread's own do: about what the title's threads had in the driver at once before.

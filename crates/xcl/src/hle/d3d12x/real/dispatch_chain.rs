@@ -534,9 +534,18 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
-        list.SetPipelineState(&chain.whole()?);
-        list.Dispatch(x, y, z);
-        return Ok(());
+        if let Some(whole) = chain.whole.get() {
+            list.SetPipelineState(whole);
+            list.Dispatch(x, y, z);
+            return Ok(());
+        }
+        if !super::super::pso_async::enabled() {
+            list.SetPipelineState(&chain.whole()?);
+            list.Dispatch(x, y, z);
+            return Ok(());
+        }
+        chain.start_whole_async();
+        return Err("whole compute pipeline still building in background".into());
     };
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
     let held = Arc::new(Recording { scratch, first, chain, indirect: None });
